@@ -30,14 +30,32 @@ get_copy_decision() {
     echo "$answer"
 }
 
+copy_xdg_dir() {
+    local directory="$1"
+    local answer="$2"
+    local dest_ip="$3"
+    local username="$4"
+    local password="$5"
+    local directory_path=$(xdg-user-dir "$directory")
+    if [[ "$answer" == "y" ]]; then
+        #sshpass -p "$password" scp -r "$directory_path" "$username@$dest_ip:$directory_path"
+        echo "The $directory_path has been copied over." 
+    fi
+}
+
 echo "This is a tool that helps with migration to a new computer."
-(doc_answer=$(get_copy_decision "DOCUMENTS") ; echo "User's answer: $doc_answer") &
+doc_answer=$(get_copy_decision "DOCUMENTS")
+
+vid_answer=$(get_copy_decision "VIDEOS")
+
+img_answer=$(get_copy_decision "IMAGES")
+
+mus_answer=$(get_copy_decision "MUSIC")
+
+dwn_answer=$(get_copy_decision "DOWNLOAD")
 
 directory=$(xdg-user-dir "VIDEOS")
 size_in_gb=$(get_directory_size "$directory")
-echo "Copy over Videos? The size of the Videos folder is ${size_in_gb}GB? (y/n)"
-read vid_answer
-echo $vid_answer
 
 # Ask the user if they want to reinstall Flatpak applications
 read -p "Do you want to reinstall Flatpak applications on the new machine? (y/n): " answer
@@ -50,14 +68,18 @@ else
     echo "No action taken. Flatpak applications will not be reinstalled."
 fi
 
-echo -p "Enter the destination IP address:"
-read dest_ip
+read -p "Enter the destination IP address:" dest_ip
 
-echo -p "Enter the destination username:"
-read username
+read -p "Enter the destination username:" username
 
-echo -p -s "Enter the destination password:"
-read password
+read -p "Enter the destination password:" password
 
-sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$dest_ip" 'xargs flatpak install -y flathub < flatpaks.txt'
+#Copy home directories over
+copy_xdg_dir "DOCUMENTS" "$doc_answer" "$dest_ip" "$username" "$password"
+copy_xdg_dir "VIDEOS" "$vid_answer" "$dest_ip" "$username" "$password"
+copy_xdg_dir "IMAGES" "$img_answer" "$dest_ip" "$username" "$password"
+copy_xdg_dir "MUSIC" "$mus_answer" "$dest_ip" "$username" "$password"
+copy_xdg_dir "DOWNLOAD" "$dwn_answer" "$dest_ip" "$username" "$password"
+
+#sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$dest_ip" 'xargs flatpak install -y flathub < flatpaks.txt'
 
