@@ -22,7 +22,6 @@ get_copy_decision() {
     local directory_path=$(xdg-user-dir "$directory")
     # Get the size of the directory
     local size_in_gb=$(get_directory_size "$directory_path")
-
     # Ask the user if the directory should be included
     read -p "Copy over $directory? The size of the $directory folder is ${size_in_gb}GB. Do you want to include it? (y/n): " answer
 
@@ -37,8 +36,15 @@ copy_xdg_dir() {
     local username="$4"
     local password="$5"
     local directory_path=$(xdg-user-dir "$directory")
+    local directory_name=$(basename "$directory_path")
+    
     if [[ "$answer" == "y" ]]; then
-        #sshpass -p "$password" scp -r "$directory_path" "$username@$dest_ip:$directory_path"
+        #sshpass -p "$password" scp -r -o StrictHostKeyChecking=no "$directory_path/" "$username@$dest_ip:$/home/$username/$directory_name"
+        sshpass -p "$password" sftp -o StrictHostKeyChecking=no "$username@$dest_ip" <<EOF
+        cd /home/$username/$directory_name
+        lcd "$directory_path"
+        mput -r .
+EOF
         echo "The $directory_path has been copied over." 
     fi
 }
@@ -58,9 +64,9 @@ directory=$(xdg-user-dir "VIDEOS")
 size_in_gb=$(get_directory_size "$directory")
 
 # Ask the user if they want to reinstall Flatpak applications
-read -p "Do you want to reinstall Flatpak applications on the new machine? (y/n): " answer
+read -p "Do you want to reinstall Flatpak applications on the new machine? (y/n): " reinstall_answer
 
-if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
     # Perform the command to list installed Flatpak applications and save it to a file
     flatpak list --app --columns=application > installed_flatpaks.txt
     echo "List of installed Flatpaks saved to 'installed_flatpaks.txt'."
@@ -81,5 +87,14 @@ copy_xdg_dir "IMAGES" "$img_answer" "$dest_ip" "$username" "$password"
 copy_xdg_dir "MUSIC" "$mus_answer" "$dest_ip" "$username" "$password"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer" "$dest_ip" "$username" "$password"
 
-#sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$dest_ip" 'xargs flatpak install -y flathub < flatpaks.txt'
+if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+    # Copy the file with the list of flatpaks to reinstall over to the new machine
+    sshpass -p "$password" scp -r -o StrictHostKeyChecking=no "./installed_flatpaks.txt" "$username@$dest_ip:/home/$username/"
+    echo "The list of flatpaks to reinstall has been copied over to the new machine, now the reinstallation will start."
+fi
+
+if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+    sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$dest_ip" 'xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt'
+    echo "Flatpak applications have been reinstalled on the new machine."
+fi
 
