@@ -49,7 +49,17 @@ EOF
     fi
 }
 
-echo "This is a tool that helps with migration to a new computer."
+read -p "This is a tool that helps with migration to a new computer. It has several preconditions:
+
+- Both computers need to be on the same local network. You will need to know the IP address of the destination computer. You can find it out in the network settings.
+- The destination computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
+- The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overriden.
+- Already installed flatpaks will be reinstalled from Flathub.
+
+Press Enter to continue or Ctrl+C to quit.
+
+"
+
 doc_answer=$(get_copy_decision "DOCUMENTS")
 
 vid_answer=$(get_copy_decision "VIDEOS")
@@ -60,11 +70,15 @@ mus_answer=$(get_copy_decision "MUSIC")
 
 dwn_answer=$(get_copy_decision "DOWNLOAD")
 
-directory=$(xdg-user-dir "VIDEOS")
-size_in_gb=$(get_directory_size "$directory")
+echo
 
 # Ask the user if they want to reinstall Flatpak applications
 read -p "Do you want to reinstall Flatpak applications on the new machine? (y/n): " reinstall_answer
+
+#Ask the user if they want to copy the Flatpak app data over
+if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+    read -p "Do you want to copy the Flatpak app data over, too? (y/n): " data_answer
+fi
 
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
     # Perform the command to list installed Flatpak applications and save it to a file
@@ -74,11 +88,18 @@ else
     echo "No action taken. Flatpak applications will not be reinstalled."
 fi
 
-read -p "Enter the destination IP address:" dest_ip
+read -p "Enter the destination IP address: " dest_ip
 
-read -p "Enter the destination username:" username
+read -p "Enter the destination username: " username
 
-read -p "Enter the destination password:" password
+echo -n "Enter the username password: "
+read -s password
+echo
+
+read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
+"
+
+read -p "Press to continue"
 
 #Copy home directories over
 copy_xdg_dir "DOCUMENTS" "$doc_answer" "$dest_ip" "$username" "$password"
@@ -89,7 +110,7 @@ copy_xdg_dir "DOWNLOAD" "$dwn_answer" "$dest_ip" "$username" "$password"
 
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
     # Copy the file with the list of flatpaks to reinstall over to the new machine
-    sshpass -p "$password" scp -r -o StrictHostKeyChecking=no "./installed_flatpaks.txt" "$username@$dest_ip:/home/$username/"
+    sshpass -p "$password" scp -r -o StrictHostKeyChecking=accept-new "./installed_flatpaks.txt" "$username@$dest_ip:/home/$username/"
     echo "The list of flatpaks to reinstall has been copied over to the new machine, now the reinstallation will start."
 fi
 
@@ -98,3 +119,15 @@ if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
     echo "Flatpak applications have been reinstalled on the new machine."
 fi
 
+if [[ "$data_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+    # Copy flatpak app data in ~/.var/app/ over to the new machine
+    echo "Now the flatpak app data will be copied over."
+    sshpass -p "$password" sftp -o StrictHostKeyChecking=no "$username@$dest_ip" <<EOF
+        cd /home/$username/.var/app/
+        lcd "$HOME"/.var/app
+        mput -r .
+EOF
+fi
+
+echo "
+The migration is finished!"
