@@ -1,13 +1,21 @@
 #!/bin/bash
 
+# Function to run a command remotely over SSH
+run_remote_command() {
+    local command_to_run="$1"
+
+    # SSH into the remote machine and execute the command
+    sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$origin_ip" "$command_to_run"
+}
+
 # Function to get the size of a directory
 get_directory_size() {
     local directory="$1"
 
     # Check if the directory exists
-    if [ -d "$directory" ]; then
+    if run_remote_command "[ -d \"$directory\" ]"; then
         # Calculate the size of the directory in bytes using du command
-        local dir_size=$(du -sb "$directory" | cut -f1)
+        local dir_size=$(run_remote_command "du -sb \"$directory\" | cut -f1")
         # Convert bytes to GB (1 GB = 1024 * 1024 * 1024 bytes)
         local dir_size_gb=$(echo "scale=2; $dir_size / (1024 * 1024 * 1024)" | bc)
         echo "$dir_size_gb"
@@ -19,11 +27,12 @@ get_directory_size() {
 get_copy_decision() {
     local directory="$1"
     # Get the directory path using xdg-user-dir
-    local directory_path=$(xdg-user-dir "$directory")
+    local directory_path=$(run_remote_command "xdg-user-dir \"$directory\"")
     # Get the size of the directory
     local size_in_gb=$(get_directory_size "$directory_path")
+    local directory_name=$(basename "$directory_path")
     # Ask the user if the directory should be included
-    read -p "Copy over $directory? The size of the $directory folder is ${size_in_gb}GB. Do you want to include it? (y/n): " answer
+    read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. (y/n): " answer
 
     # Return the user's answer
     echo "$answer"
@@ -32,27 +41,23 @@ get_copy_decision() {
 copy_xdg_dir() {
     local directory="$1"
     local answer="$2"
-    local dest_ip="$3"
-    local username="$4"
-    local password="$5"
     local directory_path=$(xdg-user-dir "$directory")
     local directory_name=$(basename "$directory_path")
     
-    if [[ "$answer" == "y" ]]; then
-        #sshpass -p "$password" scp -r -o StrictHostKeyChecking=no "$directory_path/" "$username@$dest_ip:$/home/$username/$directory_name"
-        sshpass -p "$password" sftp -o StrictHostKeyChecking=no "$username@$dest_ip" <<EOF
-        cd /home/$username/$directory_name
-        lcd "$directory_path"
-        mput -r .
-EOF
-        echo "The $directory_path has been copied over." 
+    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+        # Create the local directory if it doesn't exist
+        mkdir -p "$directory_path"
+        
+        # Copy the directory from remote to local using rsync
+        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:/home/$username/$directory_name" "$HOME"
+        echo "The $directory_name has been copied over." 
     fi
 }
 
 read -p "This is a tool that helps with migration to a new computer. It has several preconditions:
 
-- Both computers need to be on the same local network. You will need to know the IP address of the destination computer. You can find it out in the network settings.
-- The destination computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
+- Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
+- The origin computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
 - The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overriden.
 - Already installed flatpaks will be reinstalled from Flathub.
 
@@ -60,11 +65,19 @@ Press Enter to continue or Ctrl+C to quit.
 
 "
 
+read -p "Enter the origin IP address: " origin_ip
+
+read -p "Enter the origin username: " username
+
+echo -n "Enter the user password: "
+read -s password
+echo
+
 doc_answer=$(get_copy_decision "DOCUMENTS")
 
 vid_answer=$(get_copy_decision "VIDEOS")
 
-img_answer=$(get_copy_decision "IMAGES")
+pic_answer=$(get_copy_decision "PICTURES")
 
 mus_answer=$(get_copy_decision "MUSIC")
 
@@ -81,52 +94,35 @@ if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
 fi
 
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    # Perform the command to list installed Flatpak applications and save it to a file
-    flatpak list --app --columns=application > installed_flatpaks.txt
+    # Perform the command to list installed Flatpak applications on the remote machine and save it to a file
+    run_remote_command "flatpak list --app --columns=application" > installed_flatpaks.txt
     echo "List of installed Flatpaks saved to 'installed_flatpaks.txt'."
 else
     echo "No action taken. Flatpak applications will not be reinstalled."
 fi
 
-read -p "Enter the destination IP address: " dest_ip
-
-read -p "Enter the destination username: " username
-
-echo -n "Enter the username password: "
-read -s password
 echo
 
 read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
 "
 
-read -p "Press to continue"
-
 #Copy home directories over
-copy_xdg_dir "DOCUMENTS" "$doc_answer" "$dest_ip" "$username" "$password"
-copy_xdg_dir "VIDEOS" "$vid_answer" "$dest_ip" "$username" "$password"
-copy_xdg_dir "IMAGES" "$img_answer" "$dest_ip" "$username" "$password"
-copy_xdg_dir "MUSIC" "$mus_answer" "$dest_ip" "$username" "$password"
-copy_xdg_dir "DOWNLOAD" "$dwn_answer" "$dest_ip" "$username" "$password"
+copy_xdg_dir "DOCUMENTS" "$doc_answer"
+copy_xdg_dir "VIDEOS" "$vid_answer"
+copy_xdg_dir "PICTURES" "$pic_answer"
+copy_xdg_dir "MUSIC" "$mus_answer"
+copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    # Copy the file with the list of flatpaks to reinstall over to the new machine
-    sshpass -p "$password" scp -r -o StrictHostKeyChecking=accept-new "./installed_flatpaks.txt" "$username@$dest_ip:/home/$username/"
-    echo "The list of flatpaks to reinstall has been copied over to the new machine, now the reinstallation will start."
-fi
-
-if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$dest_ip" 'xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt'
+    #xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
     echo "Flatpak applications have been reinstalled on the new machine."
 fi
 
-if [[ "$data_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    # Copy flatpak app data in ~/.var/app/ over to the new machine
+if [[ "$data_answer" == "y" || "$data_answer" == "Y" || "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+    # Copy flatpak app data in ~/.var/app/ over from the old machine
     echo "Now the flatpak app data will be copied over."
-    sshpass -p "$password" sftp -o StrictHostKeyChecking=no "$username@$dest_ip" <<EOF
-        cd /home/$username/.var/app/
-        lcd "$HOME"/.var/app
-        mput -r .
-EOF
+    mkdir -p "$HOME/.var/app"
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:/home/$username/.var/app/" "$HOME/.var/app/"
 fi
 
 echo "
