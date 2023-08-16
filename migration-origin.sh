@@ -49,7 +49,7 @@ copy_xdg_dir() {
         mkdir -p "$directory_path"
         
         # Copy the directory from remote to local using rsync
-        run_remote_command "rsync -avz /home/$username/$directory_name $directory_path"
+        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:/home/$username/$directory_name" "$HOME"
         echo "The $directory_name has been copied over." 
     fi
 }
@@ -114,14 +114,15 @@ copy_xdg_dir "MUSIC" "$mus_answer"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
+    #xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
     echo "Flatpak applications have been reinstalled on the new machine."
 fi
 
-if [[ "$data_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+if [[ "$data_answer" == "y" || "$data_answer" == "Y" || "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
     # Copy flatpak app data in ~/.var/app/ over from the old machine
     echo "Now the flatpak app data will be copied over."
-    run_remote_command "rsync -avz /home/$username/.var/app/ $HOME/.var/app"
+    mkdir -p "$HOME/.var/app"
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:/home/$username/.var/app/" "$HOME/.var/app/"
 fi
 
 echo "
