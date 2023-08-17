@@ -24,6 +24,7 @@ get_directory_size() {
     fi
 }
 
+# Fuction to ask whether the XDG directory should be copied over
 get_copy_decision() {
     local directory="$1"
     # Get the directory path using xdg-user-dir
@@ -38,6 +39,7 @@ get_copy_decision() {
     echo "$answer"
 }
 
+# Function to copy the chosen XDG directory over
 copy_xdg_dir() {
     local directory="$1"
     local answer="$2"
@@ -54,7 +56,8 @@ copy_xdg_dir() {
     fi
 }
 
-read -p "This is a tool that helps with migration to a new computer. It has several preconditions:
+read -p "LINUX DESKTOP MIGRATION TOOL
+This is a tool that helps with migration to a new computer. It has several preconditions:
 
 - Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
 - The origin computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
@@ -73,6 +76,7 @@ echo -n "Enter the user password: "
 read -s password
 echo
 
+# Asking about copying the XDG directories over
 doc_answer=$(get_copy_decision "DOCUMENTS")
 
 vid_answer=$(get_copy_decision "VIDEOS")
@@ -93,8 +97,8 @@ if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
     read -p "Do you want to copy the Flatpak app data over, too? (y/n): " data_answer
 fi
 
+# Generate a list of installed flatpaks on the origin machine to reinstall on the destination machine
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    # Perform the command to list installed Flatpak applications on the remote machine and save it to a file
     run_remote_command "flatpak list --app --columns=application" > installed_flatpaks.txt
     echo "List of installed Flatpaks saved to 'installed_flatpaks.txt'."
 else
@@ -106,20 +110,21 @@ echo
 read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
 "
 
-#Copy home directories over
+# Copy home directories over
 copy_xdg_dir "DOCUMENTS" "$doc_answer"
 copy_xdg_dir "VIDEOS" "$vid_answer"
 copy_xdg_dir "PICTURES" "$pic_answer"
 copy_xdg_dir "MUSIC" "$mus_answer"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
+#Reinstall flatpaks from the origin machine
 if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    #xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
+    xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
     echo "Flatpak applications have been reinstalled on the new machine."
 fi
 
+# Copy flatpak app data in ~/.var/app/ over from the origin machine
 if [[ "$data_answer" == "y" || "$data_answer" == "Y" || "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    # Copy flatpak app data in ~/.var/app/ over from the old machine
     echo "Now the flatpak app data will be copied over."
     mkdir -p "$HOME/.var/app"
     sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:/home/$username/.var/app/" "$HOME/.var/app/"
