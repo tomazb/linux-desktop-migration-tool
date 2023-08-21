@@ -80,10 +80,10 @@ echo
 toolbox_list_output=$(run_remote_command "toolbox list")
 
 # Extract container IDs using awk
-container_ids=$(echo "$toolbox_list_output" | awk 'NR>1 {print $1}')
+container_ids_and_names=$(echo "$toolbox_list_output" | awk '/^CONTAINER ID/{flag=1; next} flag && /^[a-f0-9]+/{print $1, $2}')
 
 # Loop through each container ID, save is as an image and export it to tar
-for container_id in $container_ids; do
+while read -r container_id container_name; do
     # Stop the container remotely
     run_remote_command "podman container stop $container_id"
     # Create an image out of the container remotely
@@ -92,7 +92,15 @@ for container_id in $container_ids; do
     run_remote_command "podman save -o $container_id.tar $container_id-migration"
     # Move the exported tar file from remote to local using rsync
     sshpass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_id.tar" .
-done
+    # Remove the exported image from local storage
+    run_remote_command "podman rmi $container_id-migration"
+    # Load the image on the destination computer
+    podman load -i "$container_id.tar"
+    # Create a container from the imported image
+    toolbox create --container "$container_name" --image "$container_id-migration"
+    # Delete the imported tar file
+    rm "$container_id.tar"
+done <<< "$container_ids_and_names"
 
 # Asking about copying the XDG directories over
 doc_answer=$(get_copy_decision "DOCUMENTS")
