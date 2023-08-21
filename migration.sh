@@ -76,6 +76,24 @@ echo -n "Enter the user password: "
 read -s password
 echo
 
+# Run toolbox list command and store the output
+toolbox_list_output=$(run_remote_command "toolbox list")
+
+# Extract container IDs using awk
+container_ids=$(echo "$toolbox_list_output" | awk 'NR>1 {print $1}')
+
+# Loop through each container ID, save is as an image and export it to tar
+for container_id in $container_ids; do
+    # Stop the container remotely
+    run_remote_command "podman container stop $container_id"
+    # Create an image out of the container remotely
+    run_remote_command "podman container commit $container_id $container_id-migration"
+    # Export the image as tar remotely
+    run_remote_command "podman save -o $container_id.tar $container_id-migration"
+    # Move the exported tar file from remote to local using rsync
+    sshpass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_id.tar" .
+done
+
 # Asking about copying the XDG directories over
 doc_answer=$(get_copy_decision "DOCUMENTS")
 
