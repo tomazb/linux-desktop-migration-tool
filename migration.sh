@@ -33,7 +33,8 @@ get_copy_decision() {
     local size_in_gb=$(get_directory_size "$directory_path")
     local directory_name=$(basename "$directory_path")
     # Ask the user if the directory should be included
-    read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. (y/n): " answer
+    read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. ([y]/n): " answer
+    answer=${answer:-y}
 
     # Return the user's answer
     echo "$answer"
@@ -46,7 +47,7 @@ copy_xdg_dir() {
     local directory_path=$(xdg-user-dir "$directory")
     local directory_name=$(basename "$directory_path")
     
-    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+    if [[ "$answer" =~ ^[yY] ]]; then
         # Create the local directory if it doesn't exist
         mkdir -p "$directory_path"
         
@@ -70,7 +71,8 @@ Press Enter to continue or Ctrl+C to quit.
 
 read -p "Enter the origin IP address: " origin_ip
 
-read -p "Enter the origin username: " username
+read -p "Enter the origin username [$USER]: " username
+username=${username:-$USER}
 
 echo -n "Enter the user password: "
 read -s password
@@ -90,15 +92,17 @@ dwn_answer=$(get_copy_decision "DOWNLOAD")
 echo
 
 # Ask the user if they want to reinstall Flatpak applications
-read -p "Do you want to reinstall Flatpak applications on the new machine? (y/n): " reinstall_answer
+read -p "Do you want to reinstall Flatpak applications on the new machine? ([y]/n): " reinstall_answer
+reinstall_answer=${reinstall_answer:-y}
 
-#Ask the user if they want to copy the Flatpak app data over
-if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
-    read -p "Do you want to copy the Flatpak app data over, too? (y/n): " data_answer
+# Ask the user if they want to copy the Flatpak app data over
+if [[ "$reinstall_answer" =~ ^[yY] ]]; then
+    read -p "Do you want to copy the Flatpak app data over, too? ([y]/n): " data_answer
+    data_answer=${data_answer:-y}
 fi
 
 # Generate a list of installed flatpaks on the origin machine to reinstall on the destination machine
-if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     run_remote_command "flatpak list --app --columns=application" > installed_flatpaks.txt
     echo "List of installed Flatpaks saved to 'installed_flatpaks.txt'."
 else
@@ -118,13 +122,13 @@ copy_xdg_dir "MUSIC" "$mus_answer"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
 #Reinstall flatpaks from the origin machine
-if [[ "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
     echo "Flatpak applications have been reinstalled on the new machine."
 fi
 
 # Copy flatpak app data in ~/.var/app/ over from the origin machine
-if [[ "$data_answer" == "y" || "$data_answer" == "Y" || "$reinstall_answer" == "y" || "$reinstall_answer" == "Y" ]]; then
+if [[ "$data_answer" =~ ^[yY] ]]; then
     echo "Now the flatpak app data will be copied over."
     mkdir -p "$HOME/.var/app"
     sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:/home/$username/.var/app/" "$HOME/.var/app/"
