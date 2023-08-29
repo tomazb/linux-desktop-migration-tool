@@ -152,19 +152,19 @@ if [[ "$toolbx_answer" =~ ^[yY] ]]; then
             # Stop the container remotely
             run_remote_command "podman container stop $container_id"
             # Create an image out of the container remotely
-            run_remote_command "podman container commit $container_id $container_id-migrated"
+            run_remote_command "podman container commit $container_id $container_name-migrated"
             # Export the image as tar remotely
-            run_remote_command "podman save -o $container_id.tar $container_id-migrated"
+            run_remote_command "podman save -o $container_name.tar $container_name-migrated"
             # Move the exported tar file from remote to local using rsync
-            sshpass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_id.tar" .
+            sshpass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_name.tar" .
             # Remove the exported image from local storage
-            run_remote_command "podman rmi $container_id-migrated"
+            run_remote_command "podman rmi $container_name-migrated"
             # Load the image on the destination computer
-            podman load -i "$container_id.tar"
+            podman load -i "$container_name.tar"
             # Create a container from the imported image
-            toolbox create --container "$container_name" --image "$container_id-migrated"
+            toolbox create --container "$container_name" --image "$container_name-migrated"
             # Delete the imported tar file
-            rm "$container_id.tar"
+            rm "$container_name.tar"
         fi
     done
 echo "Toolbx containers migrated.
