@@ -49,15 +49,16 @@ get_copy_decision() {
 copy_xdg_dir() {
     local directory="$1"
     local answer="$2"
-    local directory_path=$(xdg-user-dir "$directory")
-    local directory_name=$(basename "$directory_path")
+    local directory_path_destination=$(xdg-user-dir "$directory")
+    local directory_name_destination=$(basename "$directory_path_destination")
+    local directory_path_origin=$(run_remote_command "xdg-user-dir \"$directory\"")
     
     if [[ "$answer" =~ ^[yY] ]]; then
         # Create the local directory if it doesn't exist
-        mkdir -p "$directory_path"
+        mkdir -p "$directory_path_destination"
         
         # Copy the directory from remote to local using rsync
-        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:/home/$username/$directory_name" "$HOME"
+        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:$directory_path_origin/" "$directory_path_destination"
         echo "The $directory_name has been copied over." 
     fi
 }
@@ -82,6 +83,9 @@ username=${username:-$USER}
 echo -n "Enter the user password: "
 read -s password
 echo
+
+# Get the origin user home directory path
+user_home_origin=$(run_remote_command "eval echo \"~$username\"")
 
 # Asking about copying the XDG directories over
 doc_answer=$(get_copy_decision "DOCUMENTS")
@@ -160,7 +164,7 @@ fi
 if [[ "$data_answer" =~ ^[yY] ]]; then
     echo "Now the flatpak app data will be copied over."
     mkdir -p "$HOME/.var/app"
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:/home/$username/.var/app/" "$HOME/.var/app/"
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.var/app/" "$HOME/.var/app/"
 fi
 
 # Migrate Toolbx containers, loop through each container ID and name, save it as an image and export it to tar, copy it over and import it
