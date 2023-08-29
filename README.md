@@ -16,7 +16,6 @@ Linux Desktop Migration Tool aims to make migration from one Linux desktop machi
 - rsync, sshpass, xdg-user-dirs, gawk are installed.
 
 ## Planned features
-- Migration of Toolbx containers.
 - Migration of arbitrary directories in home.
 - Migration of ssh certificates, nss database.
 - Migration of GNOME desktop settings.

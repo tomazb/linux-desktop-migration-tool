@@ -106,14 +106,6 @@ if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     data_answer=${data_answer:-y}
 fi
 
-# Generate a list of installed flatpaks on the origin machine to reinstall on the destination machine
-if [[ "$reinstall_answer" =~ ^[yY] ]]; then
-    run_remote_command "flatpak list --app --columns=application" > installed_flatpaks.txt
-    echo "List of installed Flatpaks saved to 'installed_flatpaks.txt'."
-else
-    echo "No action taken. Flatpak applications will not be reinstalled."
-fi
-
 # Ask the user if they want to migrate Toolbx containers
 if command -v toolbox &>/dev/null; then
     # Run toolbox list command and store the output
@@ -141,7 +133,26 @@ copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
 #Reinstall flatpaks from the origin machine
 if [[ "$reinstall_answer" =~ ^[yY] ]]; then
-    xargs flatpak install -y --reinstall flathub < installed_flatpaks.txt
+    # Capture the list of installed flatpaks on the origin machine
+    installed_flatpaks_origin=$(run_remote_command "flatpak list --app --columns=application")
+    # Parse the list using awk to skip the header and get the flatpak names
+    flatpak_names_origin=$(echo "$installed_flatpaks_origin" | awk 'NR>1 {print}')
+    # Capture the list of installed flatpaks on the destination machine
+    installed_flatpaks_destination=$(flatpak list --app --columns=application)
+    # Parse the list using awk to skip the header and get the flatpak names
+    flatpak_names_destination=$(echo "$installed_flatpaks_destination" | awk 'NR>1 {print}')
+    # Loop through each installed flatpak on the origin machine and install those that are not already installed on the destination machine
+    while IFS= read -r flatpak_name <&3; do
+        if [ -n "$flatpak_name" ]; then
+            # Check if the flatpak is already installed on the destination machine
+            if echo "$installed_flatpaks_destination" | grep -q "$flatpak_name"; then
+                echo "Flatpak $flatpak_name is already installed. Skipping."
+            else
+                # Install the flatpak on the local machine
+                flatpak install -y flathub "$flatpak_name"
+            fi
+        fi
+    done 3<<< "$flatpak_names_origin"
     echo "Flatpak applications have been reinstalled on the new machine."
 fi
 
