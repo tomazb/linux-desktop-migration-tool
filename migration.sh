@@ -69,7 +69,6 @@ This is a tool that helps with migration to a new computer. It has several preco
 - Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
 - The origin computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
 - The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overriden.
-- Already installed flatpaks will be reinstalled from Flathub.
 
 Press Enter to continue or Ctrl+C to quit.
 
@@ -135,7 +134,7 @@ copy_xdg_dir "PICTURES" "$pic_answer"
 copy_xdg_dir "MUSIC" "$mus_answer"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
-#Reinstall flatpaks from the origin machine
+# Reinstall flatpaks from the origin machine and copy over their data
 if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     # Capture the list of installed flatpaks on the origin machine
     installed_flatpaks_origin=$(run_remote_command "flatpak list --app --columns=application")
@@ -158,13 +157,12 @@ if [[ "$reinstall_answer" =~ ^[yY] ]]; then
         fi
     done 3<<< "$flatpak_names_origin"
     echo "Flatpak applications have been reinstalled on the new machine."
-fi
-
-# Copy flatpak app data in ~/.var/app/ over from the origin machine
-if [[ "$data_answer" =~ ^[yY] ]]; then
-    echo "Now the flatpak app data will be copied over."
-    mkdir -p "$HOME/.var/app"
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.var/app/" "$HOME/.var/app/"
+    # Copy flatpak app data in ~/.var/app/ over from the origin machine
+    if [[ "$data_answer" =~ ^[yY] ]]; then
+        echo "Now the flatpak app data will be copied over."
+        mkdir -p "$HOME/.var/app"
+        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.var/app/" "$HOME/.var/app/"
+    fi
 fi
 
 # Migrate Toolbx containers, loop through each container ID and name, save it as an image and export it to tar, copy it over and import it
