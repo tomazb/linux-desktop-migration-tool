@@ -74,13 +74,23 @@ Press Enter to continue or Ctrl+C to quit.
 
 "
 
-read -p "Enter the origin IP address: " origin_ip
+while true; do
+    read -p "Enter the origin IP address: " origin_ip
+    read -p "Enter the origin username [$USER]: " username
+    username=${username:-$USER}
+    echo -n "Enter the user password: "
+    read -s password
+    echo
 
-read -p "Enter the origin username [$USER]: " username
-username=${username:-$USER}
-
-echo -n "Enter the user password: "
-read -s password
+    # Check the SSH connection
+    if sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new -q $username@$origin_ip exit; then
+        echo "The connection has been successfully established."
+        break  # Break the loop if the connection is successful
+    else
+        echo "The connection with the origin computer could not be established. Please check the login information and make sure remote login is enabled on the origin computer.
+        "
+    fi
+done
 echo
 
 # Get the origin user home directory path
