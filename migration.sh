@@ -93,20 +93,46 @@ while true; do
 done
 echo
 
+# Asking whether to copy files in home directories
+read -p "Would you like to migrate files in home directories? ([y]/n)" copy_answer
+copy_answer=${copy_answer:-y}
+
 # Get the origin user home directory path
 user_home_origin=$(run_remote_command "eval echo \"~$username\"")
 
-# Asking about copying the XDG directories over
-doc_answer=$(get_copy_decision "DOCUMENTS")
+if [[ "$copy_answer" =~ ^[yY] ]]; then
+    # Asking about copying the XDG directories over
+    doc_answer=$(get_copy_decision "DOCUMENTS")
 
-vid_answer=$(get_copy_decision "VIDEOS")
+    vid_answer=$(get_copy_decision "VIDEOS")
 
-pic_answer=$(get_copy_decision "PICTURES")
+    pic_answer=$(get_copy_decision "PICTURES")
 
-mus_answer=$(get_copy_decision "MUSIC")
+    mus_answer=$(get_copy_decision "MUSIC")
 
-dwn_answer=$(get_copy_decision "DOWNLOAD")
-
+    dwn_answer=$(get_copy_decision "DOWNLOAD")
+    echo
+    echo "Now you can pick other directories in home you would also like to copy over. Instead of full path, use path relative to the home directory. So instead of /home/user/example_dir just example_dir."
+    
+    # Asking for arbitrary home directories to copy over
+    while true; do
+        read -p "Enter the directory path (relative to your home directory) to copy (or 'done' to finish): " relative_dir
+        if [ "$relative_dir" == "done" ]; then
+            break
+        else
+            # Construct the full path by appending the relative path to the user's home directory
+            dir="$user_home_origin/$relative_dir"
+            
+            if run_remote_command "test -d '$dir'"; then
+                dir_to_copy+=("$relative_dir")
+                echo "Added $dir to the list of directories to copy."
+            else
+                echo "Directory does not exist on the remote machine. Please enter a valid directory path."
+            fi
+        fi
+    done
+    
+fi
 echo
 
 # Ask the user if they want to reinstall Flatpak applications
@@ -143,6 +169,11 @@ copy_xdg_dir "VIDEOS" "$vid_answer"
 copy_xdg_dir "PICTURES" "$pic_answer"
 copy_xdg_dir "MUSIC" "$mus_answer"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer"
+
+# Loop through directories picked by the user and copy them over
+for dir_to_copy in "${directories_to_copy[@]}"; do
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$dir_to_copy/" "$HOME/$dir_to_copy"
+done
 
 # Reinstall flatpaks from the origin machine and copy over their data
 if [[ "$reinstall_answer" =~ ^[yY] ]]; then
