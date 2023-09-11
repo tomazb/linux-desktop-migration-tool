@@ -20,9 +20,12 @@ get_directory_size() {
     # Check if the directory exists
     if run_remote_command "[ -d \"$directory\" ]"; then
         # Calculate the size of the directory in bytes using du command
-        local dir_size=$(run_remote_command "du -sb \"$directory\" | cut -f1")
+        local dir_size
+        dir_size=$(run_remote_command "du -sb \"$directory\" | cut -f1")
+
         # Convert bytes to GB (1 GB = 1024 * 1024 * 1024 bytes)
-        local dir_size_gb=$(echo "scale=2; $dir_size / (1024 * 1024 * 1024)" | bc)
+        local dir_size_gb
+        dir_size_gb=$(echo "scale=2; $dir_size / (1024 * 1024 * 1024)" | bc)
         echo "$dir_size_gb"
     else
         echo "Error: Directory not found or invalid path."
@@ -32,11 +35,18 @@ get_directory_size() {
 # Fuction to ask whether the XDG directory should be copied over
 get_copy_decision() {
     local directory="$1"
+
     # Get the directory path using xdg-user-dir
-    local directory_path=$(run_remote_command "xdg-user-dir \"$directory\"")
+    local directory_path
+    directory_path=$(run_remote_command "xdg-user-dir \"$directory\"")
+
     # Get the size of the directory
-    local size_in_gb=$(get_directory_size "$directory_path")
-    local directory_name=$(basename "$directory_path")
+    local size_in_gb
+    size_in_gb=$(get_directory_size "$directory_path")
+
+    local directory_name
+    directory_name=$(basename "$directory_path")
+
     # Ask the user if the directory should be included
     read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. ([y]/n): " answer
     answer=${answer:-y}
