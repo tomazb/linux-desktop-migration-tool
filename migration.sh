@@ -48,7 +48,7 @@ get_copy_decision() {
     directory_name=$(basename "$directory_path")
 
     # Ask the user if the directory should be included
-    read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. ([y]/n): " answer
+    IFS= read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. ([y]/n): " -r answer
     answer=${answer:-y}
 
     # Return the user's answer
@@ -79,7 +79,7 @@ copy_xdg_dir() {
     fi
 }
 
-read -p "LINUX DESKTOP MIGRATION TOOL
+IFS= read -p "LINUX DESKTOP MIGRATION TOOL
 This is a tool that helps with migration to a new computer. It has several preconditions:
 
 - Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
@@ -88,15 +88,15 @@ This is a tool that helps with migration to a new computer. It has several preco
 
 Press Enter to continue or Ctrl+C to quit.
 
-"
+" -r
 
-read -p "Enter the origin IP address: " origin_ip
+IFS= read -p "Enter the origin IP address: " -r origin_ip
 
-read -p "Enter the origin username [$USER]: " username
+IFS= read -p "Enter the origin username [$USER]: " -r username
 username=${username:-$USER}
 
 echo -n "Enter the user password: "
-read -s password
+IFS= read -rs password
 echo
 
 # Get the origin user home directory path
@@ -116,12 +116,12 @@ dwn_answer=$(get_copy_decision "DOWNLOAD")
 echo
 
 # Ask the user if they want to reinstall Flatpak applications
-read -p "Do you want to reinstall Flatpak applications on the new machine? ([y]/n): " reinstall_answer
+IFS= read -p "Do you want to reinstall Flatpak applications on the new machine? ([y]/n): " -r reinstall_answer
 reinstall_answer=${reinstall_answer:-y}
 
 # Ask the user if they want to copy the Flatpak app data over
 if [[ "$reinstall_answer" =~ ^[yY] ]]; then
-    read -p "Do you want to copy the Flatpak app data over, too? ([y]/n): " data_answer
+    IFS= read -p "Do you want to copy the Flatpak app data over, too? ([y]/n): " -r data_answer
     data_answer=${data_answer:-y}
 fi
 
@@ -133,15 +133,15 @@ if command -v toolbox &>/dev/null; then
     IFS=$'\n' read -r -d '' -a container_ids_and_names <<< "$(echo "$toolbox_list_output" | awk '/^CONTAINER ID/{flag=1; next} flag && /^[a-f0-9]+/{print $1 "\t" $2}')"
     # If there are any Toolbx containers on the origin machine, ask whether to migrate them
     if [ "${#container_ids_and_names[@]}" -gt 0 ]; then
-    read -p "You seem to be using Toolbx, would you like to migrate its containers? ([y]/n): " toolbx_answer
+    IFS= read -p "You seem to be using Toolbx, would you like to migrate its containers? ([y]/n): " -r toolbx_answer
     toolbx_answer=${toolbx_answer:-y}
     fi
 fi
 
 echo
 
-read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
-"
+IFS= read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
+" -r
 
 # Copy home directories over
 copy_xdg_dir "DOCUMENTS" "$doc_answer"
