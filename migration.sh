@@ -75,7 +75,7 @@ copy_xdg_dir() {
         
         # Copy the directory from remote to local using rsync
         sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:$directory_path_origin/" "$directory_path_destination"
-        echo "The $directory_name has been copied over." 
+        echo "The $directory_name_destination has been copied over."
     fi
 }
 
