@@ -59,10 +59,16 @@ get_copy_decision() {
 copy_xdg_dir() {
     local directory="$1"
     local answer="$2"
-    local directory_path_destination=$(xdg-user-dir "$directory")
-    local directory_name_destination=$(basename "$directory_path_destination")
-    local directory_path_origin=$(run_remote_command "xdg-user-dir \"$directory\"")
-    
+
+    local directory_path_destination
+    directory_path_destination=$(xdg-user-dir "$directory")
+
+    local directory_name_destination
+    directory_name_destination=$(basename "$directory_path_destination")
+
+    local directory_path_origin
+    directory_path_origin=$(run_remote_command "xdg-user-dir \"$directory\"")
+
     if [[ "$answer" =~ ^[yY] ]]; then
         # Create the local directory if it doesn't exist
         mkdir -p "$directory_path_destination"
