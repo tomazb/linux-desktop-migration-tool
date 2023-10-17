@@ -120,17 +120,21 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
         if [ "$relative_dir" == "done" ]; then
             break
         else
-            # Construct the full path by appending the relative path to the user's home directory
-            dir="$user_home_origin/$relative_dir"
-            
-            if run_remote_command "test -d '$dir'"; then
-                dir_to_copy+=("$relative_dir")
-                echo "Added $dir to the list of directories to copy."
+            if [ "$relative_dir" == ".ssh" ]; then
+                echo "Migrating the ~/.ssh directory is not currently supported. Skipping."
             else
-                echo "Directory does not exist on the remote machine. Please enter a valid directory path."
+                # Construct the full path by appending the relative path to the user's home directory
+                dir="$user_home_origin/$relative_dir"
+            
+                if run_remote_command "test -d '$dir'"; then
+                    dir_to_copy+=("$relative_dir")
+                    echo "Added $dir to the list of directories to copy."
+                else
+                    echo "Directory does not exist on the remote machine. Please enter a valid directory path."
+                fi
             fi
-        fi
-    done
+       fi     
+       done
     
 fi
 echo
@@ -171,8 +175,8 @@ copy_xdg_dir "MUSIC" "$mus_answer"
 copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
 # Loop through directories picked by the user and copy them over
-for dir_to_copy in "${directories_to_copy[@]}"; do
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$dir_to_copy/" "$HOME/$dir_to_copy"
+for copy_dir in "${dir_to_copy[@]}"; do
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$copy_dir/" "$HOME/$copy_dir"
 done
 
 # Reinstall flatpaks from the origin machine and copy over their data
