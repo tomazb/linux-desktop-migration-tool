@@ -94,7 +94,7 @@ done
 echo
 
 # Asking whether to copy files in home directories
-read -p "Would you like to migrate files in home directories? ([y]/n)" copy_answer
+read -p "Would you like to migrate files in home directories? ([y]/n): " copy_answer
 copy_answer=${copy_answer:-y}
 
 # Get the origin user home directory path
