@@ -20,9 +20,12 @@ get_directory_size() {
     # Check if the directory exists
     if run_remote_command "[ -d \"$directory\" ]"; then
         # Calculate the size of the directory in bytes using du command
-        local dir_size=$(run_remote_command "du -sb \"$directory\" | cut -f1")
+        local dir_size
+        dir_size=$(run_remote_command "du -sb \"$directory\" | cut -f1")
+
         # Convert bytes to GB (1 GB = 1024 * 1024 * 1024 bytes)
-        local dir_size_gb=$(echo "scale=2; $dir_size / (1024 * 1024 * 1024)" | bc)
+        local dir_size_gb
+        dir_size_gb=$(echo "scale=2; $dir_size / (1024 * 1024 * 1024)" | bc)
         echo "$dir_size_gb"
     else
         echo "Error: Directory not found or invalid path."
@@ -32,13 +35,20 @@ get_directory_size() {
 # Fuction to ask whether the XDG directory should be copied over
 get_copy_decision() {
     local directory="$1"
+
     # Get the directory path using xdg-user-dir
-    local directory_path=$(run_remote_command "xdg-user-dir \"$directory\"")
+    local directory_path
+    directory_path=$(run_remote_command "xdg-user-dir \"$directory\"")
+
     # Get the size of the directory
-    local size_in_gb=$(get_directory_size "$directory_path")
-    local directory_name=$(basename "$directory_path")
+    local size_in_gb
+    size_in_gb=$(get_directory_size "$directory_path")
+
+    local directory_name
+    directory_name=$(basename "$directory_path")
+
     # Ask the user if the directory should be included
-    read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. ([y]/n): " answer
+    IFS= read -p "Copy over $directory_name? The size of the folder is ${size_in_gb}GB. ([y]/n): " -r answer
     answer=${answer:-y}
 
     # Return the user's answer
@@ -49,21 +59,27 @@ get_copy_decision() {
 copy_xdg_dir() {
     local directory="$1"
     local answer="$2"
-    local directory_path_destination=$(xdg-user-dir "$directory")
-    local directory_name_destination=$(basename "$directory_path_destination")
-    local directory_path_origin=$(run_remote_command "xdg-user-dir \"$directory\"")
-    
+
+    local directory_path_destination
+    directory_path_destination=$(xdg-user-dir "$directory")
+
+    local directory_name_destination
+    directory_name_destination=$(basename "$directory_path_destination")
+
+    local directory_path_origin
+    directory_path_origin=$(run_remote_command "xdg-user-dir \"$directory\"")
+
     if [[ "$answer" =~ ^[yY] ]]; then
         # Create the local directory if it doesn't exist
         mkdir -p "$directory_path_destination"
         
         # Copy the directory from remote to local using rsync
         sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:$directory_path_origin/" "$directory_path_destination"
-        echo "The $directory_name has been copied over." 
+        echo "The $directory_name_destination has been copied over."
     fi
 }
 
-read -p "LINUX DESKTOP MIGRATION TOOL
+IFS= read -p "LINUX DESKTOP MIGRATION TOOL
 This is a tool that helps with migration to a new computer. It has several preconditions:
 
 - Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
@@ -72,14 +88,14 @@ This is a tool that helps with migration to a new computer. It has several preco
 
 Press Enter to continue or Ctrl+C to quit.
 
-"
+" -r
 
 while true; do
-    read -p "Enter the origin IP address: " origin_ip
-    read -p "Enter the origin username [$USER]: " username
+    IFS= read -p "Enter the origin IP address: " -r origin_ip
+    IFS= read -p "Enter the origin username [$USER]: " -r username
     username=${username:-$USER}
     echo -n "Enter the user password: "
-    read -s password
+    IFS= read -rs password
     echo
 
     # Check the SSH connection
@@ -94,7 +110,7 @@ done
 echo
 
 # Asking whether to copy files in home directories
-read -p "Would you like to migrate files in home directories? ([y]/n): " copy_answer
+IFS= read -p "Would you like to migrate files in home directories? ([y]/n): " -r copy_answer
 copy_answer=${copy_answer:-y}
 
 # Get the origin user home directory path
@@ -116,7 +132,7 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
     
     # Asking for arbitrary home directories to copy over
     while true; do
-        read -p "Enter the directory path (relative to your home directory) to copy (or 'done' to finish): " relative_dir
+        IFS= read -p "Enter the directory path (relative to your home directory) to copy (or 'done' to finish): " -r relative_dir
         if [ "$relative_dir" == "done" ]; then
             break
         else
@@ -140,12 +156,12 @@ fi
 echo
 
 # Ask the user if they want to reinstall Flatpak applications
-read -p "Do you want to reinstall Flatpak applications on the new machine? ([y]/n): " reinstall_answer
+IFS= read -p "Do you want to reinstall Flatpak applications on the new machine? ([y]/n): " -r reinstall_answer
 reinstall_answer=${reinstall_answer:-y}
 
 # Ask the user if they want to copy the Flatpak app data over
 if [[ "$reinstall_answer" =~ ^[yY] ]]; then
-    read -p "Do you want to copy the Flatpak app data over, too? ([y]/n): " data_answer
+    IFS= read -p "Do you want to copy the Flatpak app data over, too? ([y]/n): " -r data_answer
     data_answer=${data_answer:-y}
 fi
 
@@ -157,15 +173,15 @@ if command -v toolbox &>/dev/null; then
     IFS=$'\n' read -r -d '' -a container_ids_and_names <<< "$(echo "$toolbox_list_output" | awk '/^CONTAINER ID/{flag=1; next} flag && /^[a-f0-9]+/{print $1 "\t" $2}')"
     # If there are any Toolbx containers on the origin machine, ask whether to migrate them
     if [ "${#container_ids_and_names[@]}" -gt 0 ]; then
-    read -p "You seem to be using Toolbx, would you like to migrate its containers? ([y]/n): " toolbx_answer
+    IFS= read -p "You seem to be using Toolbx, would you like to migrate its containers? ([y]/n): " -r toolbx_answer
     toolbx_answer=${toolbx_answer:-y}
     fi
 fi
 
 echo
 
-read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
-"
+IFS= read -p "Press enter to start the migration. It will take some time. You can leave the computer, have a coffee and wait until the migration is finished.
+" -r
 
 # Copy home directories over
 copy_xdg_dir "DOCUMENTS" "$doc_answer"
