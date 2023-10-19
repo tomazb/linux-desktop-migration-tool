@@ -136,6 +136,7 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
         if [ "$relative_dir" == "done" ]; then
             break
         else
+            # Prevent migrating the .ssh directory because the script using ssh would just crash after the migration
             if [ "$relative_dir" == ".ssh" ]; then
                 echo "Migrating the ~/.ssh directory is not currently supported. Skipping."
             else
@@ -173,8 +174,18 @@ if command -v toolbox &>/dev/null; then
     IFS=$'\n' read -r -d '' -a container_ids_and_names <<< "$(echo "$toolbox_list_output" | awk '/^CONTAINER ID/{flag=1; next} flag && /^[a-f0-9]+/{print $1 "\t" $2}')"
     # If there are any Toolbx containers on the origin machine, ask whether to migrate them
     if [ "${#container_ids_and_names[@]}" -gt 0 ]; then
-    IFS= read -p "You seem to be using Toolbx, would you like to migrate its containers? ([y]/n): " -r toolbx_answer
-    toolbx_answer=${toolbx_answer:-y}
+        # Get the architecture of the local machine
+        local_arch=$(arch)
+        # Get the architecture of the remote machine
+        remote_arch=$(run_remote_command "arch")
+        # Check whether the hardware architecture is the same on both machines. If not, warn the user about it. Migration between different architectures is not disabled in case the architecture detection malfunctions or the user has a specific reason for the migration
+        if [ "$local_arch" == "$remote_arch" ]; then 
+            IFS= read -p "You seem to be using Toolbx, would you like to migrate its containers? ([y]/n): " -r toolbx_answer
+            toolbx_answer=${toolbx_answer:-y}
+        else
+            IFS= read -p "You seem to be using Toolbx, but the destination machine has a different hardware architecture than the origin one, existing containers won't work. Unless you have a specific reason, you should not migrate them. Migrate them anyway? (y/[n]): " -r toolbx_answer
+            toolbx_answer=${toolbx_answer:-n}
+        fi     
     fi
 fi
 
