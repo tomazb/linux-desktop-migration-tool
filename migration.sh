@@ -156,6 +156,10 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
 fi
 echo
 
+#Ask the user if they want to migrate credentials and secrets
+IFS= read -p "Do you want to migrate credentials and secrets (the keyring, ssh certificates and settings, PKI certificates)? ([y]/n) " -r secrets_answer
+secrets_answer=${secrets_answer:-y}
+
 # Ask the user if they want to reinstall Flatpak applications
 IFS= read -p "Do you want to reinstall Flatpak applications on the new machine? ([y]/n): " -r reinstall_answer
 reinstall_answer=${reinstall_answer:-y}
@@ -265,5 +269,12 @@ echo "Toolbx containers migrated.
 "
 fi
 
+# Migrate secrets and certificates
+if [[ "$secrets_answer" =~ ^[yY] ]]; then
+    # Copy over the directory with keyrings
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.local/share/keyring/" "$HOME/.local/share/keyring/"
+    #Copy over the directory with pki certificates and nss database
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.pki/" "$HOME/.pki/"
+    #Copy over the directory with ssh certificates and settings, make sure files on the destination machine are not overwritten before the last ssh connection is closed
 echo "
 The migration is finished!"
