@@ -254,7 +254,7 @@ if [[ "$toolbx_answer" =~ ^[yY] ]]; then
             # Export the image as tar remotely
             run_remote_command "podman save -o $container_name.tar $container_name-migrated"
             # Move the exported tar file from remote to local using rsync
-            sshpass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_name.tar" .
+            sshpsshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.pki/" "$HOME/.pki/"ass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_name.tar" .
             # Remove the exported image from local storage
             run_remote_command "podman rmi $container_name-migrated"
             # Load the image on the destination computer
@@ -272,9 +272,35 @@ fi
 # Migrate secrets and certificates
 if [[ "$secrets_answer" =~ ^[yY] ]]; then
     # Copy over the directory with keyrings
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.local/share/keyring/" "$HOME/.local/share/keyring/"
-    #Copy over the directory with pki certificates and nss database
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.local/share/keyrings/" "$HOME/.local/share/keyrings/"
+    # Copy over the directory with pki certificates and nss database
     sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.pki/" "$HOME/.pki/"
-    #Copy over the directory with ssh certificates and settings, make sure files on the destination machine are not overwritten before the last ssh connection is closed
+    # Check whether the gpg tool is present on both machines and if it is, migrate gpg keys
+    if ! command -v gpg &> /dev/null || ! run_remote_command "command -v gpg &> /dev/null"; then
+        echo "GPG (GNU Privacy Guard) is not detected on one or both machines. Skipping GPG key migration."
+    else
+        # Export GPG keys on the origin machine
+        run_remote_command "gpg --armor --export > $user_home_origin/gpg_keys.asc"
+        # Copy the file with exported keys over
+        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/gpg_keys.asc" "$HOME/"
+        # Import the keys from the file
+        gpg --import $HOME/gpg_keys.asc
+        # Delete the file with keys on both machines
+        run_remote_command "rm $user_home_origin/gpg_keys.asc"
+        rm $HOME/gpg_keys.asc
+    fi
+        
+    # Migrate ssh certificates and settings
+    # Make a temporary .ssh dir
+    mdir -p $HOME/.ssh-migration
+    # Copy the .ssh dir over to the temporary dir to avoid an ssh connection crash
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.ssh/" "$HOME/.ssh-migration/"
+    # Copy files from the temporary dir to ~/.ssh once the connection is closed
+    cp -a $HOME/.ssh-migration/* $HOME/.ssh/
+    # Delete the temporary dir
+    rm -r $HOME/.ssh-migration
+    echo "Secrets and certificates migrated.
+    "
+fi
 echo "
 The migration is finished!"
