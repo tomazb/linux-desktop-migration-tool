@@ -289,7 +289,14 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
         run_remote_command "rm $user_home_origin/gpg_keys.asc"
         rm $HOME/gpg_keys.asc
     fi
-        
+    
+    # Migrate GNOME Online Accounts
+    if run_remote_command "test -e '$user_home_origin/.config/goa-1.0/accounts.conf'"; then
+        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.config/goa-1.0/accounts.conf" "$HOME/.config/goa-1.0/"
+    else
+        echo "GNOME Online Accounts don't seem to be set up on the origin machine. Skipping."
+    fi    
+
     # Migrate ssh certificates and settings
     # Make a temporary .ssh dir
     mdir -p $HOME/.ssh-migration
@@ -299,7 +306,7 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     cp -a $HOME/.ssh-migration/* $HOME/.ssh/
     # Delete the temporary dir
     rm -r $HOME/.ssh-migration
-    echo "Secrets and certificates migrated.
+    echo "GNOME Online Accounts, secrets and certificates migrated.
     "
 fi
 echo "
