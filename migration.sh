@@ -310,4 +310,4 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     "
 fi
 echo "
-The migration is finished!"
+The migration is finished! Log out and in for all changes to take effect."
