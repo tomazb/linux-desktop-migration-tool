@@ -218,8 +218,6 @@ if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     flatpak_names_origin=$(echo "$installed_flatpaks_origin" | awk 'NR>1 {print}')
     # Capture the list of installed flatpaks on the destination machine
     installed_flatpaks_destination=$(flatpak list --app --columns=application)
-    # Parse the list using awk to skip the header and get the flatpak names
-    flatpak_names_destination=$(echo "$installed_flatpaks_destination" | awk 'NR>1 {print}')
     # Loop through each installed flatpak on the origin machine and install those that are not already installed on the destination machine
     while IFS= read -r flatpak_name <&3; do
         if [ -n "$flatpak_name" ]; then
