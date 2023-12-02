@@ -99,7 +99,7 @@ while true; do
     echo
 
     # Check the SSH connection
-    if sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new -q $username@$origin_ip exit; then
+    if sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new -q "$username"@"$origin_ip" exit; then
         echo "The connection has been successfully established."
         break  # Break the loop if the connection is successful
     else
@@ -284,10 +284,10 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
         # Copy the file with exported keys over
         sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/gpg_keys.asc" "$HOME/"
         # Import the keys from the file
-        gpg --import $HOME/gpg_keys.asc
+        gpg --import "$HOME"/gpg_keys.asc
         # Delete the file with keys on both machines
         run_remote_command "rm $user_home_origin/gpg_keys.asc"
-        rm $HOME/gpg_keys.asc
+        rm "$HOME"/gpg_keys.asc
     fi
     
     # Migrate GNOME Online Accounts
@@ -299,13 +299,13 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
 
     # Migrate ssh certificates and settings
     # Make a temporary .ssh dir
-    mdir -p $HOME/.ssh-migration
+    mdir -p "$HOME"/.ssh-migration
     # Copy the .ssh dir over to the temporary dir to avoid an ssh connection crash
     sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.ssh/" "$HOME/.ssh-migration/"
     # Copy files from the temporary dir to ~/.ssh once the connection is closed
-    cp -a $HOME/.ssh-migration/* $HOME/.ssh/
+    cp -a "$HOME"/.ssh-migration/* "$HOME"/.ssh/
     # Delete the temporary dir
-    rm -r $HOME/.ssh-migration
+    rm -r "$HOME"/.ssh-migration
     echo "GNOME Online Accounts, secrets and certificates migrated.
     "
 fi
