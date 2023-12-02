@@ -32,7 +32,7 @@ get_directory_size() {
     fi
 }
 
-# Fuction to ask whether the XDG directory should be copied over
+# Function to ask whether the XDG directory should be copied over
 get_copy_decision() {
     local directory="$1"
 
@@ -84,7 +84,7 @@ This is a tool that helps with migration to a new computer. It has several preco
 
 - Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
 - The origin computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
-- The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overriden.
+- The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overridden.
 
 Press Enter to continue or Ctrl+C to quit.
 
