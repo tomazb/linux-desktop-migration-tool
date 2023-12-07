@@ -32,7 +32,7 @@ get_directory_size() {
     fi
 }
 
-# Fuction to ask whether the XDG directory should be copied over
+# Function to ask whether the XDG directory should be copied over
 get_copy_decision() {
     local directory="$1"
 
@@ -84,7 +84,7 @@ This is a tool that helps with migration to a new computer. It has several preco
 
 - Both computers need to be on the same local network. You will need to know the IP address of the origin computer. You can find it out in the network settings.
 - The origin computer needs to have remote login via ssh enabled. You can enable it in Settings/Sharing.
-- The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overriden.
+- The destination computer is expected to be freshly installed with the user set up. Any data at the destination computer may be overridden.
 
 Press Enter to continue or Ctrl+C to quit.
 
@@ -99,7 +99,7 @@ while true; do
     echo
 
     # Check the SSH connection
-    if sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new -q $username@$origin_ip exit; then
+    if sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new -q "$username"@"$origin_ip" exit; then
         echo "The connection has been successfully established."
         break  # Break the loop if the connection is successful
     else
@@ -218,8 +218,6 @@ if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     flatpak_names_origin=$(echo "$installed_flatpaks_origin" | awk 'NR>1 {print}')
     # Capture the list of installed flatpaks on the destination machine
     installed_flatpaks_destination=$(flatpak list --app --columns=application)
-    # Parse the list using awk to skip the header and get the flatpak names
-    flatpak_names_destination=$(echo "$installed_flatpaks_destination" | awk 'NR>1 {print}')
     # Loop through each installed flatpak on the origin machine and install those that are not already installed on the destination machine
     while IFS= read -r flatpak_name <&3; do
         if [ -n "$flatpak_name" ]; then
@@ -284,10 +282,10 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
         # Copy the file with exported keys over
         sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/gpg_keys.asc" "$HOME/"
         # Import the keys from the file
-        gpg --import $HOME/gpg_keys.asc
+        gpg --import "$HOME"/gpg_keys.asc
         # Delete the file with keys on both machines
         run_remote_command "rm $user_home_origin/gpg_keys.asc"
-        rm $HOME/gpg_keys.asc
+        rm "$HOME"/gpg_keys.asc
     fi
     
     # Migrate GNOME Online Accounts
@@ -299,13 +297,13 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
 
     # Migrate ssh certificates and settings
     # Make a temporary .ssh dir
-    mdir -p $HOME/.ssh-migration
+    mdir -p "$HOME"/.ssh-migration
     # Copy the .ssh dir over to the temporary dir to avoid an ssh connection crash
     sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.ssh/" "$HOME/.ssh-migration/"
     # Copy files from the temporary dir to ~/.ssh once the connection is closed
-    cp -a $HOME/.ssh-migration/* $HOME/.ssh/
+    cp -a "$HOME"/.ssh-migration/* "$HOME"/.ssh/
     # Delete the temporary dir
-    rm -r $HOME/.ssh-migration
+    rm -r "$HOME"/.ssh-migration
     echo "GNOME Online Accounts, secrets and certificates migrated.
     "
 fi
