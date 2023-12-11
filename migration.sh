@@ -156,6 +156,10 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
 fi
 echo
 
+#Ask the user if they want to migrate settings
+IFS= read -p "Do you want to migrate desktop and app settings? ([y]/n) " -r settings_answer
+settings_answer=${settings_answer:-y}
+
 #Ask the user if they want to migrate credentials and secrets
 IFS= read -p "Do you want to migrate credentials and secrets (the keyring, ssh certificates and settings, PKI certificates)? ([y]/n) " -r secrets_answer
 secrets_answer=${secrets_answer:-y}
@@ -306,6 +310,19 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     rm -r "$HOME"/.ssh-migration
     echo "GNOME Online Accounts, secrets and certificates migrated.
     "
+fi
+
+# Migrate settings
+if [[ "settings_answer" =~ ^[yY] ]]; then
+    # Export Dconf settings on the origin machine
+    run_remote_command "dconf dump / > $user_home_origin/dconf-settings.txt"
+    # Copy the exported settings file to the destination machine
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/dconf-settings.txt" "$HOME/"
+    # Import Dconf settings on the destination machine
+    dconf load / < "$HOME/dconf-settings.txt"
+    # Clean up: Remove the exported settings file from both machines
+    run_remote_command "rm $user_home_origin/dconf-settings.txt"
+    rm "$HOME/dconf-settings.txt"
 fi
 echo "
 The migration is finished! Log out and in for all changes to take effect."
