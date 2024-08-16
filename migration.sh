@@ -313,16 +313,25 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
 fi
 
 # Migrate settings
-if [[ "settings_answer" =~ ^[yY] ]]; then
-    # Export Dconf settings on the origin machine
-    run_remote_command "dconf dump / > $user_home_origin/dconf-settings.txt"
-    # Copy the exported settings file to the destination machine
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/dconf-settings.txt" "$HOME/"
-    # Import Dconf settings on the destination machine
-    dconf load / < "$HOME/dconf-settings.txt"
-    # Clean up: Remove the exported settings file from both machines
-    run_remote_command "rm $user_home_origin/dconf-settings.txt"
-    rm "$HOME/dconf-settings.txt"
+if [[ "$settings_answer" =~ ^[yY] ]]; then
+    # Export Dconf settings on the origin machine and save to a variable
+    dconf_output=$(run_remote_command 'dconf dump /')
+    
+    # Check if the command was successful
+    if [[ $? -eq 0 ]]; then
+        echo "Dump success"
+        
+        # Copy the exported settings to the destination machine
+        echo "$dconf_output" | sshpass -p "$password" ssh "$username@$origin_ip" "cat > $user_home_origin/dconf-settings.txt"
+        
+        echo "$dconf_output"
+        # Import Dconf settings on the destination machine
+        echo "$dconf_output" | dconf load /
+        
+    else
+        echo "Dump failed"
+    fi
 fi
+
 echo "
 The migration is finished! Log out and in for all changes to take effect."
