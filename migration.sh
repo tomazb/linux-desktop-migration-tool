@@ -156,6 +156,10 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
 fi
 echo
 
+#Ask the user if they want to migrate settings
+IFS= read -p "Do you want to migrate desktop and app settings? ([y]/n) " -r settings_answer
+settings_answer=${settings_answer:-y}
+
 #Ask the user if they want to migrate credentials and secrets
 IFS= read -p "Do you want to migrate credentials and secrets (the keyring, ssh certificates and settings, PKI certificates)? ([y]/n) " -r secrets_answer
 secrets_answer=${secrets_answer:-y}
@@ -307,5 +311,54 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     echo "GNOME Online Accounts, secrets and certificates migrated.
     "
 fi
+
+# Migrate settings
+if [[ "$settings_answer" =~ ^[yY] ]]; then
+    # Export Dconf settings on the origin machine and save to a variable
+    dconf_output=$(run_remote_command 'dconf dump /')
+    
+    # Check if the command was successful
+    if [[ $? -eq 0 ]]; then
+        echo "Desktop settings from the origin machine loaded successfully."
+        
+        # Import Dconf settings on the destination machine directly
+        echo "$dconf_output" | dconf load -f /
+        
+        echo "Settings imported on the destination machine successfully.
+        "
+        
+    else
+        echo "Loading desktop settings from the origin computer failed."
+    fi
+    # Migrate the desktop background
+    # Read the picture-uri from the remote machine
+    remote_background_uri=$(run_remote_command "dconf read /org/gnome/desktop/background/picture-uri")
+
+    # Remove quotes from the URI
+    remote_background_uri=$(echo "$remote_background_uri" | tr -d "'")
+
+    # Check if the URI is a file URI
+    if [[ "$remote_background_uri" == file://* ]]; then
+        # Extract the file path from the URI
+        remote_file_path="${remote_background_uri#file://}"
+
+        # Check if the file exists on the local machine
+        if [[ ! -f "$remote_file_path" ]]; then
+            # Copy the file from the remote machine to the local machine
+            sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$remote_file_path" "$HOME/.config/background"
+            if [[ $? -eq 0 ]]; then
+                # Set the dconf key to the copied background file in URI format
+                dconf write /org/gnome/desktop/background/picture-uri "'file://"$HOME"/.config/background'"
+                dconf write /org/gnome/desktop/background/picture-uri-dark "'file://"$HOME"/.config/background'"
+                dconf write /org/gnome/desktop/screensaver/picture-uri "'file://"$HOME"/.config/background'"
+            fi  
+        else
+            echo "The background is already present on the destination machine."
+        fi
+    else
+        echo "The picture-uri is not a valid file URI."
+    fi
+fi
+
 echo "
 The migration is finished! Log out and in for all changes to take effect."
