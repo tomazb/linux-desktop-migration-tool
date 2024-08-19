@@ -8,6 +8,7 @@ Linux Desktop Migration Tool aims to make migration from one Linux desktop machi
 - Migrate Flatpak app data.
 - Migrate Toolbx containers.
 - Migrate ssh certificates, PKI certificates and nss database, GPG keys, keyring, GNOME Online Accounts.
+- Migrate GNOME desktop/app settings.
 
 ## Prerequisites
 - It is aimed for and tested on Fedora Silverblue, but it should work on any modern desktop distribution.
@@ -17,7 +18,7 @@ Linux Desktop Migration Tool aims to make migration from one Linux desktop machi
 - rsync, sshpass, xdg-user-dirs, gawk, gpg are installed.
 
 ## Planned features
-- Migration of GNOME desktop settings.
+- Migration of NetworkManager settings.
 
 ## How to Install and Run
 - just download the migration.sh file, open the terminal app and run 'sh migration.sh' command.
