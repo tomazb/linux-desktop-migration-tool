@@ -110,7 +110,7 @@ done
 echo
 
 # Asking whether to copy files in home directories
-IFS= read -p "Would you like to migrate files in home directories? ([y]/n): " -r copy_answer
+IFS= read -p "Do you want to migrate files in home directories? ([y]/n): " -r copy_answer
 copy_answer=${copy_answer:-y}
 
 # Get the origin user home directory path
@@ -157,7 +157,7 @@ fi
 echo
 
 #Ask the user if they want to migrate settings
-IFS= read -p "Do you want to migrate desktop and app settings? ([y]/n) " -r settings_answer
+IFS= read -p "Do you want to migrate desktop, app, and network settings? ([y]/n) " -r settings_answer
 settings_answer=${settings_answer:-y}
 
 #Ask the user if they want to migrate credentials and secrets
@@ -358,6 +358,10 @@ if [[ "$settings_answer" =~ ^[yY] ]]; then
     else
         echo "The picture-uri is not a valid file URI."
     fi
+    
+    # Check if NetworkManager is present on the origin machine.
+    if run_remote_command "command -v nmcli >/dev/null 2>&1"; then
+        run_remote_command "echo '$sudo_password' | sudo -S nmcli connection show"
 fi
 
 echo "
