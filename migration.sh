@@ -107,6 +107,19 @@ while true; do
         "
     fi
 done
+
+# Check whether the user on the origin machine is priviledged in order to know whether the tool can do operations that require a priviledged access on the origin machine.
+
+# Get the current user's groups
+user_groups=$(run_remote_command "groups \"~$username\"")
+
+# Check if the user is in the 'sudo' or 'wheel' group
+if [[ $user_groups == *"sudo"* ]] || [[ $user_groups == *"wheel"* ]]; then
+    is_privileged=true
+else
+    is_privileged=false
+fi
+
 echo
 
 # Asking whether to copy files in home directories
@@ -156,11 +169,20 @@ if [[ "$copy_answer" =~ ^[yY] ]]; then
 fi
 echo
 
-#Ask the user if they want to migrate settings
-IFS= read -p "Do you want to migrate desktop, app, and network settings? ([y]/n) " -r settings_answer
+# Ask the user if they want to migrate settings
+IFS= read -p "Do you want to migrate desktop and app settings? ([y]/n) " -r settings_answer
 settings_answer=${settings_answer:-y}
 
-#Ask the user if they want to migrate credentials and secrets
+# If the user on the origin machine is privileged, ask whether to migrate network settings, otherwise say the user doesn't have rights for it
+if [ "$is_privileged" = true ]; then
+    IFS= read -p "Do you want to migrate network settings? ([y]/n) " -r settings_answer
+    network_answer=${network_answer:-y}
+else
+    echo "The user on the origin machine doesn't have rights required for the migration of network settings. Skipping."
+    network_answer="n"
+fi        
+
+# Ask the user if they want to migrate credentials and secrets
 IFS= read -p "Do you want to migrate credentials and secrets (the keyring, ssh certificates and settings, PKI certificates)? ([y]/n) " -r secrets_answer
 secrets_answer=${secrets_answer:-y}
 
@@ -358,10 +380,14 @@ if [[ "$settings_answer" =~ ^[yY] ]]; then
     else
         echo "The picture-uri is not a valid file URI."
     fi
-    
-    # Check if NetworkManager is present on the origin machine.
+fi
+
+# Migrate network settings
+if [[ "$network_answer" =~ ^[yY] ]]; then
+# Check if NetworkManager is present on the origin machine.
     if run_remote_command "command -v nmcli >/dev/null 2>&1"; then
         run_remote_command "echo '$sudo_password' | sudo -S nmcli connection show"
+    fi
 fi
 
 echo "
