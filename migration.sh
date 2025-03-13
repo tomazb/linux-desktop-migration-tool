@@ -5,12 +5,18 @@
 # This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 #You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>. 
 
-# Function to run a command remotely over SSH
+# Function to run a command remotely over SSH, based on the second parameter it can run as either normal or privileged user
 run_remote_command() {
     local command_to_run="$1"
+    local use_sudo="$2"
 
-    # SSH into the remote machine and execute the command
-    sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$origin_ip" "$command_to_run"
+    if [[ "$use_sudo" == "true" ]]; then
+        # SSH into the remote machine and execute the command with sudo
+        sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$origin_ip" "echo '$password' | sudo -S $command_to_run"
+    else
+        # SSH into the remote machine and execute the command without sudo
+        sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new "$username@$origin_ip" "$command_to_run"
+    fi
 }
 
 # Function to get the size of a directory
@@ -111,13 +117,25 @@ done
 # Check whether the user on the origin machine is priviledged in order to know whether the tool can do operations that require a priviledged access on the origin machine.
 
 # Get the current user's groups
-user_groups=$(run_remote_command "groups \"~$username\"")
+remote_user_groups=$(run_remote_command "groups \"$username\"")
+
+# Check whether the user on the origin machine is priviledged in order to know whether the tool can do operations that require a priviledged access on the origin machine.
+if [[ $remote_user_groups == *"sudo"* ]] || [[ $remote_user_groups == *"wheel"* ]]; then
+    remote_is_privileged=true
+else
+    remote_is_privileged=false
+fi
+
+# Check whether the user on the destination machine is priviledged in order to know whether the tool can do operations that require a priviledged access on the destination machine.
+
+# Get the current user's groups
+local_user_groups=$(run_remote_command "groups \"~$username\"")
 
 # Check if the user is in the 'sudo' or 'wheel' group
-if [[ $user_groups == *"sudo"* ]] || [[ $user_groups == *"wheel"* ]]; then
-    is_privileged=true
+if [[ $local_user_groups == *"sudo"* ]] || [[ $remote_user_groups == *"wheel"* ]]; then
+    local_is_privileged=true
 else
-    is_privileged=false
+    local_is_privileged=false
 fi
 
 echo
@@ -173,12 +191,12 @@ echo
 IFS= read -p "Do you want to migrate desktop and app settings? ([y]/n) " -r settings_answer
 settings_answer=${settings_answer:-y}
 
-# If the user on the origin machine is privileged, ask whether to migrate network settings, otherwise say the user doesn't have rights for it
-if [ "$is_privileged" = true ]; then
+# If the user on both the origin machine and the destination machine is privileged, ask whether to migrate network settings, otherwise say the user doesn't have rights for it
+if [ "$remote_is_privileged" = true ] && [ "$local_is_privileged" = true ]; then
     IFS= read -p "Do you want to migrate network settings? ([y]/n) " -r settings_answer
-    network_answer=${network_answer:-y}
+    network_answer=${settings_answer:-y}
 else
-    echo "The user on the origin machine doesn't have rights required for the migration of network settings. Skipping."
+    echo "The user on either the origin machine or the destination machine doesn't have rights required for the migration of network settings. Skipping."
     network_answer="n"
 fi        
 
@@ -384,10 +402,21 @@ fi
 
 # Migrate network settings
 if [[ "$network_answer" =~ ^[yY] ]]; then
-# Check if NetworkManager is present on the origin machine.
-    if run_remote_command "command -v nmcli >/dev/null 2>&1"; then
-        run_remote_command "echo '$sudo_password' | sudo -S nmcli connection show"
-    fi
+    # Use the run_remote_command function to list files in the remote directory
+    file_list=$(run_remote_command "ls /etc/NetworkManager/system-connections/" "true")
+
+# Loop through each file in the list
+while read -r filename; do
+    # Get the content of the file using the run_remote_command function
+    content=$(run_remote_command "cat /etc/NetworkManager/system-connections/$filename")
+    
+    # Create a file locally with the same name and write the content to it
+    echo "$content" > "$HOME/$filename"
+    
+    # Optionally, store the filename and content in an associative array
+    #config_files["$filename"]="$content"
+done <<< "$file_list"
+
 fi
 
 echo "
