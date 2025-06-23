@@ -85,7 +85,7 @@ copy_xdg_dir() {
     fi
 }
 
-# Fuction to run commands locally using sudo
+# Function to run commands locally using sudo
 run_local_sudo() {
     local cmd="$1"
     echo "$local_password" | sudo -S --prompt='' bash -c "$cmd"
@@ -190,11 +190,32 @@ if run_remote_command "command -v nmcli &>/dev/null" "false" && command -v nmcli
 
     if [[ $remote_is_privileged == true ]] || [[ $local_is_privileged == true ]]; then
         IFS= read -p "Do you want to migrate network settings? ([y]/n) " -r network_answer
-        network_answer=${network_answer:-y}
+        network_answer=${network_answer:-y}        
+        # A loop to handle password verification
         if [[ $network_answer =~ ^[yY] ]]; then
-            echo -n "This operation requires your local user password: " 
-            IFS= read -rs local_password
-        fi    
+            local_password=""
+            max_attempts=3
+            attempt=0
+            password_valid=false            
+            # Ask the user for the local user password which is required to complete the network settings migration
+            while [[ $attempt -lt $max_attempts ]] && [[ $password_valid == false ]]; do
+                echo -n "This operation requires your local user password: "
+                IFS= read -rs local_password
+                echo            
+                # Password verification
+                if ! echo "$local_password" | sudo -S true 2>/dev/null; then
+                    echo "❌ Incorrect password. Attempts left: $((max_attempts - attempt - 1))"
+                    ((attempt++))
+                else
+                    password_valid=true
+                fi
+            done
+            # Skip the network migration if the user isn't able to type the correct password        
+            if [[ $password_valid == false ]]; then
+                echo "Too many failed attempts. Skipping network migration."
+                network_answer="n"
+            fi
+    fi   
     else
         echo "The user on either the origin machine or the destination machine doesn't have rights required for the migration of network settings. Skipping."
     network_answer="n"
@@ -420,20 +441,26 @@ if [[ "$network_answer" =~ ^[yY] ]]; then
         run_local_sudo "base64 -d <<< '${encoded_content}' > /etc/NetworkManager/system-connections/${file@Q}"
         run_local_sudo "chmod 600 /etc/NetworkManager/system-connections/${file@Q}"
         run_local_sudo "chown root:root /etc/NetworkManager/system-connections/${file@Q}"
-        
+    done    
         # Removing the .nmconnection suffix
         connection_name="${file%.nmconnection}"
+    
+    #Reload NM configuration
+    run_local_sudo "nmcli connection reload"
         
+    for file in "${network_files[@]}"; do
+        connection_name="${file%.nmconnection}"
+        echo "Modifying connection: $connection_name"
         # Modify permissions to set the current local user
         run_local_sudo "nmcli connection modify '${connection_name}' connection.permissions 'user:$(whoami)'"
         
-        # If the connection is tied to an interface that is specific to the origin machine, remove it, the connection will then map to any interface on the destination machine       
-        run_local_sudo "nmcli connection modify ${connection_name} connection.interface-name ''"
+        # If the connection is tied to an interface that is specific to the origin machine, remove it, the connection will then map to any interface on the destination machine
+        run_local_sudo "nmcli connection modify '${connection_name}' connection.interface-name ''"
     done
     
-    run_local_sudo "systemctl restart NetworkManager"
+    run_local_sudo "nmcli device reapply $(nmcli -g DEVICE device status)"
     echo "Network settings successfully migrated."
 fi
 
 echo "
-The migration is finished! Log out and in for all changes to take effect."
+The migration is finished! Log out and log in for all changes to take effect."

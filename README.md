@@ -9,6 +9,7 @@ Linux Desktop Migration Tool aims to make migration from one Linux desktop machi
 - Migrate Toolbx containers.
 - Migrate ssh certificates, PKI certificates and nss database, GPG keys, keyring, GNOME Online Accounts.
 - Migrate GNOME desktop/app settings.
+- Migrate network settings (wired, wi-fi, VPNs..., only NetworkManager supported).
 
 ## Prerequisites
 - It is aimed for and tested on Fedora Silverblue, but it should work on any modern desktop distribution.
@@ -17,11 +18,12 @@ Linux Desktop Migration Tool aims to make migration from one Linux desktop machi
 - Both users should have the same UID, names could be different.
 - rsync, sshpass, xdg-user-dirs, gawk, gpg are installed.
 
-## Planned features
-- Migration of NetworkManager settings.
-
 ## How to Install and Run
 - just download the migration.sh file, open the terminal app and run 'sh migration.sh' command.
+
+## Post-migration Steps
+- Log out and log in for all changes to take effect.
+- You will be prompted to unlock the keyring with the password from the origin computer for the first time.
 
 ## FAQ
 
