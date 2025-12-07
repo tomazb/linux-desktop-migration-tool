@@ -1,9 +1,18 @@
 #!/bin/bash
 
+set -o pipefail
+
 #Copyright 2023 Jiri Eischmann
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 # This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-#You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>. 
+#You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Constants
+readonly MAX_PASSWORD_ATTEMPTS=3
+readonly BYTES_PER_GB=$((1024 * 1024 * 1024))
+
+# Initialize arrays
+declare -a dir_to_copy=() 
 
 # Function to run a command remotely over SSH, based on the second parameter it can run as either normal or privileged user
 run_remote_command() {
@@ -29,9 +38,9 @@ get_directory_size() {
         local dir_size
         dir_size=$(run_remote_command "du -sb \"$directory\" | cut -f1")
 
-        # Convert bytes to GB (1 GB = 1024 * 1024 * 1024 bytes)
+        # Convert bytes to GB
         local dir_size_gb
-        dir_size_gb=$(echo "scale=2; $dir_size / (1024 * 1024 * 1024)" | bc)
+        dir_size_gb=$(echo "scale=2; $dir_size / $BYTES_PER_GB" | bc)
         echo "$dir_size_gb"
     else
         echo "Error: Directory not found or invalid path."
@@ -80,7 +89,7 @@ copy_xdg_dir() {
         mkdir -p "$directory_path_destination"
         
         # Copy the directory from remote to local using rsync
-        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" --stats "$username@$origin_ip:$directory_path_origin/" "$directory_path_destination"
+        rsync_from_remote "$directory_path_origin/" "$directory_path_destination" "--stats"
         echo "The $directory_name_destination has been copied over."
     fi
 }
@@ -89,6 +98,16 @@ copy_xdg_dir() {
 run_local_sudo() {
     local cmd="$1"
     echo "$local_password" | sudo -S --prompt='' bash -c "$cmd"
+}
+
+# Function to copy files from remote to local using rsync
+rsync_from_remote() {
+    local source_path="$1"
+    local dest_path="$2"
+    local extra_opts="${3:-}"
+    
+    # shellcheck disable=SC2086
+    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" $extra_opts "$username@$origin_ip:$source_path" "$dest_path"
 }
 
 IFS= read -p "LINUX DESKTOP MIGRATION TOOL
@@ -194,17 +213,16 @@ if run_remote_command "command -v nmcli &>/dev/null" "false" && command -v nmcli
         # A loop to handle password verification
         if [[ $network_answer =~ ^[yY] ]]; then
             local_password=""
-            max_attempts=3
             attempt=0
             password_valid=false            
             # Ask the user for the local user password which is required to complete the network settings migration
-            while [[ $attempt -lt $max_attempts ]] && [[ $password_valid == false ]]; do
+            while [[ $attempt -lt $MAX_PASSWORD_ATTEMPTS ]] && [[ $password_valid == false ]]; do
                 echo -n "This operation requires your local user password: "
                 IFS= read -rs local_password
                 echo            
                 # Password verification
                 if ! echo "$local_password" | sudo -S true 2>/dev/null; then
-                    echo "❌ Incorrect password. Attempts left: $((max_attempts - attempt - 1))"
+                    echo "❌ Incorrect password. Attempts left: $((MAX_PASSWORD_ATTEMPTS - attempt - 1))"
                     ((attempt++))
                 else
                     password_valid=true
@@ -277,7 +295,8 @@ copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 
 # Loop through directories picked by the user and copy them over
 for copy_dir in "${dir_to_copy[@]}"; do
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$copy_dir/" "$HOME/$copy_dir"
+    mkdir -p "$HOME/$copy_dir"
+    rsync_from_remote "$user_home_origin/$copy_dir/" "$HOME/$copy_dir"
 done
 
 # Reinstall flatpaks from the origin machine and copy over their data
@@ -305,7 +324,7 @@ if [[ "$reinstall_answer" =~ ^[yY] ]]; then
     if [[ "$data_answer" =~ ^[yY] ]]; then
         echo "Now the flatpak app data will be copied over."
         mkdir -p "$HOME/.var/app"
-        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.var/app/" "$HOME/.var/app/"
+        rsync_from_remote "$user_home_origin/.var/app/" "$HOME/.var/app/"
     fi
 fi
 
@@ -322,7 +341,7 @@ if [[ "$toolbx_answer" =~ ^[yY] ]]; then
             # Export the image as tar remotely
             run_remote_command "podman save -o $container_name.tar $container_name-migrated"
             # Move the exported tar file from remote to local using rsync
-            sshpsshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.pki/" "$HOME/.pki/"ass -p "$password" rsync -chazP --remove-source-files --chown="$USER:$USER" --stats "$username@$origin_ip:$container_name.tar" .
+            rsync_from_remote "$container_name.tar" "." "--remove-source-files --stats"
             # Remove the exported image from local storage
             run_remote_command "podman rmi $container_name-migrated"
             # Load the image on the destination computer
@@ -340,9 +359,11 @@ fi
 # Migrate secrets and certificates
 if [[ "$secrets_answer" =~ ^[yY] ]]; then
     # Copy over the directory with keyrings
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.local/share/keyrings/" "$HOME/.local/share/keyrings/"
+    mkdir -p "$HOME/.local/share/keyrings"
+    rsync_from_remote "$user_home_origin/.local/share/keyrings/" "$HOME/.local/share/keyrings/"
     # Copy over the directory with pki certificates and nss database
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.pki/" "$HOME/.pki/"
+    mkdir -p "$HOME/.pki"
+    rsync_from_remote "$user_home_origin/.pki/" "$HOME/.pki/"
     # Check whether the gpg tool is present on both machines and if it is, migrate gpg keys
     if ! command -v gpg &> /dev/null || ! run_remote_command "command -v gpg &> /dev/null"; then
         echo "GPG (GNU Privacy Guard) is not detected on one or both machines. Skipping GPG key migration."
@@ -350,7 +371,7 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
         # Export GPG keys on the origin machine
         run_remote_command "gpg --armor --export > $user_home_origin/gpg_keys.asc"
         # Copy the file with exported keys over
-        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/gpg_keys.asc" "$HOME/"
+        rsync_from_remote "$user_home_origin/gpg_keys.asc" "$HOME/"
         # Import the keys from the file
         gpg --import "$HOME"/gpg_keys.asc
         # Delete the file with keys on both machines
@@ -360,20 +381,22 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     
     # Migrate GNOME Online Accounts
     if run_remote_command "test -e '$user_home_origin/.config/goa-1.0/accounts.conf'"; then
-        sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.config/goa-1.0/accounts.conf" "$HOME/.config/goa-1.0/"
+        mkdir -p "$HOME/.config/goa-1.0"
+        rsync_from_remote "$user_home_origin/.config/goa-1.0/accounts.conf" "$HOME/.config/goa-1.0/"
     else
         echo "GNOME Online Accounts don't seem to be set up on the origin machine. Skipping."
     fi    
 
     # Migrate ssh certificates and settings
-    # Make a temporary .ssh dir
-    mdir -p "$HOME"/.ssh-migration
+    # Make a temporary .ssh dir using mktemp for security
+    ssh_temp_dir=$(mktemp -d "$HOME/.ssh-migration.XXXXXX")
     # Copy the .ssh dir over to the temporary dir to avoid an ssh connection crash
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$user_home_origin/.ssh/" "$HOME/.ssh-migration/"
+    rsync_from_remote "$user_home_origin/.ssh/" "$ssh_temp_dir/"
     # Copy files from the temporary dir to ~/.ssh once the connection is closed
-    cp -a "$HOME"/.ssh-migration/* "$HOME"/.ssh/
+    mkdir -p "$HOME/.ssh"
+    cp -a "$ssh_temp_dir"/* "$HOME/.ssh/"
     # Delete the temporary dir
-    rm -r "$HOME"/.ssh-migration
+    rm -r "$ssh_temp_dir"
     echo "GNOME Online Accounts, secrets and certificates migrated.
     "
 fi
@@ -411,8 +434,8 @@ if [[ "$settings_answer" =~ ^[yY] ]]; then
         # Check if the file exists on the local machine
         if [[ ! -f "$remote_file_path" ]]; then
             # Copy the file from the remote machine to the local machine
-            sshpass -p "$password" rsync -chazP --chown="$USER:$USER" "$username@$origin_ip:$remote_file_path" "$HOME/.config/background"
-            if [[ $? -eq 0 ]]; then
+            mkdir -p "$HOME/.config"
+            if rsync_from_remote "$remote_file_path" "$HOME/.config/background"; then
                 # Set the dconf key to the copied background file in URI format
                 dconf write /org/gnome/desktop/background/picture-uri "'file://"$HOME"/.config/background'"
                 dconf write /org/gnome/desktop/background/picture-uri-dark "'file://"$HOME"/.config/background'"
@@ -432,7 +455,7 @@ if [[ "$network_answer" =~ ^[yY] ]]; then
         run_remote_command "find /etc/NetworkManager/system-connections/ -type f -printf '%f\\n'" "true"
     )
     for file in "${network_files[@]}"; do
-        echo "Processsing: $file"
+        echo "Processing: $file"
         
         # Fetching content
         encoded_content=$(run_remote_command "base64 -w0 \"/etc/NetworkManager/system-connections/${file}\"" "true")
@@ -441,9 +464,7 @@ if [[ "$network_answer" =~ ^[yY] ]]; then
         run_local_sudo "base64 -d <<< '${encoded_content}' > /etc/NetworkManager/system-connections/${file@Q}"
         run_local_sudo "chmod 600 /etc/NetworkManager/system-connections/${file@Q}"
         run_local_sudo "chown root:root /etc/NetworkManager/system-connections/${file@Q}"
-    done    
-        # Removing the .nmconnection suffix
-        connection_name="${file%.nmconnection}"
+    done
     
     #Reload NM configuration
     run_local_sudo "nmcli connection reload"
