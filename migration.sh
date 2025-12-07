@@ -1,6 +1,7 @@
 #!/bin/bash
 
-set -o pipefail
+set -euo pipefail
+trap 'echo "❌ Error on line ${LINENO}. Aborting." >&2' ERR
 
 #Copyright 2023 Jiri Eischmann
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
@@ -12,7 +13,52 @@ readonly MAX_PASSWORD_ATTEMPTS=3
 readonly BYTES_PER_GB=$((1024 * 1024 * 1024))
 
 # Initialize arrays
-declare -a dir_to_copy=() 
+declare -a dir_to_copy=()
+
+# Helper to check local dependencies
+require_local_bins() {
+    local missing=()
+    local bins=(sshpass rsync xdg-user-dir bc)
+
+    for bin in "${bins[@]}"; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            missing+=("$bin")
+        fi
+    done
+
+    if (( ${#missing[@]} )); then
+        echo "Missing required local tools: ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+# Helper to check remote dependencies
+require_remote_bins() {
+    local missing=()
+    local bins=(rsync xdg-user-dir du bc)
+
+    for bin in "${bins[@]}"; do
+        if ! run_remote_command "command -v $bin >/dev/null 2>&1"; then
+            missing+=("$bin")
+        fi
+    done
+
+    if (( ${#missing[@]} )); then
+        echo "Missing required tools on origin host: ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+# Helper to restore SELinux contexts when SELinux is enabled
+restorecon_if_selinux() {
+    local target_path="$1"
+
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+        if command -v restorecon >/dev/null 2>&1; then
+            restorecon -RF "$target_path"
+        fi
+    fi
+}
 
 # Function to run a command remotely over SSH, based on the second parameter it can run as either normal or privileged user
 run_remote_command() {
@@ -90,6 +136,7 @@ copy_xdg_dir() {
         
         # Copy the directory from remote to local using rsync
         rsync_from_remote "$directory_path_origin/" "$directory_path_destination" "--stats"
+        restorecon_if_selinux "$directory_path_destination"
         echo "The $directory_name_destination has been copied over."
     fi
 }
@@ -99,6 +146,8 @@ run_local_sudo() {
     local cmd="$1"
     echo "$local_password" | sudo -S --prompt='' bash -c "$cmd"
 }
+
+require_local_bins
 
 # Function to copy files from remote to local using rsync
 rsync_from_remote() {
@@ -132,6 +181,7 @@ while true; do
     # Check the SSH connection
     if sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new -q "$username"@"$origin_ip" exit; then
         echo "The connection has been successfully established."
+        require_remote_bins
         break  # Break the loop if the connection is successful
     else
         echo "The connection with the origin computer could not be established. Please check the login information and make sure remote login is enabled on the origin computer.
@@ -297,6 +347,7 @@ copy_xdg_dir "DOWNLOAD" "$dwn_answer"
 for copy_dir in "${dir_to_copy[@]}"; do
     mkdir -p "$HOME/$copy_dir"
     rsync_from_remote "$user_home_origin/$copy_dir/" "$HOME/$copy_dir"
+    restorecon_if_selinux "$HOME/$copy_dir"
 done
 
 # Reinstall flatpaks from the origin machine and copy over their data
@@ -325,6 +376,7 @@ if [[ "$reinstall_answer" =~ ^[yY] ]]; then
         echo "Now the flatpak app data will be copied over."
         mkdir -p "$HOME/.var/app"
         rsync_from_remote "$user_home_origin/.var/app/" "$HOME/.var/app/"
+        restorecon_if_selinux "$HOME/.var/app"
     fi
 fi
 
@@ -361,9 +413,11 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     # Copy over the directory with keyrings
     mkdir -p "$HOME/.local/share/keyrings"
     rsync_from_remote "$user_home_origin/.local/share/keyrings/" "$HOME/.local/share/keyrings/"
+    restorecon_if_selinux "$HOME/.local/share/keyrings"
     # Copy over the directory with pki certificates and nss database
     mkdir -p "$HOME/.pki"
     rsync_from_remote "$user_home_origin/.pki/" "$HOME/.pki/"
+    restorecon_if_selinux "$HOME/.pki"
     # Check whether the gpg tool is present on both machines and if it is, migrate gpg keys
     if ! command -v gpg &> /dev/null || ! run_remote_command "command -v gpg &> /dev/null"; then
         echo "GPG (GNU Privacy Guard) is not detected on one or both machines. Skipping GPG key migration."
@@ -383,6 +437,7 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     if run_remote_command "test -e '$user_home_origin/.config/goa-1.0/accounts.conf'"; then
         mkdir -p "$HOME/.config/goa-1.0"
         rsync_from_remote "$user_home_origin/.config/goa-1.0/accounts.conf" "$HOME/.config/goa-1.0/"
+        restorecon_if_selinux "$HOME/.config/goa-1.0"
     else
         echo "GNOME Online Accounts don't seem to be set up on the origin machine. Skipping."
     fi    
@@ -394,7 +449,12 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     rsync_from_remote "$user_home_origin/.ssh/" "$ssh_temp_dir/"
     # Copy files from the temporary dir to ~/.ssh once the connection is closed
     mkdir -p "$HOME/.ssh"
-    cp -a "$ssh_temp_dir"/* "$HOME/.ssh/"
+    shopt -s nullglob dotglob
+    if compgen -G "$ssh_temp_dir/*" > /dev/null; then
+        cp -a "$ssh_temp_dir"/* "$HOME/.ssh/"
+    fi
+    shopt -u nullglob dotglob
+    restorecon_if_selinux "$HOME/.ssh"
     # Delete the temporary dir
     rm -r "$ssh_temp_dir"
     echo "GNOME Online Accounts, secrets and certificates migrated.
@@ -436,6 +496,7 @@ if [[ "$settings_answer" =~ ^[yY] ]]; then
             # Copy the file from the remote machine to the local machine
             mkdir -p "$HOME/.config"
             if rsync_from_remote "$remote_file_path" "$HOME/.config/background"; then
+                restorecon_if_selinux "$HOME/.config"
                 # Set the dconf key to the copied background file in URI format
                 dconf write /org/gnome/desktop/background/picture-uri "'file://"$HOME"/.config/background'"
                 dconf write /org/gnome/desktop/background/picture-uri-dark "'file://"$HOME"/.config/background'"
@@ -464,6 +525,7 @@ if [[ "$network_answer" =~ ^[yY] ]]; then
         run_local_sudo "base64 -d <<< '${encoded_content}' > /etc/NetworkManager/system-connections/${file@Q}"
         run_local_sudo "chmod 600 /etc/NetworkManager/system-connections/${file@Q}"
         run_local_sudo "chown root:root /etc/NetworkManager/system-connections/${file@Q}"
+        run_local_sudo "if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then restorecon /etc/NetworkManager/system-connections/${file@Q}; fi"
     done
     
     #Reload NM configuration
