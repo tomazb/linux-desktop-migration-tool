@@ -1,0 +1,45 @@
+name: Migration checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Fedora ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['43', '44']
+    container:
+      image: registry.fedoraproject.org/fedora:${{ matrix.release }}
+    steps:
+      - name: Install test tools
+        run: dnf5 install --assumeyes git python3 procps-ng flatpak
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run regression tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check command entry points and legacy shell syntax
+        run: |
+          python3 fedora-migration.py --help
+          bash -n migration.sh
+      - name: Exercise real DNF5 and empty Flatpak inventories
+        run: |
+          python3 - <<'PY'
+          from fedora_migration.packages import collect_packages, validate_package_manifest
+          inventory = collect_packages()
+          validate_package_manifest(inventory)
+          assert inventory['rpm']['status'] == 'captured'
+          assert inventory['rpm']['requests'], 'Expected installed RPM requests in the Fedora container'
+          assert inventory['rpm']['inventory'], 'Expected an RPM inventory'
+          assert inventory['flatpak']['status'] == 'captured'
+          print('Captured', len(inventory['rpm']['requests']), 'RPM requests and',
+                len(inventory['flatpak']['apps']), 'Flatpak apps')
+          PY
