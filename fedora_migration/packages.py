@@ -211,7 +211,9 @@ def collect_packages(*, skip_rpm=False, skip_flatpak=False):
         _check_standard_installations()
     if not skip_rpm:
         try:
-            requests = _run(["dnf5", "repoquery", "--installed", "--userinstalled", "--queryformat", "%{name}.%{arch}\n"])
+            # --userinstalled already selects installed packages; DNF5 rejects
+            # combining it with the separate --installed selector.
+            requests = _run(["dnf5", "repoquery", "--userinstalled", "--queryformat", "%{name}.%{arch}\n"])
             inventory = _run(["dnf5", "repoquery", "--installed", "--queryformat", "%{name}.%{arch}\t%{reason}\t%{from_repo}\t%{full_nevra}\n"])
         except FileNotFoundError as exc:
             raise PackageError("dnf5 is required to capture RPM packages; install it or use --skip-rpm") from exc

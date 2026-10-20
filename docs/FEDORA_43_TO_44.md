@@ -139,12 +139,13 @@ versions; the tool does not reinstall exact Fedora 43 builds. Equivalent manual
 export syntax from [DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html):
 
 ```bash
-dnf5 repoquery --installed --userinstalled --queryformat '%{name}.%{arch}\n'
+dnf5 repoquery --userinstalled --queryformat '%{name}.%{arch}\n'
 dnf5 repoquery --installed \
   --queryformat '%{name}.%{arch} %{reason} %{from_repo} %{full_nevra}\n'
 ```
 
-`--userinstalled` also includes group/module and unknown reasons. It is not an
+`--userinstalled` selects installed packages on its own; DNF5 rejects combining
+it with `--installed`. It also includes group/module and unknown reasons. It is not an
 exact list of applications deliberately chosen by the user. Configured DNF
 excludes can affect both requests and inventory. Review missing,
 renamed or local RPM requests. Configure Fedora-44-compatible trusted repositories

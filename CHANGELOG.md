@@ -36,6 +36,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Hardened
 
+- Correct the RPM request query to use DNF5's `--userinstalled` selector alone;
+  Fedora container CI caught its incompatibility with `--installed`.
 - Reject unsupported nondefault XDG config/data layouts and escaped user-directory
   assignments; bound manifest mtime to signed 64-bit nanoseconds.
 - Write a complete restore intent plan before payload changes; retain saved

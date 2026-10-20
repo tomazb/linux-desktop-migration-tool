@@ -57,7 +57,7 @@ modules. The original shell script remains available for its existing workflow.
   document accepted behavior, retained fork fixes and upstream provenance.
 - [x] Run the full suite, a standalone CLI backup/verify/restore rehearsal on
   fixtures, and an independent branch review; address concrete findings.
-- [ ] Publish all changes on `codex/fedora-43-to-44-xfce` based on upstream commit
+- [x] Publish all changes on `codex/fedora-43-to-44-xfce` based on upstream commit
   `272c2d63fc003c308071b2cbb0a42225597efa14`, open a draft PR, and report limits.
 
 ## Verification record before publication
@@ -73,3 +73,11 @@ modules. The original shell script remains available for its existing workflow.
   new defect and checked real local rsync filtering on disposable fixtures.
 - Live Fedora XFCE migration and user-hardware behavior remain unverified.
   Fedora container CI results will be visible on the published pull request.
+
+## Fedora CI follow-up
+
+Published draft PR #1. The first Fedora 43/44 container runs passed all 90 tests
+but caught a real DNF5 selector error: `--installed` cannot be combined with
+`--userinstalled`. Corrected the request query and strengthened its mocked
+regression to reject that combination. The separate complete installed-inventory
+query still uses `--installed`. CI is rerun on the correction before final delivery.

@@ -35,6 +35,9 @@ class PackageTests(unittest.TestCase):
     def capture_output(self, argv, **kwargs):
         if argv[0] == "dnf5":
             if "--userinstalled" in argv:
+                # Fedora 43/44 DNF5 rejects these mutually exclusive selectors.
+                if "--installed" in argv:
+                    raise packages.PackageError("--userinstalled not allowed with --installed")
                 return "gcc-c++.x86_64\nlib_example.i686\ngcc-c++.x86_64\n"
             return "gcc-c++.x86_64\tUser\tfedora\tgcc-c++-0:15.2-1.fc43.x86_64\n"
         scope = "user" if "--user" in argv else "system"
@@ -50,7 +53,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(data["flatpak"], manifest()["flatpak"])
         self.assertTrue(data["warnings"])
         calls = [call.args[0] for call in run.call_args_list]
-        self.assertIn(["dnf5", "repoquery", "--installed", "--userinstalled", "--queryformat", "%{name}.%{arch}\n"], calls)
+        self.assertIn(["dnf5", "repoquery", "--userinstalled", "--queryformat", "%{name}.%{arch}\n"], calls)
         self.assertIn(["dnf5", "repoquery", "--installed", "--queryformat", "%{name}.%{arch}\t%{reason}\t%{from_repo}\t%{full_nevra}\n"], calls)
         self.assertIn(["flatpak", "list", "--user", "--app", "--columns=ref,origin"], calls)
         self.assertIn(["flatpak", "remotes", "--system", "--show-disabled", "--columns=name,url"], calls)
