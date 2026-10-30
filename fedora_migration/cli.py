@@ -288,11 +288,15 @@ def restore_command(args):
         packages.install_packages(
             manifest["packages"], skip_rpm=args.skip_rpm, skip_flatpak=args.skip_flatpak,
         )
-    # Package operations can take time: recheck the session immediately before copying.
-    assert_xfce_stopped()
-    assert_applications_closed(secrets=secrets)
+    def recheck_before_writing():
+        # Package installs and re-verifying a large bundle take time: recheck
+        # after verification, immediately before the first file changes.
+        assert_xfce_stopped()
+        assert_applications_closed(secrets=secrets)
+
     print("Restoring selected files and retaining prior versions...", flush=True)
-    result = bundle.restore_bundle(source_path, home, dry_run=False, backup_dir=rollback)
+    result = bundle.restore_bundle(source_path, home, dry_run=False, backup_dir=rollback,
+                                   before_write=recheck_before_writing)
     if result["backup_dir"]:
         print(f"Rollback directory: {result['backup_dir']}", flush=True)
     if selinux:

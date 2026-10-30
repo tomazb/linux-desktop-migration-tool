@@ -39,7 +39,8 @@ Use `--exclude PATTERN` to leave out home-relative paths or globs; each `*` matc
 one path segment and exclusions win over includes. The monitor layout
 (`displays.xml`) and `.var/app/*/cache` are excluded by default because a new
 machine's outputs differ; `--no-default-excludes` keeps them. Every exclusion is
-reported as a warning in the summary and the restore preview.
+reported as a warning in the summary and the restore preview, counting each
+excluded tree once; a pattern of yours that matched nothing is reported too.
 Supported secrets such as `.ssh`, `.gnupg`, `.pki`, keyrings and `.config/goa-1.0` require
 `--include-secrets` or an explicit `--include` of that secret root or a path below it.
 Broad parent includes do not implicitly select these known secret trees.

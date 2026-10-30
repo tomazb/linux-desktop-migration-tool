@@ -248,14 +248,18 @@ class CLITests(unittest.TestCase):
 
         cases = (
             (["restore", "--bundle", str(bundle)], ["verify"]),
+            # Session and application guards run before package installation and
+            # again after the final verification, immediately before writing.
             (["restore", "--bundle", str(bundle), "--apply", "--install-packages"],
-             ["verify", "install", "verify"]),
+             ["verify", "xfce", "apps", "install", "verify", "xfce", "apps"]),
         )
+        self.applications_guard.side_effect = lambda **kwargs: events.append("apps")
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 events.clear()
                 with patch.object(cli, "platform_info", return_value=info), \
-                     patch.object(cli, "assert_xfce_stopped"), \
+                     patch.object(cli, "assert_xfce_stopped",
+                                  side_effect=lambda: events.append("xfce")), \
                      patch.object(cli, "check_selinux_tools", return_value=False), \
                      patch.object(cli.packages, "install_packages",
                                   side_effect=lambda *a, **k: events.append("install")), \

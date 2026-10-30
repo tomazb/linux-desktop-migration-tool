@@ -725,5 +725,75 @@ class BackupHashingTests(BundleFixture):
             self.assertEqual(recorded[relative], digest(self.home / relative))
 
 
+class ExcludeReportingTests(BundleFixture):
+    def warnings(self, manifest):
+        return "\n".join(manifest["warnings"])
+
+    def test_unmatched_user_pattern_is_reported(self):
+        self.write(self.home / "Projects/build/out.o")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects/buid"])
+        self.assertIn("Exclusion 'Projects/buid' matched nothing", self.warnings(manifest))
+        self.assertIn("Projects/build/out.o", {e["path"] for e in manifest["entries"]})
+
+    def test_each_existing_path_counted_once_under_first_matching_pattern(self):
+        self.write(self.home / "Projects/build/out.o")
+        self.write(self.home / "Projects/main.c")
+        manifest = self.backup(include=["Projects", "Projects/build"], settings_only=True,
+                               exclude=["Projects/build", "Projects/*"])
+        text = self.warnings(manifest)
+        self.assertIn("Excluded 1 path matching 'Projects/build'", text)
+        self.assertIn("Excluded 1 path matching 'Projects/*'", text)
+
+    def test_missing_paths_are_not_counted(self):
+        manifest = self.backup(exclude=[".config"])
+        self.assertIn("Exclusion '.config' matched nothing", self.warnings(manifest))
+        self.assertNotIn("Excluded", self.warnings(manifest))
+
+    def test_unmatched_default_patterns_stay_quiet(self):
+        self.write(self.home / ".bashrc")
+        self.assertNotIn("matched nothing", self.warnings(self.backup()))
+
+
+class RestoreWriteHookTests(BundleFixture):
+    def test_before_write_runs_after_verification_and_before_any_change(self):
+        self.write(self.home / ".bashrc", b"new")
+        self.backup()
+        events = []
+        verify = bundle_module.verify_bundle
+
+        def counted(path):
+            events.append("verify")
+            return verify(path)
+
+        def hook():
+            events.append("hook")
+            self.assertEqual(list(self.target.iterdir()), [])
+
+        with patch("fedora_migration.bundle.verify_bundle", side_effect=counted):
+            restore_bundle(self.bundle, self.target, dry_run=False, before_write=hook)
+        self.assertEqual(events, ["verify", "hook"])
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"new")
+
+    def test_failing_hook_prevents_all_writes(self):
+        self.write(self.home / ".bashrc", b"new")
+        self.backup()
+        rollback = self.root / "rollback"
+
+        def refuse():
+            raise RuntimeError("firefox started")
+
+        with self.assertRaisesRegex(RuntimeError, "firefox started"):
+            restore_bundle(self.bundle, self.target, dry_run=False,
+                           backup_dir=rollback, before_write=refuse)
+        self.assertEqual(list(self.target.iterdir()), [])
+        self.assertFalse(os.path.lexists(rollback))
+
+    def test_preview_never_calls_hook(self):
+        self.write(self.home / ".bashrc")
+        self.backup()
+        restore_bundle(self.bundle, self.target, before_write=self.fail)
+
+
 if __name__ == "__main__":
     unittest.main()

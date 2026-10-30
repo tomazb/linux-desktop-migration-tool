@@ -6,7 +6,6 @@ an attacker. Symlinks are copied as links and are never traversed.
 """
 
 import contextlib
-from collections import Counter
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 import functools
@@ -384,13 +383,16 @@ def create_bundle(home, output, source, packages, *, include=(),
         user_excludes = tuple(_safe_path(os.fspath(value)) for value in exclude)
         defaults = DEFAULT_EXCLUDES if default_excludes else ()
         excludes = tuple(dict.fromkeys(user_excludes + defaults))
-        excluded = Counter()
+        # Existing paths left out, recorded under the first pattern that matches.
+        excluded = {pattern: set() for pattern in excludes}
 
         def is_excluded(relative):
             pattern = _exclusion(excludes, relative)
-            if pattern is not None:
-                excluded[pattern] += 1
-            return pattern is not None
+            if pattern is None:
+                return False
+            if os.path.lexists(home / relative):
+                excluded[pattern].add(relative)
+            return True
 
         def secret_excluded(relative):
             for secret in SECRETS:
@@ -463,12 +465,17 @@ def create_bundle(home, output, source, packages, *, include=(),
         for relative in selected:
             copy_entry(relative)
         for pattern in excludes:
-            if excluded[pattern]:
+            paths_left_out = excluded[pattern]
+            # Count each excluded tree once, not also its separately listed members.
+            count = sum(not any(path.startswith(other + "/") for other in paths_left_out)
+                        for path in paths_left_out)
+            if count:
                 note = (" (default; use --no-default-excludes to include)"
                         if pattern in defaults and pattern not in user_excludes else "")
-                count = excluded[pattern]
                 warnings.append(f"Excluded {count} path{'s' if count != 1 else ''} "
                                 f"matching {pattern!r}{note}")
+            elif pattern in user_excludes:
+                warnings.append(f"Exclusion {pattern!r} matched nothing; check the path")
         # Apply directory times after copying children. Keep owner access during
         # assembly and verification; source directory modes live in the manifest.
         manifest = {
@@ -668,8 +675,12 @@ def plan_restore(bundle, home, manifest, *, backup_dir=None):
 
 
 @_owner_accessible
-def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
-    """Preview or overlay a validated bundle, retaining originals and a journal."""
+def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=None):
+    """Preview or overlay a validated bundle, retaining originals and a journal.
+
+    before_write, if given, runs after verification and destination checks and
+    immediately before the first change; an exception from it prevents all writes.
+    """
     bundle, home = _absolute(bundle), _absolute(home)
     rollback = None
     staging = None
@@ -680,6 +691,8 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
         summary, candidate = _plan(bundle, home, manifest, backup_dir)
         if dry_run:
             return summary
+        if before_write is not None:
+            before_write()
         directories = sorted((e for e in entries if e["type"] == "directory"),
                              key=lambda e: (e["path"].count("/"), e["path"]))
         planned_replaced = {
