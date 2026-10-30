@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "tool_version": "1.0",
+  "created_at": "2026-10-30T18:07:12.473681+00:00",
+  "source": {
+    "id": "fedora",
+    "version_id": "43",
+    "pretty_name": "Fedora Linux 43 (Workstation Edition)",
+    "architecture": "x86_64",
+    "username": "alice",
+    "uid": 1000,
+    "home": "/home/alice"
+  },
+  "packages": {
+    "rpm": {
+      "status": "captured",
+      "requests": [
+        "gcc.x86_64",
+        "htop.x86_64"
+      ],
+      "inventory": [
+        {
+          "spec": "gcc.x86_64",
+          "reason": "User",
+          "from_repo": "fedora",
+          "full_nevra": "gcc-0:15.2.1-1.fc43.x86_64"
+        },
+        {
+          "spec": "htop.x86_64",
+          "reason": "User",
+          "from_repo": "fedora",
+          "full_nevra": "htop-0:3.4.1-1.fc43.x86_64"
+        }
+      ]
+    },
+    "flatpak": {
+      "status": "captured",
+      "apps": [
+        {
+          "scope": "user",
+          "ref": "org.gimp.GIMP/x86_64/stable",
+          "origin": "flathub"
+        }
+      ],
+      "remotes": [
+        {
+          "scope": "user",
+          "name": "flathub",
+          "url": "https://dl.flathub.org/repo/"
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "selected_paths": [
+    ".bashrc",
+    ".config/xfce4"
+  ],
+  "entries": [
+    {
+      "path": ".bashrc",
+      "type": "file",
+      "mode": 420,
+      "mtime_ns": 1700000000000000000,
+      "size": 39,
+      "sha256": "ebd77aeac2ddf2001148a3dc47a26e5649371bf5ccc68065d35e860fbf34ab07"
+    },
+    {
+      "path": ".config",
+      "type": "directory",
+      "mode": 493,
+      "mtime_ns": 1700000000000000000
+    },
+    {
+      "path": ".config/xfce4",
+      "type": "directory",
+      "mode": 493,
+      "mtime_ns": 1700000000000000000
+    },
+    {
+      "path": ".config/xfce4/panel-link.xml",
+      "type": "symlink",
+      "mode": 511,
+      "mtime_ns": 1700000000000000000,
+      "target": "xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+    },
+    {
+      "path": ".config/xfce4/terminal",
+      "type": "directory",
+      "mode": 493,
+      "mtime_ns": 1700000000000000000
+    },
+    {
+      "path": ".config/xfce4/terminal/terminalrc",
+      "type": "file",
+      "mode": 384,
+      "mtime_ns": 1700000000000000000,
+      "size": 63,
+      "sha256": "695876189ec869fea9380b7b6763f15e2e2ae39339890f92eab96c9fa4be18ed"
+    },
+    {
+      "path": ".config/xfce4/xfconf",
+      "type": "directory",
+      "mode": 493,
+      "mtime_ns": 1700000000000000000
+    },
+    {
+      "path": ".config/xfce4/xfconf/xfce-perchannel-xml",
+      "type": "directory",
+      "mode": 493,
+      "mtime_ns": 1700000000000000000
+    },
+    {
+      "path": ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml",
+      "type": "file",
+      "mode": 420,
+      "mtime_ns": 1700000000000000000,
+      "size": 434,
+      "sha256": "aa7946b3603e73fac7f2ce29d68b81f43096cba5aa32fe0bce769b161d4266a4"
+    }
+  ],
+  "warnings": [
+    "Missing source path, skipped: .bash_profile",
+    "Missing source path, skipped: .config/Thunar",
+    "Missing source path, skipped: .config/autostart",
+    "Missing source path, skipped: .config/gtk-2.0",
+    "Missing source path, skipped: .config/gtk-3.0",
+    "Missing source path, skipped: .config/gtk-4.0",
+    "Missing source path, skipped: .config/mimeapps.list",
+    "Missing source path, skipped: .config/user-dirs.dirs",
+    "Missing source path, skipped: .config/user-dirs.locale",
+    "Missing source path, skipped: .fonts",
+    "Missing source path, skipped: .gtkrc-2.0",
+    "Missing source path, skipped: .icons",
+    "Missing source path, skipped: .local/bin",
+    "Missing source path, skipped: .local/share/applications",
+    "Missing source path, skipped: .local/share/backgrounds",
+    "Missing source path, skipped: .local/share/fonts",
+    "Missing source path, skipped: .local/share/icons",
+    "Missing source path, skipped: .local/share/themes",
+    "Missing source path, skipped: .themes"
+  ]
+}

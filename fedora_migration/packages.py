@@ -118,18 +118,40 @@ def _mapping(value, label, keys):
         raise PackageError(f"{label} must be an object containing {', '.join(keys)}")
 
 
+# Exact keys of every package-manifest object, per manifest schema version. A new
+# schema version adds an entry here instead of loosening the older ones, so each
+# version keeps rejecting unexpected keys.
+_KEYS_V1 = {
+    "package": ("rpm", "flatpak", "warnings"),
+    "rpm": ("status", "requests", "inventory"),
+    "flatpak": ("status", "apps", "remotes"),
+    "rpm_entry": ("spec", "reason", "from_repo", "full_nevra"),
+    "remote": ("scope", "name", "url"),
+    "app": ("scope", "origin", "ref"),
+}
+PACKAGE_KEYS = {1: _KEYS_V1, 2: dict(_KEYS_V1)}
+CURRENT_SCHEMA = 2
+
+
 def _list(value, label):
     if not isinstance(value, list):
         raise PackageError(f"{label} must be a list")
 
 
-def validate_package_manifest(data):
-    """Validate without invoking package managers, so verification is portable."""
-    _mapping(data, "Package manifest", ("rpm", "flatpak", "warnings"))
+def validate_package_manifest(data, schema_version=CURRENT_SCHEMA):
+    """Validate without invoking package managers, so verification is portable.
+
+    schema_version is the schema of the manifest the data came from; inventories
+    collected now are validated as the current schema.
+    """
+    if type(schema_version) is not int or schema_version not in PACKAGE_KEYS:
+        raise PackageError(f"Unsupported package manifest schema version: {schema_version!r}")
+    keys = PACKAGE_KEYS[schema_version]
+    _mapping(data, "Package manifest", keys["package"])
     rpm = data["rpm"]
     flatpak = data["flatpak"]
-    _mapping(rpm, "RPM inventory", ("status", "requests", "inventory"))
-    _mapping(flatpak, "Flatpak inventory", ("status", "apps", "remotes"))
+    _mapping(rpm, "RPM inventory", keys["rpm"])
+    _mapping(flatpak, "Flatpak inventory", keys["flatpak"])
     if rpm["status"] not in ("captured", "skipped"):
         raise PackageError("RPM status must be captured or skipped")
     if flatpak["status"] not in ("captured", "skipped", "not-installed"):
@@ -143,7 +165,7 @@ def validate_package_manifest(data):
     if len(set(rpm["requests"])) != len(rpm["requests"]):
         raise PackageError("Duplicate RPM requests")
     for item in rpm["inventory"]:
-        _mapping(item, "RPM inventory entry", ("spec", "reason", "from_repo", "full_nevra"))
+        _mapping(item, "RPM inventory entry", keys["rpm_entry"])
         _rpm_spec(item["spec"])
         for key in ("reason", "from_repo", "full_nevra"):
             _text(item[key], f"RPM {key}", allow_empty=key == "from_repo")
@@ -153,7 +175,7 @@ def validate_package_manifest(data):
             raise PackageError("Skipped or not-installed Flatpak inventory must be empty")
     remotes = {}
     for remote in flatpak["remotes"]:
-        _mapping(remote, "Flatpak remote", ("scope", "name", "url"))
+        _mapping(remote, "Flatpak remote", keys["remote"])
         _scope(remote["scope"])
         _remote_name(remote["name"])
         _remote_url(remote["url"])
@@ -163,7 +185,7 @@ def validate_package_manifest(data):
         remotes[key] = remote["url"]
     apps = set()
     for app in flatpak["apps"]:
-        _mapping(app, "Flatpak app", ("scope", "origin", "ref"))
+        _mapping(app, "Flatpak app", keys["app"])
         _scope(app["scope"])
         _remote_name(app["origin"])
         _flatpak_ref(app["ref"])
@@ -254,9 +276,9 @@ def collect_packages(*, skip_rpm=False, skip_flatpak=False):
     return data
 
 
-def package_commands(data, *, skip_rpm=False, skip_flatpak=False):
+def package_commands(data, *, skip_rpm=False, skip_flatpak=False, schema_version=CURRENT_SCHEMA):
     """Build a reviewable command preview without running external commands."""
-    validate_package_manifest(data)
+    validate_package_manifest(data, schema_version)
     commands = []
     if not skip_rpm and data["rpm"]["requests"]:
         commands.append(["sudo", "dnf5", "install", *data["rpm"]["requests"]])
@@ -289,9 +311,10 @@ def _preflight_remotes(data):
             raise PackageError(f"Disabled {scope} Flatpak remote {name!r}. Review and enable it manually before retrying or use --skip-flatpak.")
 
 
-def install_packages(data, *, skip_rpm=False, skip_flatpak=False):
+def install_packages(data, *, skip_rpm=False, skip_flatpak=False, schema_version=CURRENT_SCHEMA):
     """Preflight remotes, then run native package managers with confirmation."""
-    commands = package_commands(data, skip_rpm=skip_rpm, skip_flatpak=skip_flatpak)
+    commands = package_commands(data, skip_rpm=skip_rpm, skip_flatpak=skip_flatpak,
+                                schema_version=schema_version)
     if not skip_flatpak and data["flatpak"]["status"] == "captured":
         _check_standard_installations()
         try:

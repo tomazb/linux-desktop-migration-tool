@@ -20,8 +20,12 @@ claim of successful migration on real Fedora desktops or your hardware.
 ## Requirements
 
 - Python 3; the Python workflow uses the standard library.
-- Backup: Fedora 43, run as the normal desktop user.
-- Restore: Fedora 44, run as the normal destination desktop user.
+- Backup: on the source Fedora system (release 43 or newer), as the normal desktop user.
+- Restore and rollback: on the destination Fedora system (release 43 or newer), as the
+  normal destination desktop user. The backup's release must be the same as the
+  destination's or up to two releases older (Fedora's supported upgrade path); a
+  downgrade or a larger jump is refused. **43 → 44 is the documented and CI-tested
+  path**; any other pair is allowed but prints a note that it is untested.
 - Log out of XFCE and close applications before backup or applying a restore. Run from a
   console TTY with that user's XFCE session and `xfconfd` stopped. The tool does
   not log you out or stop processes automatically.
@@ -152,7 +156,7 @@ rollback directory, so a rollback loses nothing. Progress is recorded in
 `rollback-journal.json` (`complete`, `partial` when conflicts were left, `failed` or
 `interrupted`); a finished (`complete`) rollback is refused a second time. It works
 on a restore that failed or was interrupted, and it does not undo package installs.
-Like a restore it needs Fedora 44, a stopped XFCE session and closed browsers.
+Like a restore it needs Fedora 43 or newer, a stopped XFCE session and closed browsers.
 
 ## What is included
 

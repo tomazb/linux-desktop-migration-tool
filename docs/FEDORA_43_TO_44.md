@@ -5,6 +5,29 @@ Use DNF5 system upgrade for an **existing Fedora 43** installation. Neither path
 removes the need for an independently verified backup. Fedora 44 was released on
 [April 28, 2026](https://fedoramagazine.org/announcing-fedora-linux-44/).
 
+## Requirements and release pairs
+
+- Backup: the source Fedora system, release 43 or newer.
+- Restore and rollback: the destination Fedora system, release 43 or newer, with a
+  bundle made on a Fedora release that is the same or up to two releases older.
+- All commands run as the normal desktop user, not root.
+
+### Other release pairs
+
+Fedora 43 → 44 is the documented path and the only pair the project tests. Other
+pairs inside the supported range (the same release, or an upgrade of one or two
+releases such as 44 → 45 or 43 → 45) are allowed, but the restore prints
+`Fedora S → D has not been tested with this tool; review the preview carefully.`
+Read the preview, panel-plugin and autostart checks with extra care and rehearse
+first. Downgrades (a newer backup on an older release), jumps of more than two
+releases, non-Fedora sources and non-numeric `VERSION_ID` values are refused. The
+package commands preview names the actual destination release.
+
+Bundles record a manifest `schema_version`. This tool writes schema 2 and still
+reads schema 1 bundles made by earlier versions unchanged. A bundle with a higher
+schema was made by a newer version of this tool and is refused until you update
+the tool. The recorded `tool_version` is informational and never compared.
+
 ## Prepare a clean-install migration
 
 1. Identify additional data outside the defaults: projects, application settings,

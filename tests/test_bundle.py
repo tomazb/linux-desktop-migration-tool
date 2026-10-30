@@ -60,7 +60,7 @@ class BundleTests(BundleFixture):
         (source.parent / "link").symlink_to("/outside/never-follow")
         self.backup()
         manifest = verify_bundle(self.bundle)
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         summary = restore_bundle(self.bundle, self.target, dry_run=False)
         restored = self.target / ".config/xfce4/test"
         self.assertEqual(restored.read_bytes(), source.read_bytes())

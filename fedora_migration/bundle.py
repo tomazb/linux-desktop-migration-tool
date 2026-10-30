@@ -19,6 +19,7 @@ import stat
 import tempfile
 import uuid
 
+from . import __version__
 from .report import entry_is_rewritable, replace_home_references, rewritable
 
 
@@ -28,6 +29,12 @@ class BundleError(RuntimeError):
 
 class BundleInterrupted(KeyboardInterrupt):
     """An interrupted restore with an actionable recovery location."""
+
+
+# Schema 1 pinned tool_version to "1.0". Schema 2 records the writing tool's
+# version for information only; both schemas accept any plain-text version.
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMAS = (1, 2)
 
 
 SETTINGS = (
@@ -481,7 +488,7 @@ def create_bundle(home, output, source, packages, *, include=(),
         # Apply directory times after copying children. Keep owner access during
         # assembly and verification; source directory modes live in the manifest.
         manifest = {
-            "schema_version": 1, "tool_version": "1.0",
+            "schema_version": SCHEMA_VERSION, "tool_version": __version__,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": source, "packages": packages,
             "selected_paths": selected,
@@ -512,8 +519,18 @@ def _load_manifest(bundle):
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int:
         raise BundleError("Invalid manifest schema.")
-    if manifest["schema_version"] != 1 or manifest.get("tool_version") != "1.0":
-        raise BundleError("Unsupported bundle schema/tool version.")
+    schema = manifest["schema_version"]
+    if schema > max(SUPPORTED_SCHEMAS):
+        raise BundleError(
+            f"This bundle uses manifest schema {schema} and was made by a newer version "
+            "of this tool; update the tool to restore it.")
+    if schema not in SUPPORTED_SCHEMAS:
+        raise BundleError(f"Unsupported bundle schema version: {schema}.")
+    tool_version = manifest.get("tool_version")
+    if (not isinstance(tool_version, str) or not tool_version
+            or any(ord(char) < 32 or ord(char) == 127 for char in tool_version)):
+        raise BundleError("Invalid tool version in the manifest: it must be a non-empty "
+                          "string without control characters.")
     for key in ("source", "packages"):
         if not isinstance(manifest.get(key), dict):
             raise BundleError(f"Manifest {key} must be an object.")
