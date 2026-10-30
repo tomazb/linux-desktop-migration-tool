@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (rehearsal automation)
+
+- `scripts/rehearsal.py` orchestrates the documented two-VM rehearsal with
+  libvirt/KVM: Fedora Cloud images (SHA-256 checked against the CHECKSUM files,
+  which are not GPG-verified), cloud-init VMs with different users, XFCE installed
+  but never started, source fixtures, backup, verify, bundle copy, restore preview
+  and apply with `--rewrite-home`, the package-triage preview and rollback, with
+  checks and a JSON and Markdown report. It is a dry run unless `--execute` is
+  given, refuses to start without `/dev/kvm`, the required tools or libvirt, and
+  cleans up only its own `fmr-src-ID` / `fmr-dst-ID` domains.
+- Unit tests (`tests/test_rehearsal.py`) cover the planning, checksum parsing,
+  cloud-init rendering, quoting, cleanup scoping and report rendering with every
+  external command faked. The script has so far been exercised only in dry-run
+  mode and by these tests; a successful live run is still pending.
+
 ### Added
 
 - Separate `fedora-migration.py` backup, verification and restore workflow for

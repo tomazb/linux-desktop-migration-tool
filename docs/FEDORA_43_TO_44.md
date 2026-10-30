@@ -393,6 +393,65 @@ transaction and removes cached packages. See
 Live validation is pending. Use disposable Fedora XFCE 43 and 44 VMs with separate
 normal users and a shared Linux-filesystem backup disk; record exact OS/package versions.
 
+### Automated rehearsal script
+
+`scripts/rehearsal.py` automates much of this on a host with libvirt and KVM. The
+script has so far been exercised only in `--dry-run` mode and by unit tests (which
+fake every external command); **a successful live run is still pending**, so treat
+its first runs as a test of the script itself.
+
+It needs `/dev/kvm`, a reachable libvirt (`qemu:///session` by default; see
+`--connect`), `virt-install`, `virsh`, `qemu-img`, `ssh`, `scp`, `ssh-keygen`, `curl`,
+`sha256sum` and one of `cloud-localds`, `genisoimage` or `xorriso`. Nothing runs
+unless asked: the default is a dry run that prints every command and Python step.
+
+```bash
+python3 scripts/rehearsal.py                 # dry run: print the plan, run nothing
+python3 scripts/rehearsal.py --execute       # real run
+python3 scripts/rehearsal.py --execute --keep --with-flatpak \
+  --source-image ~/f43.qcow2 --dest-image ~/f44.qcow2
+```
+
+With `--execute` it refuses to start (exit status 2) when `/dev/kvm`, a tool or
+libvirt is missing. Otherwise it downloads the Fedora Cloud Base Generic images
+for the source (43) and destination (44) releases into `--workdir` (default
+`~/.cache/fedora-migration-rehearsal`), checks them against SHA-256 values from
+the matching CHECKSUM file, and creates two VMs named `fmr-src-ID` and `fmr-dst-ID`
+from qcow2 overlays: user `alice` on the source and `bob` on the destination, so the
+different homes exercise `--rewrite-home`. A throwaway SSH key is generated for the
+run; the guests are reached through loopback port forwards (`--ssh-port-base`).
+Each VM gets `@xfce-desktop-environment` (installed but never started; the default
+target is set to `multi-user.target`), a copy of the working tree without `.git`,
+and, on the source, the checklist fixtures: a customised panel file, `displays.xml`,
+XDG files, a hidden extra directory, an executable, an internal and an external
+symlink, a launcher naming `/home/alice`, an extra RPM and (with `--with-flatpak`)
+a user Flatpak. The destination gets a conflicting and an unrelated file.
+
+It then runs `backup`, `verify`, a bundle copy through the host, `verify`, a restore
+preview, `restore --apply --rewrite-home --rollback-dir`, the
+`restore --install-packages` preview (triage only; nothing is installed), and the
+`rollback` preview and `--apply`, with checks after each step: default secrets and
+`displays.xml` absent, restored files' content/mode/mtime and symlinks match, the
+launcher now names `/home/bob`, the rollback restores the conflicting original and
+removes new files, a second rollback is refused, and expected exit codes. A JSON and
+a Markdown report, including OS and package versions and the tool commit, are
+written to `WORKDIR/runs/ID/report.json` and `report.md`. Exit status is 0 only if
+every step passed.
+
+Unless `--keep` is given, the VMs, overlays, seed images and key are removed at the
+end and also after a failure. Cleanup only touches the two domains this run created,
+named `fmr-src-ID` and `fmr-dst-ID`; other libvirt domains are never listed or
+changed. The downloaded images stay cached in the work directory.
+
+Limits: the Fedora CHECKSUM files are not GPG-verified (out of scope), so the
+SHA-256 check relies on HTTPS to the Fedora mirror network. Images given with
+`--source-image`/`--dest-image` are used without any checksum. The script covers the
+no-secrets path only; the opt-in secrets bundle, corrupted-copy rejection, the changed-remote
+URL and unavailable-RPM tests, `--install-packages --apply`, SELinux labels, graphical inspection and a
+monitor-layout change remain manual. The checklist below is the reference.
+
+### Manual checklist
+
 1. On 43, customize panel/shortcuts/theme and create sample XDG files, a hidden
    extra directory, an executable, an internal symlink and a link outside selection.
    Install an additional RPM and user/system Flatpak apps from known remotes.
