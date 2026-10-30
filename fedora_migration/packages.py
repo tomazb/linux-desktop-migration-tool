@@ -23,9 +23,11 @@ _RPM_ARCHES = frozenset((
 ))
 _REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _REF_PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
-# Printable ASCII without spaces: Unicode whitespace classes differ between
-# Python and the glibc classes used by the legacy Bash validator.
-_REMOTE_URL = re.compile(r"[!-~]+\Z")
+# URLs are only compared with destination remotes, never used to add one.
+# Reject ASCII spaces and control characters (via _text) only: Unicode
+# whitespace classes differ between Python and glibc, and non-ASCII URLs in
+# existing bundles must remain readable.
+_ASCII_SPACE = frozenset(" \t\n\r\v\f")
 
 
 def _run(argv, *, capture=True):
@@ -92,8 +94,8 @@ def _remote_name(value):
 
 def _remote_url(value):
     _text(value, "Flatpak remote URL")
-    if not _REMOTE_URL.fullmatch(value):
-        raise PackageError(f"Invalid Flatpak remote URL (printable ASCII without spaces): {value!r}")
+    if any(char in _ASCII_SPACE for char in value):
+        raise PackageError(f"Flatpak remote URL must not contain spaces: {value!r}")
 
 
 def _flatpak_ref(value):

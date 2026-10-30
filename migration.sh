@@ -197,8 +197,9 @@ flatpak_ref_is_valid() {
 }
 
 flatpak_url_is_valid() {
+    # Bytes outside ASCII are allowed; ASCII spaces and controls are not.
     local LC_ALL=C
-    [[ $1 =~ ^[!-~]+$ ]]
+    [[ -n $1 && ! $1 =~ [[:space:][:cntrl:]] ]]
 }
 
 migrate_flatpak_applications() {

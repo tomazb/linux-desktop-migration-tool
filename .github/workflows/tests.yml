@@ -19,7 +19,7 @@ jobs:
       image: registry.fedoraproject.org/fedora:${{ matrix.release }}
     steps:
       - name: Install test tools
-        run: dnf5 install --assumeyes git python3 procps-ng flatpak
+        run: dnf5 install --assumeyes git python3 procps-ng flatpak glibc-langpack-en
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

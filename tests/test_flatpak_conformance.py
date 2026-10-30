@@ -1,6 +1,7 @@
 """Shared Flatpak inventory cases for the Python and legacy Bash validators."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -16,6 +17,14 @@ PYTHON = {
     "remote_urls": packages._remote_url,
     "scopes": packages._scope,
 }
+# glibc UTF-8 locales can match non-ASCII letters in [A-Za-z] ranges, so the
+# Bash validators must give the same answers in a language locale as in C.
+INSTALLED_LOCALES = {
+    name.lower().replace("-", "")
+    for name in subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.split()
+}
+LOCALES = [name for name in ("C.UTF-8", "en_US.UTF-8")
+           if name.lower().replace("-", "") in INSTALLED_LOCALES]
 # Bash enumerates its two scopes itself and never parses a scope from data.
 BASH = {
     "refs": "flatpak_ref_is_valid",
@@ -38,17 +47,20 @@ class FlatpakConformanceTests(unittest.TestCase):
                     self.assertEqual(accepted, case["valid"])
 
     def test_bash_validators_match_shared_cases(self):
-        for group, function in BASH.items():
-            for case in CASES[group]:
-                with self.subTest(group=group, value=case["value"]):
-                    # Values are argv data; the validator never evaluates them.
-                    result = subprocess.run(
-                        ["bash", "-c", 'source "$1"; "$2" "$3"', "conformance",
-                         str(ROOT / "migration.sh"), function, case["value"]],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    self.assertIn(result.returncode, (0, 1), result.stderr)
-                    self.assertEqual(result.returncode == 0, case["valid"])
+        self.assertIn("C.UTF-8", LOCALES)
+        for locale in LOCALES:
+            environment = {**os.environ, "LC_ALL": locale}
+            for group, function in BASH.items():
+                for case in CASES[group]:
+                    with self.subTest(locale=locale, group=group, value=case["value"]):
+                        # Values are argv data; the validator never evaluates them.
+                        result = subprocess.run(
+                            ["bash", "-c", 'source "$1"; "$2" "$3"', "conformance",
+                             str(ROOT / "migration.sh"), function, case["value"]],
+                            capture_output=True, text=True, timeout=10, env=environment,
+                        )
+                        self.assertIn(result.returncode, (0, 1), result.stderr)
+                        self.assertEqual(result.returncode == 0, case["valid"])
 
     def test_every_group_is_checked_by_python(self):
         self.assertEqual(set(PYTHON), {key for key in CASES if key != "description"})

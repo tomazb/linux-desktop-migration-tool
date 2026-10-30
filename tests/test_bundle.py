@@ -397,6 +397,11 @@ def _fd_path(stream):
     return os.readlink(f"/proc/self/fd/{stream.fileno()}")
 
 
+PROC_FDS = unittest.skipUnless(os.path.isdir("/proc/self/fd"),
+                               "Copy instrumentation needs Linux /proc/self/fd")
+
+
+@PROC_FDS
 class RestorePrivacyTests(BundleFixture):
     def test_restore_temporary_files_stay_private_until_replacement(self):
         private = self.write(self.home / ".config/xfce4/private.xml", b"secret", 0o600)
@@ -437,6 +442,7 @@ class RestorePrivacyTests(BundleFixture):
         self.assertEqual(list(existing.glob(".fedora-migration-*")), [])
 
 
+@PROC_FDS
 class RecoveryCopyTests(BundleFixture):
     def fail_saving_bashrc(self, error):
         for name, data in ((".bash_profile", b"new profile"), (".bashrc", b"new rc")):

@@ -11,7 +11,7 @@
     {"value": "app//x86_64/stable", "valid": false},
     {"value": "app/-org.example.App/x86_64/stable", "valid": false},
     {"value": "app/org.example.App/x86_64/$(touch injected)", "valid": false},
-    {"value": "app/org.exämple.App/x86_64/stable", "valid": false, "why": "ASCII only, independent of locale"},
+    {"value": "app/org.ex\u00e4mple.App/x86_64/stable", "valid": false, "why": "ASCII only, independent of locale"},
     {"value": "app/org.example.App/x86_64/sta ble", "valid": false},
     {"value": "", "valid": false}
   ],
@@ -23,7 +23,7 @@
     {"value": ".hidden", "valid": false},
     {"value": "flat hub", "valid": false},
     {"value": "flathub/extra", "valid": false},
-    {"value": "flåthub", "valid": false, "why": "ASCII only, independent of locale"},
+    {"value": "fl\u00e5thub", "valid": false, "why": "ASCII only, independent of locale"},
     {"value": "", "valid": false}
   ],
   "remote_urls": [
@@ -31,7 +31,9 @@
     {"value": "oci+https://registry.fedoraproject.org", "valid": true},
     {"value": "file:///srv/flatpak/repo", "valid": true},
     {"value": "https://example.org/a b", "valid": false},
-    {"value": "https://example.org/ repo", "valid": false, "why": "printable ASCII only; Unicode spaces differ between Python and glibc"},
+    {"value": "file:///home/toma\u017e/repo", "valid": true, "why": "non-ASCII URLs from existing bundles remain readable"},
+    {"value": "https://example.org/\u00a0repo", "valid": true, "why": "only ASCII spaces are rejected; Unicode space classes differ between Python and glibc"},
+    {"value": "https://example.org/a\tb", "valid": false},
     {"value": "https://example.org/\u007f", "valid": false},
     {"value": "", "valid": false}
   ],

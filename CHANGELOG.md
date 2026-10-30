@@ -54,8 +54,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Restore preview verifies the bundle once instead of twice; apply verifies once
   for planning and again immediately before writing (previously three times).
 - Shared Flatpak validation cases for the Python and legacy Bash workflows. Bash
-  now requires a two-element application ID and printable-ASCII remote URLs, and
-  validates in the C locale so non-ASCII names are rejected under any locale.
+  now requires a two-element application ID and validates in the C locale, so
+  non-ASCII names and refs are rejected under any locale. Both reject ASCII spaces
+  and control characters in remote URLs; non-ASCII URLs remain accepted.
 
 ### Documentation
 

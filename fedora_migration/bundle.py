@@ -5,6 +5,7 @@ an operation runs. Checksums detect corruption, not replacement of a manifest by
 an attacker. Symlinks are copied as links and are never traversed.
 """
 
+import contextlib
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -162,7 +163,18 @@ def _fsync_directory(path):
         os.close(fd)
 
 
-def _save_original(original, saved, staging):
+def _private_parents(directory, root):
+    """Create missing directories below root, syncing each new entry."""
+    missing = []
+    while directory != root and not os.path.lexists(directory):
+        missing.append(directory)
+        directory = directory.parent
+    for node in reversed(missing):
+        node.mkdir(mode=0o700)
+        _fsync_directory(node.parent)
+
+
+def _save_original(original, saved, staging, previous):
     """Publish a recovery copy under previous/ only once it is complete.
 
     The copy is assembled in the private staging directory on the same
@@ -178,12 +190,14 @@ def _save_original(original, saved, staging):
                      follow_symlinks=False)
         else:
             _copy_regular(original, temporary)
-        saved.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _private_parents(saved.parent, previous)
         os.replace(temporary, saved)
         _fsync_directory(saved.parent)
     finally:
-        if os.path.lexists(temporary):
-            temporary.unlink()
+        # Never let cleanup replace the error that is already propagating.
+        with contextlib.suppress(OSError):
+            if os.path.lexists(temporary):
+                temporary.unlink()
 
 
 def _xdg_directories(home, warnings):
@@ -205,7 +219,12 @@ def _xdg_directories(home, warnings):
                      | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
         raise BundleError(f"Cannot read {config}: {exc}. {remedy}") from exc
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        os.close(fd)
+        raise
+    if not regular:
         os.close(fd)
         raise BundleError(f"{config} is not a regular file. {remedy}")
     with os.fdopen(fd, "rb") as stream:
@@ -541,7 +560,7 @@ def plan_restore(bundle, home, manifest, *, backup_dir=None):
         return _plan(bundle, home, manifest, backup_dir)[0]
     except BundleError:
         raise
-    except (OSError, ValueError, TypeError, OverflowError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
         raise BundleError(f"Restore failed before copying files: {exc}") from exc
 
 
@@ -604,7 +623,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
             if exists != (relative in planned_replaced):
                 raise BundleError(f"Destination changed after preflight: {destination}")
             if exists:
-                _save_original(destination, previous / relative, staging)
+                _save_original(destination, previous / relative, staging, previous)
             temporary = destination.parent / (".fedora-migration-" + uuid.uuid4().hex)
             try:
                 if entry["type"] == "file":
@@ -621,8 +640,9 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
                          follow_symlinks=False)
                 os.replace(temporary, destination)
             finally:
-                if os.path.lexists(temporary):
-                    temporary.unlink()
+                with contextlib.suppress(OSError):
+                    if os.path.lexists(temporary):
+                        temporary.unlink()
         selected = set(manifest["selected_paths"])
         # Preserve selected directory roots and new directories. Existing
         # structural HOME parents and unrelated contents keep their metadata.
@@ -631,10 +651,14 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
                 destination = home / entry["path"]
                 destination.chmod(entry["mode"])
                 os.utime(destination, ns=(entry["mtime_ns"], entry["mtime_ns"]))
-        staging.rmdir()
-        staging = None
         journal["status"] = "complete"
         _update_journal(rollback, journal)
+        # Every file is restored; a leftover staging entry must not turn a
+        # completed restore into a failure.
+        try:
+            staging.rmdir()
+        except OSError as exc:
+            summary["warnings"].append(f"Could not remove {staging}: {exc}")
         return summary
     except (BundleError, OSError, ValueError, TypeError, OverflowError, KeyboardInterrupt) as exc:
         if staging is not None:
