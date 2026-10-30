@@ -216,26 +216,73 @@ must match for package installation. `--skip-rpm` and `--skip-flatpak` can omit 
 package path; backup also accepts these switches to omit its inventory.
 
 RPM manifest data includes `rpm.requests` as `name.arch`, and `rpm.inventory` with
-installation reason, source repository and full NEVRA. Fedora 44 resolves current
-versions; the tool does not reinstall exact Fedora 43 builds. Equivalent manual
-export syntax from [DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html):
+installation reason, source repository and full NEVRA. Schema 2 adds `rpm.repos`
+(enabled repositories from `dnf5 repo info --enabled --json`: id, name, base URLs,
+metalink, mirrorlist, GPG key URLs and repo file path, with any `user:password@`
+removed from URLs), `rpm.groups` and `rpm.environments` (read from DNF5's
+`/usr/lib/sysimage/libdnf5/groups.toml` and `environments.toml`). If any of these
+cannot be read the backup still succeeds, with that list empty and a warning.
+Fedora 44 resolves current versions; the tool does not reinstall exact Fedora 43
+builds. Equivalent manual export syntax from
+[DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html):
 
 ```bash
 dnf5 repoquery --userinstalled --queryformat '%{name}.%{arch}\n'
 dnf5 repoquery --installed \
   --queryformat '%{name}.%{arch} %{reason} %{from_repo} %{full_nevra}\n'
+dnf5 repo info --enabled --json
 ```
 
 `--userinstalled` selects installed packages on its own; DNF5 rejects combining
 it with `--installed`. It also includes group/module and unknown reasons. It is not an
 exact list of applications deliberately chosen by the user. Configured DNF
-excludes can affect both requests and inventory. Review missing,
-renamed or local RPM requests. Configure Fedora-44-compatible trusted repositories
-yourself. [DNF5 install](https://dnf5.readthedocs.io/en/latest/commands/install.8.html)
-resolves package requests and dependencies; automatic erasures/skips are not enabled.
+excludes can affect both requests and inventory. All DNF5 and Flatpak commands run
+with `LC_ALL=C.UTF-8` so their output can be parsed reliably.
+
+### Restore triage
+
+Before installing, restore classifies every RPM request with two read-only queries
+on the destination, `dnf5 repoquery --installed` and `--available` (the second can
+download repository metadata). The preview prints the result; apply uses the same
+classification:
+
+- **Already installed** packages are dropped from the command.
+- **To install** packages are available but not installed. They become a single
+  `sudo dnf5 install` with the packages sorted. Nothing is requested if the list is empty.
+- **Unavailable** packages are neither installed nor available, and were installed
+  from a named repository on the source (including `External User` packages from a
+  third-party repository such as COPR). They are grouped by source repository. When
+  the bundle recorded that repository the hint names it, with its recorded base URL
+  or metalink, so you can enable it and retry; otherwise the hint says the repository
+  was not recorded and you must configure it or drop those packages. GPG key URLs are
+  never printed as commands: obtain and verify keys yourself.
+- **Manual** packages are neither installed nor available and came from
+  `@commandline`, `<unknown>` or no recorded repository (local RPM files and the
+  like). They are listed with their full NEVRA, never block the restore and are
+  never put in a command.
+
+By default, any unavailable package makes `restore --apply --install-packages`
+refuse with exit status 1 before the package transaction, the session checks and
+any file change. `--skip-unavailable` continues instead: only the installable
+packages are installed, the skipped ones are listed, and the flag is also passed to
+`dnf5 install`. Without that flag it is not passed. Bundles from before schema 2 are
+triaged the same way, with every hint saying the repository is not recorded.
+
+Groups and environments are shown for information only ("the source had
+environment(s) ...") and are never requested. `dnf5 environment install` reinstalls
+missing default members even when the environment is already installed, and
+`--skip-unavailable` silently skips an unknown group or environment id, so
+requesting them would change the system in ways this tool cannot preview. Only the
+explicit `name.arch` packages are requested.
+
+[DNF5 install](https://dnf5.readthedocs.io/en/latest/commands/install.8.html)
+resolves package requests and dependencies; automatic erasures are not enabled.
+Configure Fedora-44-compatible trusted repositories yourself.
 
 Flatpak manifests retain each app's scope, full ref and origin, and remote
-scope/name/URL. Full refs retain branch and architecture. Equivalent inventories:
+scope/name/URL. Full refs retain branch and architecture. Restore runs one
+`flatpak install --user|--system ORIGIN REF...` per scope and origin (refs sorted),
+after checking every recorded remote; Flatpak's own confirmation is kept. Equivalent inventories:
 
 ```bash
 flatpak list --user --app --columns=ref,origin

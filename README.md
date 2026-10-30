@@ -201,11 +201,29 @@ reauthorization on 44; the tool does not import keys or activate accounts.
 RPM requests use `name.arch`, allowing Fedora 44 to select its current packages;
 old Fedora 43 versions are recorded for reference, not reinstalled. DNF5's
 `--userinstalled` also includes group/module and unknown installation reasons.
-DNF configuration excludes can affect requests and inventory.
-Review unavailable or renamed requests and configure compatible trusted repositories
-yourself. Package installation is optional and is not atomic with file restore.
+DNF configuration excludes can affect requests and inventory. Schema 2 bundles
+also describe the enabled DNF repositories (id, name, base URLs, metalink,
+mirrorlist, GPG key URLs; URL credentials are removed), and the installed
+environments and groups. That is information only: the tool never copies
+repository configuration and never installs groups or environments, because DNF5
+would also reinstall their default members. Only explicit `name.arch` packages
+are requested.
+
+With `--install-packages`, restore first asks the destination DNF5 (read-only,
+possibly downloading repository metadata) which requests are already installed,
+available, or neither. Installed packages are left out of the command. Packages
+that are neither, and whose source repository is a named repository, are
+**unavailable**: apply refuses before any package or file change and lists them
+by source repository, with the recorded repository URLs when the bundle has them.
+Fix the repositories and retry, or add `--skip-unavailable` to install only the
+available packages. Packages recorded as installed from a local file
+(`@commandline`) or an unknown source are **manual**: they are listed with their
+full NEVRA, never block the restore and are never installed by this tool.
+Package installation is optional and is not atomic with file restore.
 
 Flatpak records user/system scope, full ref and origin, plus remote name and URL.
+Restore runs one `flatpak install` per scope and origin, keeping Flatpak's own
+confirmation prompt.
 Configure matching trusted remotes on 44 before installation. The tool checks the
 remote URL and does not automatically add repositories or switch origins. Custom
 named Flatpak installations are unsupported; use `--skip-flatpak` and handle those

@@ -34,6 +34,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Preserved this fork's previous shell fixes instead of replacing its script
   wholesale. Legacy live Fedora XFCE 43/44 migration remains unverified.
 
+### Changed (package migration)
+
+- Schema 2 package manifests also record the enabled DNF repositories (credentials
+  removed from URLs) and the installed DNF groups and environments, for
+  information. Unreadable data gives empty lists and a warning. Schema 1 bundles
+  are unchanged and still restore.
+- `restore --install-packages` now triages RPM requests against the destination's
+  installed and available packages: installed ones are dropped, unavailable ones
+  are grouped by source repository with recorded-repository hints, and packages
+  from `@commandline`/unknown sources are listed for manual handling and never
+  installed. Apply refuses before any change when packages are unavailable unless
+  the new `--skip-unavailable` is given, which installs only the available ones.
+- Groups and environments are never requested; only explicit `name.arch` packages.
+- Flatpak apps are installed with one command per scope and origin instead of one
+  per app, keeping native confirmations.
+- DNF5 and Flatpak commands run with `LC_ALL=C.UTF-8`.
+
 ### Changed (schema 2 and releases)
 
 - Backups now use manifest schema 2 and record the writing tool's version
