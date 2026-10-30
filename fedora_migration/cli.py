@@ -270,6 +270,11 @@ def print_rpm_triage(data, triage, *, skip_unavailable):
     print(f"  Already installed: {len(triage['installed'])} (not requested again)")
     print(f"  To install: {len(triage['installable'])}")
     print_limited([f"    {report.clip(spec)}" for spec in triage["installable"]])
+    if triage["installable_from_local"]:
+        print(f"  Note: {len(triage['installable_from_local'])} of these were installed from a "
+              "local file or an unknown source on the old system; this system's repositories "
+              "provide the same name now. Check that it is the same software:")
+        print_limited([f"    {report.clip(spec)}" for spec in triage["installable_from_local"]])
     print(f"  Unavailable: {skipped}" + (f" in {len(unavailable)} source repositories" if unavailable else ""))
     for repo, specs in list(unavailable.items())[:MAX_LISTED]:
         print(f"    From repository {report.clip(repo)} ({len(specs)} package{'s' if len(specs) != 1 else ''}): "

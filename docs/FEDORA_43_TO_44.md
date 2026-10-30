@@ -259,7 +259,13 @@ classification:
 - **Manual** packages are neither installed nor available and came from
   `@commandline`, `<unknown>` or no recorded repository (local RPM files and the
   like). They are listed with their full NEVRA, never block the restore and are
-  never put in a command.
+  never put in a command. If such a package's name *is* available here, it is
+  installed like any other, and the preview flags it so you can check that the
+  repository's package is the same software.
+- A package recorded both from a repository and from a local file (for example
+  several installed kernel versions) counts as from that repository, so the strict
+  rule above applies. The installed-package check ignores configured DNF excludes,
+  so an excluded but installed package is not reported as unavailable.
 
 By default, any unavailable package makes `restore --apply --install-packages`
 refuse with exit status 1 before the package transaction, the session checks and

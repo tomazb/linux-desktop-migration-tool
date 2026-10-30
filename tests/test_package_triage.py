@@ -491,7 +491,10 @@ class DestinationCollectorTests(unittest.TestCase):
         self.assertEqual(available, {"bash.x86_64", "htop.x86_64"})
         calls = [call.args[0] for call in run.call_args_list]
         self.assertEqual(sorted(calls), sorted([
-            ["dnf5", "repoquery", "--installed", "--queryformat", "%{name}.%{arch}\n"],
+            # Excludes must not hide what is already installed; they still apply
+            # to what can be installed.
+            ["dnf5", "repoquery", "--installed", "--setopt=disable_excludes=*",
+             "--queryformat", "%{name}.%{arch}\n"],
             ["dnf5", "repoquery", "--available", "--queryformat", "%{name}.%{arch}\n"]]))
 
     def test_failure_is_a_package_error(self):
@@ -616,6 +619,43 @@ class FlatpakBatchingTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in installs],
                          packages.package_commands(data, skip_rpm=True))
         self.assertTrue(all(call.kwargs["capture"] is False for call in installs))
+
+
+class ReviewFindingTriageTests(unittest.TestCase):
+    def test_available_packages_from_a_local_source_are_installed_but_flagged(self):
+        data = rpm_data(["a.x86_64", "b.x86_64"],
+                        [entry("a.x86_64", "@commandline"), entry("b.x86_64", "fedora")])
+        result = packages.triage_rpm(data, installed=set(), available={"a.x86_64", "b.x86_64"})
+        self.assertEqual(result["installable"], ["a.x86_64", "b.x86_64"])
+        self.assertEqual(result["installable_from_local"], ["a.x86_64"])
+
+    def test_duplicate_inventory_rows_do_not_depend_on_order(self):
+        rows = [entry("kernel-devel.x86_64", "updates", nevra="kernel-devel-0:6.1-1.x86_64"),
+                entry("kernel-devel.x86_64", "@commandline", nevra="kernel-devel-0:6.2-1.x86_64")]
+        for inventory in (rows, list(reversed(rows))):
+            with self.subTest(order=[row["from_repo"] for row in inventory]):
+                result = packages.triage_rpm(rpm_data(["kernel-devel.x86_64"], inventory),
+                                             installed=set(), available=set())
+                self.assertEqual(result["unavailable"], {"updates": ["kernel-devel.x86_64"]})
+                self.assertEqual(result["manual"], [])
+
+    def test_duplicate_local_rows_keep_every_nevra(self):
+        rows = [entry("x.x86_64", "@commandline", nevra="x-0:2-1.x86_64"),
+                entry("x.x86_64", "<unknown>", nevra="x-0:1-1.x86_64")]
+        for inventory in (rows, list(reversed(rows))):
+            result = packages.triage_rpm(rpm_data(["x.x86_64"], inventory),
+                                         installed=set(), available=set())
+            self.assertEqual(len(result["manual"]), 1)
+            self.assertEqual(result["manual"][0]["full_nevra"], "x-0:1-1.x86_64, x-0:2-1.x86_64")
+
+
+class DeepStateFileTests(CollectionFixture):
+    def test_deeply_nested_state_file_is_a_warning(self):
+        self.groups_file.write_text('version = "1.0"\n[groups.core]\npackages = '
+                                    + "{a = " * 600 + "1" + "}" * 600 + "\n")
+        data = self.collect()
+        self.assertEqual(data["rpm"]["groups"], [])
+        self.assertTrue(any("groups" in warning for warning in data["warnings"]))
 
 
 if __name__ == "__main__":

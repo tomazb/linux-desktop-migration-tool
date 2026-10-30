@@ -447,7 +447,9 @@ def _environment_records(section):
 def _collect_state(path, table, build, warnings):
     try:
         return build(_state_table(path, table))
-    except (OSError, ValueError) as exc:  # TOMLDecodeError and UnicodeDecodeError are ValueErrors
+    # TOMLDecodeError and UnicodeDecodeError are ValueErrors; deeply nested
+    # input exhausts the parser's recursion.
+    except (OSError, ValueError, RecursionError) as exc:
         warnings.append(f"Could not read DNF {table} from {path}, so none were recorded: {_oneline(exc)}")
         return []
 
@@ -508,7 +510,10 @@ def collect_destination_rpms():
     Querying available packages can download repository metadata.
     """
     try:
-        installed = _run(["dnf5", "repoquery", "--installed", "--queryformat", "%{name}.%{arch}\n"])
+        # Configured excludes must not hide what is already installed; they still
+        # limit what can be installed below and in the transaction.
+        installed = _run(["dnf5", "repoquery", "--installed", "--setopt=disable_excludes=*",
+                          "--queryformat", "%{name}.%{arch}\n"])
         available = _run(["dnf5", "repoquery", "--available", "--queryformat", "%{name}.%{arch}\n"])
     except FileNotFoundError as exc:
         raise PackageError("dnf5 is required to check RPM availability; install it or use --skip-rpm") from exc
@@ -529,21 +534,32 @@ def triage_rpm(data, installed, available):
     `unavailable`, a dict of source repository id -> sorted specs. Groups and
     environments are never requested: DNF5 would reinstall their default members.
     """
-    origins = {item["spec"]: item for item in data["rpm"]["inventory"]}
-    result = {"installed": [], "installable": [], "manual": [], "unavailable": {}}
+    # Installonly packages (kernels) can have several inventory rows per spec.
+    origins = {}
+    for item in data["rpm"]["inventory"]:
+        origins.setdefault(item["spec"], []).append(item)
+    result = {"installed": [], "installable": [], "installable_from_local": [],
+              "manual": [], "unavailable": {}}
     for spec in sorted(data["rpm"]["requests"]):
+        records = origins.get(spec, [])
+        repos = sorted({record["from_repo"] for record in records} - _MANUAL_REPOS)
         if spec in installed:
             result["installed"].append(spec)
         elif spec in available:
             result["installable"].append(spec)
+            if not repos:
+                # Installed from a local file or an unknown source on the old
+                # system; a repository here provides the same name now.
+                result["installable_from_local"].append(spec)
+        elif repos:
+            # Any record from a real repository makes it unavailable (strict),
+            # whatever order the rows came in.
+            result["unavailable"].setdefault(repos[0], []).append(spec)
         else:
-            origin = origins.get(spec)
-            repo = origin["from_repo"] if origin else ""
-            if repo in _MANUAL_REPOS:
-                result["manual"].append({"spec": spec, "from_repo": repo,
-                                         "full_nevra": origin["full_nevra"] if origin else spec})
-            else:
-                result["unavailable"].setdefault(repo, []).append(spec)
+            origin = sorted(record["from_repo"] for record in records)
+            result["manual"].append({
+                "spec": spec, "from_repo": origin[0] if origin else "",
+                "full_nevra": ", ".join(sorted(r["full_nevra"] for r in records)) or spec})
     result["unavailable"] = dict(sorted(result["unavailable"].items()))
     return result
 
