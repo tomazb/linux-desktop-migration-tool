@@ -165,6 +165,13 @@ rsync_from_remote '/home/source/odd $(not-a-command)/' "$HOME/destination" '--no
         self.assertIn("custom", result.stderr.lower())
         self.assertFalse(any(cmd[:2] == ["flatpak", "install"] for cmd in self.commands()))
 
+    def test_single_element_application_id_is_rejected_before_install(self):
+        (self.fixture / "user-apps").write_text("app/Example/x86_64/stable\twork\n")
+        result = self.run_bash("migrate_flatpak_applications")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("app inventory", result.stderr)
+        self.assertFalse(any(cmd[:2] == ["flatpak", "install"] for cmd in self.commands()))
+
     def test_flatpak_data_cannot_inject_shell_commands(self):
         marker = self.root / "injected"
         (self.fixture / "user-apps").write_text(f"app/org.example.First/x86_64/stable\t$(touch {marker})\n")

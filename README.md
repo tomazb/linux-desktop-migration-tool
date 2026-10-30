@@ -92,7 +92,8 @@ python3 fedora-migration.py restore \
 Restore overlays selected paths and keeps unrelated target files. Files it
 replaces are retained under a private rollback directory with a journal. Record
 that directory. Its journal is an intent plan written before copying: listed paths
-may have been touched; `previous/` contains the actual saved originals. Ctrl+C
+may have been touched; `previous/` contains only complete saved originals, which are
+assembled under `staging/` and moved into place when finished. Ctrl+C
 returns exit code 130 and reports the retained recovery directory. There is no
 automatic rollback command; see the
 [recovery instructions](docs/FEDORA_43_TO_44.md#recover-overwritten-files).

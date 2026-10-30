@@ -122,8 +122,13 @@ def _digest(path):
     return digest.hexdigest()
 
 
-def _copy_regular(source, destination, expected=None):
-    """Copy an opened regular file; reject replacement or mutation during copy."""
+def _copy_regular(source, destination, expected=None, *, preserve_metadata=True):
+    """Copy an opened regular file; reject replacement or mutation during copy.
+
+    The new destination is private (0600) from creation, whatever the umask.
+    With preserve_metadata=False it stays private so the caller can validate it
+    before applying the intended mode and timestamps itself.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(source, flags)
     with os.fdopen(fd, "rb") as reader:
@@ -132,7 +137,9 @@ def _copy_regular(source, destination, expected=None):
             raise BundleError(f"Not a regular file: {source}")
         if expected is not None and _fingerprint(before) != _fingerprint(expected):
             raise BundleError(f"Source changed before copying: {source}")
-        with destination.open("xb") as writer:
+        out_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(os.open(destination, out_flags, 0o600), "wb") as writer:
             shutil.copyfileobj(reader, writer, 1024 * 1024)
             writer.flush()
             os.fsync(writer.fileno())
@@ -141,24 +148,72 @@ def _copy_regular(source, destination, expected=None):
         if (_fingerprint(before) != _fingerprint(after)
                 or _fingerprint(before) != _fingerprint(current)):
             raise BundleError(f"Source changed while copying: {source}")
-    destination.chmod(stat.S_IMODE(before.st_mode))
-    os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
+    if preserve_metadata:
+        destination.chmod(stat.S_IMODE(before.st_mode))
+        os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
     return before
+
+
+def _fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _save_original(original, saved, staging):
+    """Publish a recovery copy under previous/ only once it is complete.
+
+    The copy is assembled in the private staging directory on the same
+    filesystem, made durable, then renamed into place. A failed or interrupted
+    save leaves no partial file under previous/.
+    """
+    temporary = staging / uuid.uuid4().hex
+    try:
+        if original.is_symlink():
+            info = original.lstat()
+            temporary.symlink_to(os.readlink(original))
+            os.utime(temporary, ns=(info.st_atime_ns, info.st_mtime_ns),
+                     follow_symlinks=False)
+        else:
+            _copy_regular(original, temporary)
+        saved.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.replace(temporary, saved)
+        _fsync_directory(saved.parent)
+    finally:
+        if os.path.lexists(temporary):
+            temporary.unlink()
 
 
 def _xdg_directories(home, warnings):
     result = dict(PERSONAL)
     config = home / ".config/user-dirs.dirs"
     _assert_no_symlink_ancestors(config)
-    if not config.exists() or config.is_symlink():
+    if not os.path.lexists(config):
+        # Without a configuration, xdg-user-dirs uses these default names.
         return list(result.values())
-    if not config.is_file():
-        warnings.append("Skipped non-regular XDG directory configuration.")
-        return list(result.values())
+    # Never substitute default names for a configuration that cannot be read
+    # safely: that would complete a backup without the configured folders.
+    remedy = ("Replace it with a regular file containing your personal-folder "
+              "settings, or use --settings-only and select folders with --include.")
+    if config.is_symlink():
+        raise BundleError(f"{config} is a symlink; personal-folder discovery does "
+                          f"not follow it. {remedy}")
+    try:
+        fd = os.open(config, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise BundleError(f"Cannot read {config}: {exc}. {remedy}") from exc
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise BundleError(f"{config} is not a regular file. {remedy}")
+    with os.fdopen(fd, "rb") as stream:
+        text = stream.read().decode("utf-8", errors="replace")
     # Only this narrow assignment grammar is accepted. No shell expansion,
     # command substitution, variable evaluation, or backslash interpretation.
     pattern = re.compile(r'^\s*XDG_([A-Z]+)_DIR="([^"\\]*)"\s*(?:#.*)?$')
-    for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in text.splitlines():
         match = pattern.fullmatch(line)
         assignment = re.match(r'^\s*XDG_([A-Z]+)_DIR\s*=', line)
         if assignment and assignment[1] in PERSONAL and not match:
@@ -435,8 +490,6 @@ def _preflight(home, entries):
             raise BundleError(f"Refusing special destination file: {destination}")
         if (incoming == "directory") != (existing == "directory"):
             raise BundleError(f"Directory/type conflict: {destination}")
-        if incoming == "directory" and existing != "directory":
-            raise BundleError(f"Directory/type conflict: {destination}")
 
 
 def _update_journal(rollback, journal):
@@ -445,40 +498,63 @@ def _update_journal(rollback, journal):
     os.replace(temporary, rollback / "journal.json")
 
 
+def _plan(bundle, home, manifest, backup_dir):
+    """Validate destination and rollback paths without changing anything."""
+    entries = manifest["entries"]
+    _preflight(home, entries)
+    summary = {
+        "files": sum(e["type"] == "file" for e in entries),
+        "directories": sum(e["type"] == "directory" for e in entries),
+        "symlinks": sum(e["type"] == "symlink" for e in entries),
+        "selected_paths": list(manifest["selected_paths"]),
+        "backup_dir": None, "warnings": list(manifest["warnings"]),
+    }
+    candidate = (_absolute(backup_dir) if backup_dir is not None else
+                 home / ".local/state/fedora-xfce-migration" /
+                 ("restore-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                  + "-" + uuid.uuid4().hex[:12]))
+    _assert_no_symlink_ancestors(candidate)
+    if os.path.lexists(candidate):
+        raise BundleError(f"Rollback directory must be a new path: {candidate}")
+    if _within(candidate, bundle) or _within(bundle, candidate):
+        raise BundleError("Rollback directory must not overlap the bundle.")
+    for entry in entries:
+        destination = home / entry["path"]
+        if (_within(destination, candidate)
+                or (entry["type"] != "directory" and _within(candidate, destination))):
+            raise BundleError(f"Rollback path conflicts with restored path: {destination}")
+        if _within(bundle, destination) and entry["type"] != "directory":
+            raise BundleError(f"Restore would replace its bundle: {destination}")
+        if _within(destination, bundle):
+            raise BundleError(f"Restore destination overlaps its bundle: {destination}")
+    return summary, candidate
+
+
+def plan_restore(bundle, home, manifest, *, backup_dir=None):
+    """Preview a restore using a manifest that verify_bundle() returned for bundle.
+
+    This avoids re-reading the payload for a preview. restore_bundle() with
+    dry_run=False always verifies the bundle again before changing anything.
+    """
+    bundle, home = _absolute(bundle), _absolute(home)
+    try:
+        return _plan(bundle, home, manifest, backup_dir)[0]
+    except BundleError:
+        raise
+    except (OSError, ValueError, TypeError, OverflowError) as exc:
+        raise BundleError(f"Restore failed before copying files: {exc}") from exc
+
+
 def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
     """Preview or overlay a validated bundle, retaining originals and a journal."""
     bundle, home = _absolute(bundle), _absolute(home)
     rollback = None
+    staging = None
     journal = None
     try:
         manifest = verify_bundle(bundle)
         entries = manifest["entries"]
-        _preflight(home, entries)
-        summary = {
-            "files": sum(e["type"] == "file" for e in entries),
-            "directories": sum(e["type"] == "directory" for e in entries),
-            "symlinks": sum(e["type"] == "symlink" for e in entries),
-            "selected_paths": list(manifest["selected_paths"]),
-            "backup_dir": None, "warnings": list(manifest["warnings"]),
-        }
-        candidate = (_absolute(backup_dir) if backup_dir is not None else
-                     home / ".local/state/fedora-xfce-migration" /
-                     ("restore-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                      + "-" + uuid.uuid4().hex[:12]))
-        _assert_no_symlink_ancestors(candidate)
-        if os.path.lexists(candidate):
-            raise BundleError(f"Rollback directory must be a new path: {candidate}")
-        if _within(candidate, bundle) or _within(bundle, candidate):
-            raise BundleError("Rollback directory must not overlap the bundle.")
-        for entry in entries:
-            destination = home / entry["path"]
-            if (_within(destination, candidate)
-                    or (entry["type"] != "directory" and _within(candidate, destination))):
-                raise BundleError(f"Rollback path conflicts with restored path: {destination}")
-            if _within(bundle, destination) and entry["type"] != "directory":
-                raise BundleError(f"Restore would replace its bundle: {destination}")
-            if _within(destination, bundle):
-                raise BundleError(f"Restore destination overlaps its bundle: {destination}")
+        summary, candidate = _plan(bundle, home, manifest, backup_dir)
         if dry_run:
             return summary
         directories = sorted((e for e in entries if e["type"] == "directory"),
@@ -506,6 +582,10 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
         rollback = candidate
         previous = rollback / "previous"
         previous.mkdir(mode=0o700)
+        # Recovery copies are assembled here and renamed into previous/ only
+        # when complete, so previous/ never holds a partial original.
+        staging = rollback / "staging"
+        staging.mkdir(mode=0o700)
         summary["backup_dir"] = str(rollback)
         _update_journal(rollback, journal)
         for entry in directories:
@@ -524,19 +604,14 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
             if exists != (relative in planned_replaced):
                 raise BundleError(f"Destination changed after preflight: {destination}")
             if exists:
-                saved = previous / relative
-                saved.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                if destination.is_symlink():
-                    saved.symlink_to(os.readlink(destination))
-                    info = destination.lstat()
-                    os.utime(saved, ns=(info.st_atime_ns, info.st_mtime_ns),
-                             follow_symlinks=False)
-                else:
-                    _copy_regular(destination, saved)
+                _save_original(destination, previous / relative, staging)
             temporary = destination.parent / (".fedora-migration-" + uuid.uuid4().hex)
             try:
                 if entry["type"] == "file":
-                    _copy_regular(bundle / "payload" / relative, temporary)
+                    # Stays 0600 through checksum validation: the payload copy's
+                    # own mode may be wider than the manifest after a transfer.
+                    _copy_regular(bundle / "payload" / relative, temporary,
+                                  preserve_metadata=False)
                     if _digest(temporary) != entry["sha256"]:
                         raise BundleError(f"Payload changed during restore: {relative}")
                     temporary.chmod(entry["mode"])
@@ -556,10 +631,17 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
                 destination = home / entry["path"]
                 destination.chmod(entry["mode"])
                 os.utime(destination, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        staging.rmdir()
+        staging = None
         journal["status"] = "complete"
         _update_journal(rollback, journal)
         return summary
     except (BundleError, OSError, ValueError, TypeError, OverflowError, KeyboardInterrupt) as exc:
+        if staging is not None:
+            try:
+                staging.rmdir()
+            except OSError:
+                pass
         if rollback is not None:
             if journal is not None:
                 journal["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"

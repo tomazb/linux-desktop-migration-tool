@@ -40,6 +40,11 @@ class CLITests(unittest.TestCase):
             "home": str(self.home), "uid": 1000, "username": "alice",
             "architecture": "x86_64",
         }
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+            os.environ.pop(variable, None)
 
     def invoke(self, args):
         out, err = io.StringIO(), io.StringIO()
@@ -149,6 +154,39 @@ class CLITests(unittest.TestCase):
         self.assertTrue((target / ".config/xfce4/settings.xml").is_file())
         self.assertIn("restored", out.lower())
         install.assert_not_called()
+
+    def test_restore_verifies_once_for_preview_and_again_before_mutation(self):
+        cli = cli_module()
+        bundle = self.backup_fixture()
+        target = self.root / "target-home"
+        target.mkdir()
+        info = dict(self.info, version_id="44", home=str(target))
+        events = []
+        verify = cli.bundle.verify_bundle
+
+        def counted_verify(path):
+            events.append("verify")
+            return verify(path)
+
+        cases = (
+            (["restore", "--bundle", str(bundle)], ["verify"]),
+            (["restore", "--bundle", str(bundle), "--apply", "--install-packages"],
+             ["verify", "install", "verify"]),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                events.clear()
+                with patch.object(cli, "platform_info", return_value=info), \
+                     patch.object(cli, "assert_xfce_stopped"), \
+                     patch.object(cli, "check_selinux_tools", return_value=False), \
+                     patch.object(cli.packages, "install_packages",
+                                  side_effect=lambda *a, **k: events.append("install")), \
+                     patch.object(cli.bundle, "verify_bundle", side_effect=counted_verify):
+                    code, out, err = self.invoke(argv)
+                self.assertEqual(code, 0, err)
+                # Preview previously verified the payload twice and apply three
+                # times; the final check still precedes every file mutation.
+                self.assertEqual(events, expected)
 
     def test_package_failure_does_not_start_file_restore(self):
         cli = cli_module()

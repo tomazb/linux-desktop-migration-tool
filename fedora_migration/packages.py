@@ -23,6 +23,9 @@ _RPM_ARCHES = frozenset((
 ))
 _REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _REF_PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+# Printable ASCII without spaces: Unicode whitespace classes differ between
+# Python and the glibc classes used by the legacy Bash validator.
+_REMOTE_URL = re.compile(r"[!-~]+\Z")
 
 
 def _run(argv, *, capture=True):
@@ -87,6 +90,12 @@ def _remote_name(value):
         raise PackageError(f"Invalid Flatpak remote name: {value!r}")
 
 
+def _remote_url(value):
+    _text(value, "Flatpak remote URL")
+    if not _REMOTE_URL.fullmatch(value):
+        raise PackageError(f"Invalid Flatpak remote URL (printable ASCII without spaces): {value!r}")
+
+
 def _flatpak_ref(value):
     _text(value, "Flatpak app ref")
     parts = value.split("/")
@@ -145,9 +154,7 @@ def validate_package_manifest(data):
         _mapping(remote, "Flatpak remote", ("scope", "name", "url"))
         _scope(remote["scope"])
         _remote_name(remote["name"])
-        _text(remote["url"], "Flatpak remote URL")
-        if any(char.isspace() for char in remote["url"]):
-            raise PackageError("Flatpak remote URL must not contain whitespace")
+        _remote_url(remote["url"])
         key = (remote["scope"], remote["name"])
         if key in remotes:
             raise PackageError(f"Duplicate Flatpak remote: {key[0]}/{key[1]}")
@@ -192,7 +199,7 @@ def _remote_inventory(scope, *, include_disabled=True):
     seen = set()
     for name, url in _rows(output, 2, "Flatpak remotes"):
         _remote_name(name)
-        _text(url, "Flatpak remote URL")
+        _remote_url(url)
         if name in seen:
             raise PackageError(f"Duplicate {scope} Flatpak remote in command output: {name}")
         seen.add(name)

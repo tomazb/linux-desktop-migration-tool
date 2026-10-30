@@ -202,7 +202,9 @@ def restore_command(args):
     home = Path(info["home"])
     rollback = args.rollback_dir.expanduser() if args.rollback_dir else None
     # Validate the destination before either package transactions or file writes.
-    plan = bundle.restore_bundle(source_path, home, dry_run=True, backup_dir=rollback)
+    # Plan from the manifest verified above; --apply verifies the bundle again
+    # immediately before writing, after any package transactions.
+    plan = bundle.plan_restore(source_path, home, manifest, backup_dir=rollback)
     print("Restore preview:" if not args.apply else "Validated restore plan:")
     print_manifest_summary(manifest)
     print(f"Destination: {home}")

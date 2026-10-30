@@ -24,6 +24,8 @@ Nondefault `XDG_CONFIG_HOME`/`XDG_DATA_HOME` layouts are rejected on backup and
 restore. Migrate them separately; do not unset these values merely to bypass the
 check. Unsupported escaped assignments in `user-dirs.dirs` are rejected explicitly
 rather than interpreted as shell code or silently replaced with default folders.
+A symlinked or non-regular `user-dirs.dirs` is also rejected: replace it with a
+regular file, or use `--settings-only` and select folders with `--include`.
 
 ```bash
 python3 fedora-migration.py backup --output /mnt/backup/fedora43-backup \
@@ -177,7 +179,10 @@ Close applications and log out of XFCE again. Read the journal in the reported
 rollback directory and identify the exact paths to recover. Status is `complete`,
 `failed` or `interrupted` after an attempt (`in_progress` if abruptly terminated).
 The intent plan lists potentially touched paths, not proof every listed write
-finished; inspect `previous/` for actual saved originals. Ctrl+C returns 130 and
+finished; inspect `previous/` for actual saved originals. A recovery copy is
+assembled under `staging/` and moved into `previous/` only once complete, so
+`previous/` never holds a partial original; after an abrupt termination, ignore
+anything left in `staging/`. Ctrl+C returns 130 and
 reports the retained rollback directory. Keep a
 copy of the current target versions if you need to compare them. Copy only the
 chosen corresponding entries from `ROLLBACK/previous/` back beneath your home,

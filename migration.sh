@@ -182,6 +182,25 @@ detect_privileges() {
     if has_admin_group "$local_groups"; then local_is_privileged=true; fi
 }
 
+# Flatpak inventory rules shared with fedora_migration/packages.py. The cases in
+# tests/fixtures/flatpak_conformance.json keep both implementations aligned.
+# LC_ALL=C keeps bracket ranges to ASCII bytes regardless of the user's locale.
+flatpak_name_is_valid() {
+    local LC_ALL=C
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+flatpak_ref_is_valid() {
+    local LC_ALL=C part='[A-Za-z0-9_][A-Za-z0-9_.-]*'
+    # An application ID has at least two elements, such as org.example.App.
+    [[ $1 =~ ^(app/)?($part)/$part/$part$ && ${BASH_REMATCH[2]} == *.* ]]
+}
+
+flatpak_url_is_valid() {
+    local LC_ALL=C
+    [[ $1 =~ ^[!-~]+$ ]]
+}
+
 migrate_flatpak_applications() {
     local scope configuration source_output target_output enabled_output app_output
     local kind output line name url extra key ref origin i
@@ -219,7 +238,7 @@ migrate_flatpak_applications() {
             while IFS= read -r line; do
                 [[ -n $line ]] || continue
                 IFS=$'\t' read -r name url extra <<< "$line"
-                if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ || -z $url || -n $extra || $url =~ [[:space:][:cntrl:]] ]]; then
+                if ! flatpak_name_is_valid "$name" || ! flatpak_url_is_valid "$url" || [[ -n $extra ]]; then
                     echo "Invalid $scope Flatpak remote inventory; expected tab-separated name and URL." >&2
                     return 1
                 fi
@@ -239,7 +258,7 @@ migrate_flatpak_applications() {
         while IFS= read -r line; do
             [[ -n $line ]] || continue
             IFS=$'\t' read -r ref origin extra <<< "$line"
-            if [[ ! $ref =~ ^(app/)?[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*$ || ! $origin =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ || -n $extra ]]; then
+            if ! flatpak_ref_is_valid "$ref" || ! flatpak_name_is_valid "$origin" || [[ -n $extra ]]; then
                 echo "Invalid $scope Flatpak app inventory; expected complete ref and origin." >&2
                 return 1
             fi

@@ -44,6 +44,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   originals and report the rollback path on failure or Ctrl+C interruption.
 - Clarify content/tree verification versus metadata replay, configured DNF
   exclusions, and traversal of mounted subtrees within selected paths.
+- Create copied files with mode `0600` from the start; restore keeps temporary
+  files private through checksum validation and applies the manifest mode and
+  timestamps only immediately before atomic replacement.
+- Stage recovery copies privately and publish them under `previous/` only once
+  complete and synced, so a failed or interrupted save leaves no partial original.
+- Reject a symlinked or non-regular `.config/user-dirs.dirs` during personal-folder
+  discovery instead of silently selecting default folder names.
+- Restore preview verifies the bundle once instead of twice; apply verifies once
+  for planning and again immediately before writing (previously three times).
+- Shared Flatpak validation cases for the Python and legacy Bash workflows. Bash
+  now requires a two-element application ID and printable-ASCII remote URLs, and
+  validates in the C locale so non-ASCII names are rejected under any locale.
 
 ### Documentation
 

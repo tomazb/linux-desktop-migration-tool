@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from fedora_migration.bundle import (
 )
 
 
-class BundleTests(unittest.TestCase):
+class BundleFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -23,6 +24,17 @@ class BundleTests(unittest.TestCase):
         self.target = self.root / "target"
         self.target.mkdir()
         self.bundle = self.root / "bundle"
+        # The workflow rejects nondefault XDG base directories; keep the
+        # caller's desktop environment from changing these filesystem fixtures.
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+            os.environ.pop(variable, None)
+
+    def umask(self, value):
+        previous = os.umask(value)
+        self.addCleanup(os.umask, previous)
 
     def write(self, path, data=b"settings", mode=0o640):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,6 +52,8 @@ class BundleTests(unittest.TestCase):
         change(data)
         path.write_text(json.dumps(data))
 
+
+class BundleTests(BundleFixture):
     def test_roundtrip_bytes_modes_mtime_and_symlink(self):
         source = self.write(self.home / ".config/xfce4/test", b"\x00hello", 0o600)
         os.utime(source, ns=(1700000000000000000, 1700000000123456789))
@@ -376,6 +390,137 @@ class BundleTests(unittest.TestCase):
             result = restore_bundle(self.bundle, self.target, dry_run=False)
         final_size = (Path(result["backup_dir"]) / "journal.json").stat().st_size
         self.assertLessEqual(sum(written), 4 * final_size + 1024)
+
+
+
+def _fd_path(stream):
+    return os.readlink(f"/proc/self/fd/{stream.fileno()}")
+
+
+class RestorePrivacyTests(BundleFixture):
+    def test_restore_temporary_files_stay_private_until_replacement(self):
+        private = self.write(self.home / ".config/xfce4/private.xml", b"secret", 0o600)
+        public = self.write(self.home / ".config/xfce4/public.xml", b"shared", 0o644)
+        os.utime(private, ns=(1700000000000000000, 1700000000123456789))
+        os.utime(public, ns=(1600000000000000000, 1600000000987654321))
+        self.backup()
+        # A transferred payload copy can be wider than its manifest mode.
+        (self.bundle / "payload/.config/xfce4/private.xml").chmod(0o644)
+        existing = self.target / ".config/xfce4"
+        existing.mkdir(parents=True)
+        for directory in (existing.parent, existing):
+            directory.chmod(0o755)
+        self.umask(0o022)
+        observed = []
+        copy, digest = shutil.copyfileobj, bundle_module._digest
+
+        def record_copy(reader, writer, *args):
+            name = Path(_fd_path(writer)).name
+            if name.startswith(".fedora-migration-"):
+                observed.append(("copy", stat.S_IMODE(os.fstat(writer.fileno()).st_mode)))
+            return copy(reader, writer, *args)
+
+        def record_digest(path):
+            if Path(path).name.startswith(".fedora-migration-"):
+                observed.append(("verify", stat.S_IMODE(Path(path).stat().st_mode)))
+            return digest(path)
+
+        with patch("fedora_migration.bundle.shutil.copyfileobj", side_effect=record_copy), \
+             patch("fedora_migration.bundle._digest", side_effect=record_digest):
+            restore_bundle(self.bundle, self.target, dry_run=False)
+        self.assertEqual(sorted(observed), [("copy", 0o600)] * 2 + [("verify", 0o600)] * 2)
+        for source, mode in ((private, 0o600), (public, 0o644)):
+            restored = existing / source.name
+            self.assertEqual(restored.read_bytes(), source.read_bytes())
+            self.assertEqual(stat.S_IMODE(restored.stat().st_mode), mode)
+            self.assertEqual(restored.stat().st_mtime_ns, source.stat().st_mtime_ns)
+        self.assertEqual(list(existing.glob(".fedora-migration-*")), [])
+
+
+class RecoveryCopyTests(BundleFixture):
+    def fail_saving_bashrc(self, error):
+        for name, data in ((".bash_profile", b"new profile"), (".bashrc", b"new rc")):
+            self.write(self.home / name, data)
+        self.write(self.target / ".bash_profile", b"old profile")
+        self.write(self.target / ".bashrc", b"old rc contents", 0o600)
+        self.backup()
+        rollback = self.root / "rollback"
+        copy = shutil.copyfileobj
+
+        def fail_midway(reader, writer, *args):
+            if _fd_path(reader) == str(self.target / ".bashrc"):
+                writer.write(reader.read(3))
+                writer.flush()
+                raise error
+            return copy(reader, writer, *args)
+
+        with patch("fedora_migration.bundle.shutil.copyfileobj", side_effect=fail_midway):
+            with self.assertRaises((BundleError, KeyboardInterrupt)) as caught:
+                restore_bundle(self.bundle, self.target, dry_run=False, backup_dir=rollback)
+        return rollback, caught.exception
+
+    def assert_recovery_state(self, rollback, status):
+        destination = self.target / ".bashrc"
+        self.assertEqual(destination.read_bytes(), b"old rc contents")
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        # The earlier, completed recovery copy remains valid and published.
+        self.assertEqual((self.target / ".bash_profile").read_bytes(), b"new profile")
+        self.assertEqual((rollback / "previous/.bash_profile").read_bytes(), b"old profile")
+        self.assertFalse(os.path.lexists(rollback / "previous/.bashrc"))
+        remaining = sorted(path.relative_to(rollback).as_posix()
+                           for path in rollback.rglob("*") if not path.is_dir())
+        self.assertEqual(remaining, ["journal.json", "previous/.bash_profile"])
+        self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
+        journal = json.loads((rollback / "journal.json").read_text())
+        self.assertEqual(journal["status"], status)
+        self.assertEqual(journal["replaced"], [".bash_profile", ".bashrc"])
+        return journal
+
+    def test_enospc_while_saving_original_publishes_no_partial_copy(self):
+        rollback, error = self.fail_saving_bashrc(
+            OSError(errno.ENOSPC, os.strerror(errno.ENOSPC)))
+        self.assertIsInstance(error, BundleError)
+        self.assertIn(f"Retained rollback directory: {rollback}", str(error))
+        journal = self.assert_recovery_state(rollback, "failed")
+        self.assertIn(os.strerror(errno.ENOSPC), journal["error"])
+
+    def test_interrupt_while_saving_original_publishes_no_partial_copy(self):
+        rollback, error = self.fail_saving_bashrc(KeyboardInterrupt())
+        self.assertIsInstance(error, bundle_module.BundleInterrupted)
+        self.assertIn(f"Retained rollback directory: {rollback}", str(error))
+        self.assert_recovery_state(rollback, "interrupted")
+
+
+class XDGConfigurationTests(BundleFixture):
+    def test_symlinked_user_dirs_configuration_is_rejected_not_defaulted(self):
+        real = self.write(self.home / ".config/user-dirs.real",
+                          b'XDG_DOCUMENTS_DIR="$HOME/WorkFiles"\n')
+        self.write(self.home / "WorkFiles/report.txt")
+        link = self.home / ".config/user-dirs.dirs"
+        for target in (real.name, "missing-user-dirs"):
+            with self.subTest(target=target):
+                if os.path.lexists(link):
+                    link.unlink()
+                link.symlink_to(target)
+                with self.assertRaisesRegex(BundleError, r"user-dirs\.dirs.*symlink"):
+                    self.backup()
+                self.assertFalse(os.path.lexists(self.bundle))
+        # Settings-only backups do not discover personal directories.
+        self.backup(settings_only=True)
+        self.assertEqual(os.readlink(self.bundle / "payload/.config/user-dirs.dirs"),
+                         "missing-user-dirs")
+
+    def test_non_regular_user_dirs_configuration_is_rejected_not_defaulted(self):
+        (self.home / ".config/user-dirs.dirs").mkdir(parents=True)
+        self.write(self.home / "Documents/report.txt")
+        with self.assertRaisesRegex(BundleError, r"user-dirs\.dirs.*regular file"):
+            self.backup()
+        self.assertFalse(os.path.lexists(self.bundle))
+
+    def test_missing_user_dirs_configuration_uses_xdg_defaults(self):
+        self.write(self.home / "Documents/report.txt")
+        manifest = self.backup()
+        self.assertIn("Documents", manifest["selected_paths"])
 
 
 if __name__ == "__main__":
