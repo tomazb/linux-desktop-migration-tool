@@ -55,6 +55,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `0777`) cannot make the tool's own new files and directories inaccessible.
 - Reject a symlinked or non-regular `.config/user-dirs.dirs` during personal-folder
   discovery instead of silently selecting default folder names.
+- Back up and restore filenames containing a backslash on Linux; previously one
+  such file failed the whole backup after all copying. Backslash paths are still
+  rejected where the platform treats `\\` as a separator, and an unsupported name
+  now fails when copying reaches it rather than at final verification.
 - Restore preview verifies the bundle once instead of twice; apply verifies once
   for planning and again immediately before writing (previously three times).
 - Shared Flatpak validation cases for the Python and legacy Bash workflows. Bash

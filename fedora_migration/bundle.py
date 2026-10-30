@@ -82,9 +82,16 @@ def _check_xdg_layout(home):
             )
 
 
+# Backslash is an ordinary filename character where "/" is the only path
+# separator (Linux, where backup and restore run). verify can also run on
+# systems such as Windows that treat it as a separator; reject it there.
+_BACKSLASH_IS_SEPARATOR = os.sep != "/" or os.altsep is not None
+
+
 def _safe_path(value):
     if (not isinstance(value, str) or not value or "\0" in value
-            or value.startswith("/") or "\\" in value
+            or value.startswith("/")
+            or (_BACKSLASH_IS_SEPARATOR and "\\" in value)
             or any(part in ("", ".", "..") for part in value.split("/"))):
         raise BundleError(f"Unsafe relative path: {value!r}")
     return value
@@ -354,6 +361,8 @@ def create_bundle(home, output, source, packages, *, include=(),
         def copy_entry(relative, recurse=True):
             if relative in entries or secret_excluded(relative):
                 return
+            # Fail at the offending name, not after copying everything else.
+            _safe_path(relative)
             source_path, destination = home / relative, payload / relative
             _assert_no_symlink_ancestors(source_path)
             info = source_path.lstat()

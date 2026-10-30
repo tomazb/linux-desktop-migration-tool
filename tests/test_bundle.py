@@ -594,5 +594,47 @@ class RecoveryDurabilityTests(BundleFixture):
             self.assertIn(directory, synced)
 
 
+class BackslashNameTests(BundleFixture):
+    def test_backslash_in_names_round_trips_on_posix(self):
+        # Backslash is an ordinary filename character on Linux.
+        source = self.write(self.home / "Documents/a\\b.txt", b"report", 0o600)
+        self.write(self.home / "Documents/odd\\dir/nested.txt", b"nested")
+        (self.home / "Documents/link\\name").symlink_to("a\\b.txt")
+        self.backup(include=["Documents"], settings_only=True)
+        verify_bundle(self.bundle)
+        restore_bundle(self.bundle, self.target, dry_run=False)
+        documents = self.target / "Documents"
+        self.assertEqual((documents / "a\\b.txt").read_bytes(), b"report")
+        self.assertEqual(stat.S_IMODE((documents / "a\\b.txt").stat().st_mode), 0o600)
+        self.assertEqual((documents / "odd\\dir/nested.txt").read_bytes(), b"nested")
+        self.assertEqual(os.readlink(documents / "link\\name"), "a\\b.txt")
+        self.assertEqual(source.read_bytes(), b"report")
+
+    def test_backslash_rejected_where_it_separates_paths(self):
+        # verify can run on other systems; there a backslash name could escape.
+        self.write(self.home / "Documents/a\\b.txt")
+        self.backup(include=["Documents"], settings_only=True)
+        with patch.object(bundle_module, "_BACKSLASH_IS_SEPARATOR", True):
+            with self.assertRaisesRegex(BundleError, "Unsafe relative path"):
+                verify_bundle(self.bundle)
+
+    def test_unsupported_name_fails_before_later_files_are_copied(self):
+        self.write(self.home / "Documents/a\\b.txt")
+        self.write(self.home / "Documents/z-large.bin", b"x" * 4096)
+        copied = []
+        copy = bundle_module._copy_regular
+
+        def record(source, *args, **kwargs):
+            copied.append(Path(source).name)
+            return copy(source, *args, **kwargs)
+
+        with patch.object(bundle_module, "_BACKSLASH_IS_SEPARATOR", True), \
+             patch("fedora_migration.bundle._copy_regular", side_effect=record):
+            with self.assertRaisesRegex(BundleError, r"Unsafe relative path: 'Documents/a\\\\b\.txt'"):
+                self.backup(include=["Documents"], settings_only=True)
+        self.assertEqual(copied, [])
+        self.assertFalse(os.path.lexists(self.bundle))
+
+
 if __name__ == "__main__":
     unittest.main()
