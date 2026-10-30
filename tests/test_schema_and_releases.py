@@ -80,7 +80,8 @@ class SchemaVersionTests(BundleFixture):
     def test_invalid_tool_version_is_rejected_for_both_schemas(self):
         self.backup()
         for schema in (1, 2):
-            for value in (None, 1, 1.0, ["1.0"], {"v": 1}, True, "", "1.0\n", "1\x00", "a\tb", "x\x7f"):
+            for value in (None, 1, 1.0, ["1.0"], {"v": 1}, True, "", "1.0\n", "1\x00", "a\tb", "x\x7f",
+                          "1.1\u0085", "1.1\u009b", "\u009f"):
                 with self.subTest(schema=schema, tool_version=value):
                     self.manifest(lambda data: data.update(schema_version=schema, tool_version=value))
                     with self.assertRaisesRegex(BundleError, "tool version"):

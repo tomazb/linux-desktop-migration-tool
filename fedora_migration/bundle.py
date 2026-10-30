@@ -17,6 +17,7 @@ import re
 import shutil
 import stat
 import tempfile
+import unicodedata
 import uuid
 
 from . import __version__
@@ -528,7 +529,7 @@ def _load_manifest(bundle):
         raise BundleError(f"Unsupported bundle schema version: {schema}.")
     tool_version = manifest.get("tool_version")
     if (not isinstance(tool_version, str) or not tool_version
-            or any(ord(char) < 32 or ord(char) == 127 for char in tool_version)):
+            or any(unicodedata.category(char) == "Cc" for char in tool_version)):
         raise BundleError("Invalid tool version in the manifest: it must be a non-empty "
                           "string without control characters.")
     for key in ("source", "packages"):
