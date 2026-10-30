@@ -529,5 +529,70 @@ class XDGConfigurationTests(BundleFixture):
         self.assertIn("Documents", manifest["selected_paths"])
 
 
+class RestrictiveUmaskTests(BundleFixture):
+    def test_backup_and_restore_work_when_umask_removes_owner_access(self):
+        nested = self.write(self.home / ".config/xfce4/panel/launcher.desktop", b"new", 0o640)
+        os.utime(nested, ns=(1700000000000000000, 1700000000123456789))
+        self.write(self.target / ".config/xfce4/panel/launcher.desktop", b"old", 0o600)
+        self.umask(0o777)
+        self.backup()
+        verify_bundle(self.bundle)
+        rollback = self.root / "new-parent/rollback"
+        restore_bundle(self.bundle, self.target, dry_run=False, backup_dir=rollback)
+        restored = self.target / ".config/xfce4/panel/launcher.desktop"
+        self.assertEqual(restored.read_bytes(), b"new")
+        self.assertEqual(stat.S_IMODE(restored.stat().st_mode), 0o640)
+        self.assertEqual(restored.stat().st_mtime_ns, nested.stat().st_mtime_ns)
+        saved = rollback / "previous/.config/xfce4/panel/launcher.desktop"
+        self.assertEqual(saved.read_bytes(), b"old")
+        self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(rollback.stat().st_mode), 0o700)
+
+
+@PROC_FDS
+class RecoveryDurabilityTests(BundleFixture):
+    def test_nested_recovery_copy_is_durable_before_destination_replacement(self):
+        relative = ".config/xfce4/panel/launcher.desktop"
+        self.write(self.home / relative, b"new")
+        original = self.write(self.target / relative, b"old", 0o604)
+        os.utime(original, ns=(1600000000000000000, 1600000000987654321))
+        expected_metadata = (0o604, original.stat().st_mtime_ns)
+        self.backup()
+        rollback = self.root / "new-parent/rollback"
+        events = []
+        fsync, fsync_directory, replace = os.fsync, bundle_module._fsync_directory, os.replace
+
+        def record_fsync(fd):
+            path = os.readlink(f"/proc/self/fd/{fd}")
+            if "/staging/" in path:
+                info = os.fstat(fd)
+                events.append(("file", (stat.S_IMODE(info.st_mode), info.st_mtime_ns)))
+            return fsync(fd)
+
+        def record_directory(path):
+            events.append(("directory", Path(path)))
+            return fsync_directory(path)
+
+        def record_replace(source, destination):
+            events.append(("replace", Path(destination)))
+            return replace(source, destination)
+
+        with patch("fedora_migration.bundle.os.fsync", side_effect=record_fsync), \
+             patch("fedora_migration.bundle._fsync_directory", side_effect=record_directory), \
+             patch("fedora_migration.bundle.os.replace", side_effect=record_replace):
+            restore_bundle(self.bundle, self.target, dry_run=False, backup_dir=rollback)
+        # The recovery file's mode and mtime are set before its final fsync.
+        self.assertIn(("file", expected_metadata), events)
+        overwrite = events.index(("replace", self.target / relative))
+        synced = {path for kind, path in events[:overwrite] if kind == "directory"}
+        saved = rollback / "previous" / relative
+        # Every directory entry on the path to the recovery copy is durable
+        # before the original is overwritten, including newly created parents.
+        for directory in [saved.parent, *saved.parent.parents]:
+            if directory == self.root.parent:
+                break
+            self.assertIn(directory, synced)
+
+
 if __name__ == "__main__":
     unittest.main()

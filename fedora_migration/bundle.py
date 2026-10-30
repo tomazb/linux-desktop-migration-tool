@@ -7,6 +7,7 @@ an attacker. Symlinks are copied as links and are never traversed.
 
 import contextlib
 from datetime import datetime, timezone
+import functools
 import hashlib
 import json
 import os
@@ -49,6 +50,23 @@ SECRETS = (
 # before any destination changes rather than discovering an overflow in utime.
 MIN_MTIME_NS = -(2**63)
 MAX_MTIME_NS = 2**63 - 1
+
+
+def _owner_accessible(function):
+    """Run with umask 077 so everything the tool creates stays usable by its owner.
+
+    Creation modes are reduced by the umask, so a mask such as 0777 would make
+    new private files and directories unreadable even to the owner. Final modes
+    are applied explicitly with chmod, which the umask does not affect.
+    """
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        previous = os.umask(0o077)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            os.umask(previous)
+    return wrapper
 
 
 def _check_xdg_layout(home):
@@ -143,15 +161,16 @@ def _copy_regular(source, destination, expected=None, *, preserve_metadata=True)
         with os.fdopen(os.open(destination, out_flags, 0o600), "wb") as writer:
             shutil.copyfileobj(reader, writer, 1024 * 1024)
             writer.flush()
+            # Apply metadata before fsync so content and metadata are durable together.
+            if preserve_metadata:
+                os.fchmod(writer.fileno(), stat.S_IMODE(before.st_mode))
+                os.utime(writer.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
             os.fsync(writer.fileno())
         after = os.fstat(reader.fileno())
         current = source.lstat()
         if (_fingerprint(before) != _fingerprint(after)
                 or _fingerprint(before) != _fingerprint(current)):
             raise BundleError(f"Source changed while copying: {source}")
-    if preserve_metadata:
-        destination.chmod(stat.S_IMODE(before.st_mode))
-        os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
     return before
 
 
@@ -163,10 +182,10 @@ def _fsync_directory(path):
         os.close(fd)
 
 
-def _private_parents(directory, root):
-    """Create missing directories below root, syncing each new entry."""
+def _private_parents(directory):
+    """Create directory and its missing ancestors, syncing each new entry."""
     missing = []
-    while directory != root and not os.path.lexists(directory):
+    while not os.path.lexists(directory):
         missing.append(directory)
         directory = directory.parent
     for node in reversed(missing):
@@ -174,7 +193,7 @@ def _private_parents(directory, root):
         _fsync_directory(node.parent)
 
 
-def _save_original(original, saved, staging, previous):
+def _save_original(original, saved, staging):
     """Publish a recovery copy under previous/ only once it is complete.
 
     The copy is assembled in the private staging directory on the same
@@ -190,7 +209,7 @@ def _save_original(original, saved, staging, previous):
                      follow_symlinks=False)
         else:
             _copy_regular(original, temporary)
-        _private_parents(saved.parent, previous)
+        _private_parents(saved.parent)
         os.replace(temporary, saved)
         _fsync_directory(saved.parent)
     finally:
@@ -273,6 +292,7 @@ def _write_json(path, data):
     path.chmod(0o600)
 
 
+@_owner_accessible
 def create_bundle(home, output, source, packages, *, include=(),
                   include_secrets=False, settings_only=False):
     """Create a new private bundle outside HOME, publishing only on success."""
@@ -515,6 +535,7 @@ def _update_journal(rollback, journal):
     temporary = rollback / ("journal-" + uuid.uuid4().hex + ".tmp")
     _write_json(temporary, journal)
     os.replace(temporary, rollback / "journal.json")
+    _fsync_directory(rollback)
 
 
 def _plan(bundle, home, manifest, backup_dir):
@@ -564,6 +585,7 @@ def plan_restore(bundle, home, manifest, *, backup_dir=None):
         raise BundleError(f"Restore failed before copying files: {exc}") from exc
 
 
+@_owner_accessible
 def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
     """Preview or overlay a validated bundle, retaining originals and a journal."""
     bundle, home = _absolute(bundle), _absolute(home)
@@ -596,8 +618,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
                           if e["type"] != "directory" and e["path"] not in planned_replaced),
             "created_directories": sorted(created),
         }
-        candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        candidate.mkdir(mode=0o700)
+        _private_parents(candidate)
         rollback = candidate
         previous = rollback / "previous"
         previous.mkdir(mode=0o700)
@@ -605,6 +626,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
         # when complete, so previous/ never holds a partial original.
         staging = rollback / "staging"
         staging.mkdir(mode=0o700)
+        _fsync_directory(rollback)
         summary["backup_dir"] = str(rollback)
         _update_journal(rollback, journal)
         for entry in directories:
@@ -623,7 +645,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
             if exists != (relative in planned_replaced):
                 raise BundleError(f"Destination changed after preflight: {destination}")
             if exists:
-                _save_original(destination, previous / relative, staging, previous)
+                _save_original(destination, previous / relative, staging)
             temporary = destination.parent / (".fedora-migration-" + uuid.uuid4().hex)
             try:
                 if entry["type"] == "file":

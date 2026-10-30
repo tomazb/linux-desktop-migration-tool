@@ -49,6 +49,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   timestamps only immediately before atomic replacement.
 - Stage recovery copies privately and publish them under `previous/` only once
   complete and synced, so a failed or interrupted save leaves no partial original.
+  File metadata is applied before fsync, and new rollback and recovery directories
+  are synced before the original is overwritten.
+- Backup and restore run with umask `077`, so a restrictive user umask (even
+  `0777`) cannot make the tool's own new files and directories inaccessible.
 - Reject a symlinked or non-regular `.config/user-dirs.dirs` during personal-folder
   discovery instead of silently selecting default folder names.
 - Restore preview verifies the bundle once instead of twice; apply verifies once
