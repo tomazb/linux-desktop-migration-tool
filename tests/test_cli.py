@@ -659,16 +659,15 @@ class CLITests(unittest.TestCase):
     def test_interrupted_rollback_exits_130_and_reports_undone_dir(self):
         cli = cli_module()
         bundle, target, rollback, info = self.rollback_fixture()
-        destination = target / ".config/xfce4/settings.xml"
         original_replace = os.replace
 
-        def interrupt(src, dest):
-            if Path(dest) == destination:
+        def interrupt(src, dest, **kwargs):
+            if dest == "settings.xml" and kwargs.get("dst_dir_fd") is not None:
                 raise KeyboardInterrupt()
-            return original_replace(src, dest)
+            return original_replace(src, dest, **kwargs)
 
         with patch.object(cli, "assert_xfce_stopped"), \
-             patch("fedora_migration.bundle.os.replace", side_effect=interrupt):
+             patch("fedora_migration.rollback.os.replace", side_effect=interrupt):
             code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
         self.assertEqual(code, 130)
         undone = sorted(rollback.glob("undone-*"))

@@ -1,5 +1,6 @@
 """Rollback tests: real bundles, real restores and real journals; no mocks of file logic."""
 
+import errno
 import importlib
 import json
 import os
@@ -38,6 +39,17 @@ def snapshot(root):
             result[relative] = ("file", path.read_bytes(),
                                 stat.S_IMODE(info.st_mode), info.st_mtime_ns)
     return result
+
+
+def failing_final_replace(name, error):
+    """An os.replace stand-in that fails the pinned final rename onto `name`."""
+    real = os.replace
+
+    def side_effect(src, dst, **kwargs):
+        if dst == name and kwargs.get("dst_dir_fd") is not None:
+            raise error
+        return real(src, dst, **kwargs)
+    return side_effect
 
 
 class RollbackFixture(BundleFixture):
@@ -606,6 +618,40 @@ class ValidationTests(RollbackFixture):
             self.apply(before_write=swap_after_planning)
         self.assertEqual((elsewhere / "xfce4/new.xml").read_bytes(), b"restored new")
 
+    def test_created_directories_inside_the_bundle_are_refused(self):
+        (self.home / ".config/xfce4/empty").mkdir(parents=True)
+        self.write(self.home / ".config/xfce4/a.xml", b"a")
+        self.bundle = self.target / "stored-bundle"
+        self.backup()
+        self.restore()
+        for crafted in ("stored-bundle/payload/.config/xfce4/empty", "stored-bundle/payload",
+                        "stored-bundle"):
+            with self.subTest(crafted=crafted):
+                journal = self.journal()
+                journal["created_directories"] = [crafted]
+                (self.rollback_dir / "journal.json").write_text(json.dumps(journal))
+                self.assertRefused("bundle")
+                self.assertTrue((self.bundle / "payload/.config/xfce4/empty").is_dir())
+                bundle_module.verify_bundle(self.bundle)
+
+    def test_created_directory_inside_the_rollback_directory_is_refused(self):
+        self.rollback_dir = self.target / ".local/state/recovery"
+        self.make()
+        self.edit_journal(lambda j: j.update(
+            created_directories=j["created_directories"] + [".local/state/recovery/previous"]))
+        self.assertRefused("rollback directory")
+
+    def test_a_rollback_directory_inside_a_created_directory_is_fine(self):
+        self.rollback_dir = self.target / ".local/state/recovery"
+        self.write(self.home / ".local/bin/tool", b"tool")
+        self.make()
+        self.assertIn(".local", self.journal()["created_directories"])
+        result = self.apply()
+        self.assertEqual(result["status"], "complete")
+        self.assertIn(".local", [d["path"] for d in result["kept_directories"]])
+        self.assertTrue(self.rollback_dir.is_dir())
+        self.assertFalse((self.target / ".local/bin").exists())
+
     def test_destinations_inside_the_rollback_directory_are_refused(self):
         self.rollback_dir = self.target / ".local/state/recovery"
         self.make()
@@ -614,19 +660,204 @@ class ValidationTests(RollbackFixture):
         self.assertRefused("rollback directory")
 
 
+class MetadataTests(RollbackFixture):
+    def test_same_bytes_but_different_mode_and_mtime_is_put_back(self):
+        self.write(self.home / ".bashrc", b"same bytes", 0o644)
+        os.utime(self.home / ".bashrc", ns=(1700000000000000000, 1700000000000000000))
+        self.write(self.target / ".bashrc", b"same bytes", 0o600)
+        os.utime(self.target / ".bashrc", ns=(1600000000000000000, 1600000000000000000))
+        self.backup()
+        self.restore()
+        plan = self.plan()
+        self.assertEqual(plan["unchanged"], [])
+        self.assertEqual(plan["put_back"], [".bashrc"])
+        result = self.apply()
+        self.assertEqual(result["status"], "complete")
+        original = self.target / ".bashrc"
+        self.assertEqual(stat.S_IMODE(original.stat().st_mode), 0o600)
+        self.assertEqual(original.stat().st_mtime_ns, 1600000000000000000)
+        self.assertEqual(
+            stat.S_IMODE((Path(result["undone_dir"]) / ".bashrc").stat().st_mode), 0o644)
+
+    def test_same_symlink_target_but_different_mtime_is_put_back(self):
+        (self.home / ".bash_profile").symlink_to("/same")
+        os.utime(self.home / ".bash_profile", ns=(1700000000000000000, 1700000000000000000),
+                 follow_symlinks=False)
+        (self.target / ".bash_profile").symlink_to("/same")
+        os.utime(self.target / ".bash_profile", ns=(1600000000000000000, 1600000000000000000),
+                 follow_symlinks=False)
+        self.backup()
+        self.restore()
+        self.assertEqual(self.plan()["put_back"], [".bash_profile"])
+        self.apply()
+        self.assertEqual((self.target / ".bash_profile").lstat().st_mtime_ns,
+                         1600000000000000000)
+
+
+class PinnedWriteTests(RollbackFixture):
+    def outside(self):
+        outside = self.root / "outside"
+        (outside / "xfce4/sub").mkdir(parents=True)
+        (outside / "xfce4/new.xml").write_bytes(b"OUTSIDE-ONLY USER DATA")
+        (outside / "xfce4/sub/deep.xml").write_bytes(b"OUTSIDE-ONLY DEEP")
+        return outside
+
+    def swap_config(self, outside):
+        (self.target / ".config").rename(self.target / ".config-original")
+        (self.target / ".config").symlink_to(outside, target_is_directory=True)
+
+    def assertOutsideIntact(self, outside):
+        self.assertEqual((outside / "xfce4/new.xml").read_bytes(), b"OUTSIDE-ONLY USER DATA")
+        self.assertEqual((outside / "xfce4/sub/deep.xml").read_bytes(), b"OUTSIDE-ONLY DEEP")
+
+    def test_parent_swapped_for_a_symlink_while_pinning_is_refused_cleanly(self):
+        self.standard_setup()
+        self.restore()
+        outside = self.outside()
+        module = rollback_module()
+        real = module._open_parent
+
+        def open_then_swap(home, relative, **kwargs):
+            descriptor = real(home, relative, **kwargs)
+            if relative == ".config/xfce4/new.xml":
+                self.swap_config(outside)
+            return descriptor
+
+        with patch.object(module, "_open_parent", side_effect=open_then_swap):
+            with self.assertRaises(BundleError):
+                self.apply()
+        self.assertOutsideIntact(outside)
+        journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+        self.assertEqual(journal["status"], "failed")
+
+    def test_parent_swapped_after_pinning_never_touches_the_outside(self):
+        self.standard_setup()
+        self.restore()
+        outside = self.outside()
+        module = rollback_module()
+        real = module._pin
+
+        def pin_then_swap(home, relative, **kwargs):
+            descriptor = real(home, relative, **kwargs)
+            if relative == ".config/xfce4/new.xml":
+                self.swap_config(outside)
+            return descriptor
+
+        with patch.object(module, "_pin", side_effect=pin_then_swap):
+            try:
+                self.apply()
+            except BundleError:
+                pass
+        self.assertOutsideIntact(outside)
+        # The exact entry that was pinned is the one that was captured.
+        self.assertEqual(
+            (self.undone_dirs()[0] / ".config/xfce4/new.xml").read_bytes(), b"restored new")
+
+    def test_edit_after_staging_and_before_capture_is_saved_not_lost(self):
+        self.standard_setup()
+        self.restore()
+        module = rollback_module()
+        real = module._stage_saved
+
+        def stage_then_edit(saved, descriptor):
+            name = real(saved, descriptor)
+            (self.target / ".bashrc").write_bytes(b"LATEST USER EDIT")
+            return name
+
+        with patch.object(module, "_stage_saved", side_effect=stage_then_edit):
+            result = self.apply()
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"original bashrc")
+        self.assertEqual((Path(result["undone_dir"]) / ".bashrc").read_bytes(),
+                         b"LATEST USER EDIT")
+
+    def test_edit_between_plan_and_write_is_saved(self):
+        self.standard_setup()
+        self.restore()
+        result = self.apply(before_write=lambda: (self.target / ".bashrc").write_bytes(
+            b"edited after planning"))
+        self.assertEqual((Path(result["undone_dir"]) / ".bashrc").read_bytes(),
+                         b"edited after planning")
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"original bashrc")
+
+    def exdev(self, source, destination, *args, **kwargs):
+        if kwargs.get("src_dir_fd") is not None:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return self.real_rename(source, destination, *args, **kwargs)
+
+    def test_cross_device_capture_falls_back_to_a_verified_copy(self):
+        self.standard_setup()
+        before = snapshot(self.target)
+        self.restore()
+        self.real_rename = os.rename
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev) as renamed:
+            result = self.apply()
+        self.assertTrue(renamed.called)
+        self.assertEqual(snapshot(self.target), before)
+        undone = Path(result["undone_dir"])
+        self.assertEqual((undone / ".bashrc").read_bytes(), b"restored bashrc")
+        self.assertEqual(os.readlink(undone / ".bash_profile"), "/restored/target")
+        self.assertEqual((undone / ".config/xfce4/new.xml").read_bytes(), b"restored new")
+        self.assertEqual(list(self.rollback_dir.glob("*staging*")), [])
+
+    def test_cross_device_fallback_refuses_when_the_entry_changed_after_the_copy(self):
+        self.standard_setup()
+        self.restore()
+        self.real_rename = os.rename
+        module = rollback_module()
+        real = module._copy_entry_out
+
+        def copy_then_edit(*args, **kwargs):
+            result = real(*args, **kwargs)
+            (self.target / ".bashrc").write_bytes(b"EDITED AFTER THE COPY")
+            return result
+
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+             patch.object(module, "_copy_entry_out", side_effect=copy_then_edit):
+            with self.assertRaisesRegex(BundleError, "changed"):
+                self.apply()
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"EDITED AFTER THE COPY")
+        journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+        self.assertEqual(journal["status"], "failed")
+        self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
+
+    def test_cross_device_fallback_refuses_to_remove_a_changed_new_file(self):
+        self.standard_setup()
+        self.restore()
+        self.real_rename = os.rename
+        module = rollback_module()
+        real = module._copy_entry_out
+
+        def copy_then_edit(pinned, leaf, *args, **kwargs):
+            result = real(pinned, leaf, *args, **kwargs)
+            if leaf == "new.xml":
+                (self.target / ".config/xfce4/new.xml").write_bytes(b"EDITED AFTER THE COPY")
+            return result
+
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+             patch.object(module, "_copy_entry_out", side_effect=copy_then_edit):
+            with self.assertRaisesRegex(BundleError, "changed"):
+                self.apply()
+        self.assertEqual((self.target / ".config/xfce4/new.xml").read_bytes(),
+                         b"EDITED AFTER THE COPY")
+
+    def test_failed_final_replace_puts_the_captured_entry_back(self):
+        self.standard_setup()
+        self.restore()
+        fail_final = failing_final_replace(".bashrc", OSError("injected disk failure"))
+        with patch("fedora_migration.rollback.os.replace", side_effect=fail_final):
+            with self.assertRaises(BundleError):
+                self.apply()
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"restored bashrc")
+        self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
+
+
 class FailureDuringRollbackTests(RollbackFixture):
     def test_failure_leaves_failed_journal_undone_copy_and_no_partial_files(self):
         self.standard_setup()
         self.restore()
-        replace = os.replace
         destination = self.target / ".bashrc"
-
-        def fail_put_back(src, dst):
-            if Path(dst) == destination:
-                raise OSError("injected disk failure")
-            return replace(src, dst)
-
-        with patch("fedora_migration.bundle.os.replace", side_effect=fail_put_back):
+        fail = failing_final_replace(".bashrc", OSError("injected disk failure"))
+        with patch("fedora_migration.rollback.os.replace", side_effect=fail):
             with self.assertRaises(BundleError) as caught:
                 self.apply()
         journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
@@ -636,8 +867,9 @@ class FailureDuringRollbackTests(RollbackFixture):
         self.assertEqual(len(undone), 1)
         self.assertIn(str(undone[0]), str(caught.exception))
         self.assertIn(str(undone[0]), journal["undone_dir"])
-        # The safety copy of the file being replaced is complete.
-        self.assertEqual((undone[0] / ".bashrc").read_bytes(), b"restored bashrc")
+        # The symlink put back before the failure was saved completely; the file
+        # being replaced when it failed was returned to its place.
+        self.assertEqual(os.readlink(undone[0] / ".bash_profile"), "/restored/target")
         self.assertEqual(destination.read_bytes(), b"restored bashrc")
         self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
         self.assertEqual(list(self.rollback_dir.glob("*staging*")), [])
@@ -648,14 +880,8 @@ class FailureDuringRollbackTests(RollbackFixture):
         self.standard_setup()
         before = snapshot(self.target)
         self.restore()
-        replace = os.replace
-
-        def fail_once(src, dst):
-            if Path(dst) == self.target / ".bashrc":
-                raise OSError("injected disk failure")
-            return replace(src, dst)
-
-        with patch("fedora_migration.bundle.os.replace", side_effect=fail_once):
+        fail = failing_final_replace(".bashrc", OSError("injected disk failure"))
+        with patch("fedora_migration.rollback.os.replace", side_effect=fail):
             with self.assertRaises(BundleError):
                 self.apply()
         self.apply()
@@ -666,17 +892,12 @@ class FailureDuringRollbackTests(RollbackFixture):
     def test_interrupt_is_reported_as_interrupted(self):
         self.standard_setup()
         self.restore()
-        replace = os.replace
-
-        def interrupt(src, dst):
-            if Path(dst) == self.target / ".bashrc":
-                raise KeyboardInterrupt()
-            return replace(src, dst)
-
-        with patch("fedora_migration.bundle.os.replace", side_effect=interrupt):
+        fail = failing_final_replace(".bashrc", KeyboardInterrupt())
+        with patch("fedora_migration.rollback.os.replace", side_effect=fail):
             with self.assertRaises(BundleInterrupted) as caught:
                 self.apply()
         self.assertIn(str(self.undone_dirs()[0]), str(caught.exception))
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"restored bashrc")
         journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
         self.assertEqual(journal["status"], "interrupted")
 
