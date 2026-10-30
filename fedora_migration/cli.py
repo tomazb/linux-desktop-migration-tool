@@ -82,6 +82,53 @@ def assert_xfce_stopped():
         raise MigrationError(f"Could not check the XFCE session: {result.stderr.strip()}")
 
 
+# Process names as pgrep matches them (the kernel truncates names to 15 bytes).
+APPLICATIONS = ("firefox", "firefox-bin", "thunderbird")
+SECRET_AGENTS = ("gpg-agent", "ssh-agent", "gnome-keyring-d")
+FULL_NAMES = {"gnome-keyring-d": "gnome-keyring-daemon"}
+
+
+def assert_applications_closed(*, secrets):
+    """Refuse while applications can change the profiles being copied.
+
+    Secret agents are checked only when keyrings or keys are part of the
+    operation. The tool never stops processes itself.
+    """
+    names = APPLICATIONS + (SECRET_AGENTS if secrets else ())
+    result = subprocess.run(
+        ["pgrep", "-u", str(os.getuid()), "-x", "-l", "|".join(names)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise MigrationError(f"Could not check running applications: {result.stderr.strip()}")
+    processes = sorted({line.split(maxsplit=1)[1] for line in result.stdout.splitlines()
+                        if len(line.split(maxsplit=1)) == 2})
+    flatpaks = []
+    if shutil.which("flatpak"):
+        listed = subprocess.run(["flatpak", "ps", "--columns=application"],
+                                capture_output=True, text=True, check=False)
+        if listed.returncode:
+            raise MigrationError(
+                f"Could not check running Flatpak applications: {listed.stderr.strip()}")
+        flatpaks = sorted({line.strip() for line in listed.stdout.splitlines() if line.strip()})
+    if not processes and not flatpaks:
+        return
+    agents = [name for name in processes if name in SECRET_AGENTS]
+    shown = [FULL_NAMES.get(name, name) for name in processes] + flatpaks
+    advice = []
+    if set(processes) - set(agents):
+        advice.append("close the browser or mail client")
+    if flatpaks:
+        advice.append("stop Flatpak apps with `flatpak kill APP`")
+    if agents:
+        advice.append("stop key agents with `gpgconf --kill all` and end ssh-agent or "
+                      "gnome-keyring-daemon for this user")
+    raise MigrationError(
+        "Applications that use the selected data are still running: "
+        + ", ".join(shown) + ". Please " + "; ".join(advice) + ", then retry."
+    )
+
+
 def check_selinux_tools():
     """Return whether relabeling is required; check dependencies before writes."""
     detector = shutil.which("selinuxenabled")
@@ -150,6 +197,8 @@ def backup_command(args):
     info = platform_info()
     require_platform(info, "43")
     assert_xfce_stopped()
+    assert_applications_closed(
+        secrets=bundle.selects_secrets(args.include, args.include_secrets))
     output = args.output.expanduser().absolute()
     home = Path(info["home"])
     # Fail early before collecting inventories for an unusable backup destination.
@@ -165,6 +214,7 @@ def backup_command(args):
     manifest = bundle.create_bundle(
         home, output, info, inventory, include=args.include,
         include_secrets=args.include_secrets, settings_only=args.settings_only,
+        exclude=args.exclude, default_excludes=not args.no_default_excludes,
     )
     print(f"Backup created: {output}")
     print_manifest_summary(manifest)
@@ -229,7 +279,9 @@ def restore_command(args):
         print("Preview only: no files, packages, logs, or rollback directories were changed.")
         print("Review the plan, then add --apply to perform this restore.")
         return 0
+    secrets = bundle.manifest_has_secrets(manifest)
     assert_xfce_stopped()
+    assert_applications_closed(secrets=secrets)
     selinux = check_selinux_tools()
     if args.install_packages:
         print("Installing requested packages with their normal confirmation prompts...", flush=True)
@@ -238,6 +290,7 @@ def restore_command(args):
         )
     # Package operations can take time: recheck the session immediately before copying.
     assert_xfce_stopped()
+    assert_applications_closed(secrets=secrets)
     print("Restoring selected files and retaining prior versions...", flush=True)
     result = bundle.restore_bundle(source_path, home, dry_run=False, backup_dir=rollback)
     if result["backup_dir"]:
@@ -260,6 +313,8 @@ def parser():
     backup = subcommands.add_parser("backup", help="Create a new portable bundle on Fedora 43")
     backup.add_argument("--output", type=Path, required=True, help="New directory outside HOME, ideally on external storage")
     backup.add_argument("--include", action="append", default=[], metavar="RELATIVE_PATH", help="Additional home-relative file/directory (repeatable)")
+    backup.add_argument("--exclude", action="append", default=[], metavar="PATTERN", help="Home-relative path or glob to leave out, e.g. 'Downloads/*.iso' (repeatable; * matches one path segment)")
+    backup.add_argument("--no-default-excludes", action="store_true", help="Also back up the XFCE monitor layout (displays.xml) and Flatpak app caches")
     backup.add_argument("--include-secrets", action="store_true", help="Include SSH/GPG/PKI/keyrings/online accounts; the bundle remains unencrypted")
     backup.add_argument("--settings-only", action="store_true", help="Omit default personal folders and browser/Flatpak data")
     backup.add_argument("--skip-rpm", action="store_true", help="Explicitly omit the RPM inventory")

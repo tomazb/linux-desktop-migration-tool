@@ -15,7 +15,8 @@ removes the need for an independently verified backup. Fedora 44 was released on
    compatible Fedora 44 packages from trusted publishers.
 3. Close applications, save work and log out of XFCE. Use a console TTY with
    the source user's XFCE session and `xfconfd` stopped. The tool checks this
-   condition and never kills a daemon or logs a user out.
+   condition, refuses while Firefox, Thunderbird or Flatpak apps run (and key
+   agents when secrets are selected), and never kills a process or logs a user out.
 4. Write the bundle outside the source home. Prefer a Linux filesystem on an
    encrypted external drive. The command creates a new private directory and
    reports logical payload bytes; allow extra space for filesystem overhead/recovery.
@@ -34,6 +35,11 @@ python3 fedora-migration.py verify --bundle /mnt/backup/fedora43-backup
 ```
 
 Use `--settings-only` to omit the default personal/application-data selection.
+Use `--exclude PATTERN` to leave out home-relative paths or globs; each `*` matches
+one path segment and exclusions win over includes. The monitor layout
+(`displays.xml`) and `.var/app/*/cache` are excluded by default because a new
+machine's outputs differ; `--no-default-excludes` keeps them. Every exclusion is
+reported as a warning in the summary and the restore preview.
 Supported secrets such as `.ssh`, `.gnupg`, `.pki`, keyrings and `.config/goa-1.0` require
 `--include-secrets` or an explicit `--include` of that secret root or a path below it.
 Broad parent includes do not implicitly select these known secret trees.

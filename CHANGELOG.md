@@ -34,6 +34,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Preserved this fork's previous shell fixes instead of replacing its script
   wholesale. Legacy live Fedora XFCE 43/44 migration remains unverified.
 
+### Added (backup safety)
+
+- `backup --exclude PATTERN` (home-relative paths or one-segment globs, winning
+  over includes) and default exclusion of the XFCE monitor layout and Flatpak
+  app caches; `--no-default-excludes` keeps them. Exclusions are reported.
+- Backup and `restore --apply` refuse while Firefox, Thunderbird or Flatpak apps
+  run, and while key agents run when secrets are part of the operation.
+- Backup computes each file's checksum while copying instead of reading it again.
+
 ### Hardened
 
 - Correct the RPM request query to use DNF5's `--userinstalled` selector alone;
