@@ -622,10 +622,15 @@ def _preflight(home, entries):
             raise BundleError(f"Directory/type conflict: {destination}")
 
 
-def _update_journal(rollback, journal):
+def _update_journal(rollback, journal, name="journal.json"):
     temporary = rollback / ("journal-" + uuid.uuid4().hex + ".tmp")
-    _write_json(temporary, journal)
-    os.replace(temporary, rollback / "journal.json")
+    try:
+        _write_json(temporary, journal)
+        os.replace(temporary, rollback / name)
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.lexists(temporary):
+                temporary.unlink()
     _fsync_directory(rollback)
 
 
@@ -772,6 +777,9 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
             "new": sorted(e["path"] for e in entries
                           if e["type"] != "directory" and e["path"] not in planned_replaced),
             "created_directories": sorted(created),
+            # What the restore may have changed in eligible files after their
+            # checksum check, so a rollback can tell them from user edits.
+            "rewrite_home": list(rewrite_home) if rewrite_home else None,
         }
         _private_parents(candidate)
         rollback = candidate
