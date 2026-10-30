@@ -6,6 +6,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Separate `fedora-migration.py` backup, verification and restore workflow for
+  Fedora XFCE 43 to a freshly installed Fedora XFCE 44 system.
+- Portable private backup directories with checksummed manifests, selected
+  settings/app data, opt-in secrets, RPM requests/inventory and Flatpak origins/scopes.
+- Restore preview by default, explicit apply and package-install options,
+  overwritten-file recovery copies and a restore journal.
+- Automated filesystem/manifest/package-command checks and a documented live
+  two-VM rehearsal procedure; successful real Fedora desktop migration remains
+  unverified pending that rehearsal.
+- Fedora 43 to 44 guide separating clean-install migration from DNF5 OS upgrade.
+- Commit-pinned Codeberg comparison and provenance notes for selectively adapted
+  upstream features, retaining original authorship and GPL licensing.
+- Default personal-background selection, opt-in GNOME Online Accounts configuration
+  alongside keyrings, and a logical payload-byte summary in the Python CLI.
+
+### Adapted from Codeberg upstream
+
+- Legacy Flatpak migration keeps complete refs, origins and user/system scope,
+  validates matching remote URLs, and avoids implicit remote creation, scope
+  fallback or architecture rewriting.
+- Legacy GnuPG migration copies the complete selected keyring rather than a
+  public-key-only export, privately stages persistent files and refuses a nonempty
+  target keyring. Group membership uses `id -nG` with exact checks.
+- Preserved this fork's previous shell fixes instead of replacing its script
+  wholesale. Legacy live Fedora XFCE 43/44 migration remains unverified.
+
+### Hardened
+
+- Correct the RPM request query to use DNF5's `--userinstalled` selector alone;
+  Fedora container CI caught its incompatibility with `--installed`.
+- Reject unsupported nondefault XDG config/data layouts and escaped user-directory
+  assignments; bound manifest mtime to signed 64-bit nanoseconds.
+- Write a complete restore intent plan before payload changes; retain saved
+  originals and report the rollback path on failure or Ctrl+C interruption.
+- Clarify content/tree verification versus metadata replay, configured DNF
+  exclusions, and traversal of mounted subtrees within selected paths.
+- Create copied files with mode `0600` from the start; restore keeps temporary
+  files private through checksum validation and applies the manifest mode and
+  timestamps only immediately before atomic replacement.
+- Stage recovery copies privately and publish them under `previous/` only once
+  complete and synced, so a failed or interrupted save leaves no partial original.
+  File metadata is applied before fsync, and new rollback and recovery directories
+  are synced before the original is overwritten.
+- Backup and restore run with umask `077`, so a restrictive user umask (even
+  `0777`) cannot make the tool's own new files and directories inaccessible.
+- Reject a symlinked or non-regular `.config/user-dirs.dirs` during personal-folder
+  discovery instead of silently selecting default folder names.
+- Back up and restore filenames containing a backslash on Linux; previously one
+  such file failed the whole backup after all copying. Backslash paths are still
+  rejected where the platform treats `\` as a separator, and an unsupported name
+  now fails when copying reaches it rather than at final verification.
+- Restore preview verifies the bundle once instead of twice; apply verifies once
+  for planning and again immediately before writing (previously three times).
+- Shared Flatpak validation cases for the Python and legacy Bash workflows. Bash
+  now requires a two-element application ID and validates in the C locale, so
+  non-ASCII names and refs are rejected under any locale. Both reject ASCII spaces
+  and control characters in remote URLs; non-ASCII URLs remain accepted.
+
+### Documentation
+
+- Corrected the legacy invocation to `bash migration.sh` and clearly separated
+  its GNOME/SSH scope from the Fedora XFCE workflow. Selected upstream ports are
+  documented separately and are not verified by a live Fedora XFCE 43/44 run.
+
+The following existing unreleased entries describe earlier legacy-script work:
+
 ### Fixed
 
 - Fixed corrupted line in Toolbx container migration that merged two commands together
@@ -25,3 +93,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Hardened script with `set -euo pipefail` and ERR trap
 - Added local and remote dependency checks (rsync, sshpass, xdg-user-dir, bc, etc.)
 - Restore SELinux contexts after migrations when SELinux is enabled
+

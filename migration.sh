@@ -3,7 +3,11 @@
 set -euo pipefail
 trap 'echo "❌ Error on line ${LINENO}. Aborting." >&2' ERR
 
-#Copyright 2023 Jiri Eischmann
+# Copyright 2023-2026 Jiri Eischmann
+# Selected upstream ideas adapted from Codeberg commit
+# 7cc2443b50f710ea9a978d8391862cf764826bd6 (2026-01-05): complete GnuPG
+# keyring, Flatpak origin/ref/scope and multiple remotes, early id -nG checks.
+# Fork dependency, SSH staging, rsync, Toolbx and SELinux fixes are retained.
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 # This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 #You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
@@ -147,17 +151,221 @@ run_local_sudo() {
     echo "$local_password" | sudo -S --prompt='' bash -c "$cmd"
 }
 
-require_local_bins
-
 # Function to copy files from remote to local using rsync
 rsync_from_remote() {
     local source_path="$1"
     local dest_path="$2"
     local extra_opts="${3:-}"
+    local -a extra_args=()
+    read -r -a extra_args <<< "$extra_opts"
     
-    # shellcheck disable=SC2086
-    sshpass -p "$password" rsync -chazP --chown="$USER:$USER" $extra_opts "$username@$origin_ip:$source_path" "$dest_path"
+    sshpass -p "$password" rsync -chazP --protect-args --chown="$USER:$USER" "${extra_args[@]}" "$username@$origin_ip:$source_path" "$dest_path"
 }
+
+has_admin_group() {
+    local group
+    local -a groups=()
+    read -r -a groups <<< "$1"
+    for group in "${groups[@]}"; do
+        if [[ $group == sudo || $group == wheel ]]; then return 0; fi
+    done
+    return 1
+}
+
+detect_privileges() {
+    local remote_groups local_groups
+    remote_groups=$(run_remote_command 'id -nG') || return
+    local_groups=$(id -nG) || return
+    remote_is_privileged=false
+    local_is_privileged=false
+    if has_admin_group "$remote_groups"; then remote_is_privileged=true; fi
+    if has_admin_group "$local_groups"; then local_is_privileged=true; fi
+}
+
+# Flatpak inventory rules shared with fedora_migration/packages.py. The cases in
+# tests/fixtures/flatpak_conformance.json keep both implementations aligned.
+# LC_ALL=C keeps bracket ranges to ASCII bytes regardless of the user's locale.
+flatpak_name_is_valid() {
+    local LC_ALL=C
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+flatpak_ref_is_valid() {
+    local LC_ALL=C part='[A-Za-z0-9_][A-Za-z0-9_.-]*'
+    # An application ID has at least two elements, such as org.example.App.
+    [[ $1 =~ ^(app/)?($part)/$part/$part$ && ${BASH_REMATCH[2]} == *.* ]]
+}
+
+flatpak_url_is_valid() {
+    # Bytes outside ASCII are allowed; ASCII spaces and controls are not.
+    local LC_ALL=C
+    [[ -n $1 && ! $1 =~ [[:space:][:cntrl:]] ]]
+}
+
+migrate_flatpak_applications() {
+    local scope configuration source_output target_output enabled_output app_output
+    local kind output line name url extra key ref origin i
+    local -a app_scopes=() app_refs=() app_origins=()
+    local -A source_urls=() target_urls=() enabled_urls=()
+    if ! command -v flatpak >/dev/null || ! run_remote_command 'command -v flatpak'; then
+        echo "Flatpak is required on both machines for the selected application migration." >&2
+        return 1
+    fi
+    # Named installations need a separate mapping; never pretend default scopes
+    # capture them or silently convert system applications into user applications.
+    for configuration in /etc/flatpak/installations.d/*.conf; do
+        if [[ -e $configuration || -L $configuration ]]; then
+            echo "Unsupported custom Flatpak installation: $configuration. Migrate Flatpak separately." >&2
+            return 1
+        fi
+    done
+    configuration=$(run_remote_command 'if [ -d /etc/flatpak/installations.d ]; then find /etc/flatpak/installations.d -maxdepth 1 -name "*.conf" -print; fi') || return
+    if [[ -n $configuration ]]; then
+        echo "Unsupported custom Flatpak installation on origin: $configuration. Migrate Flatpak separately." >&2
+        return 1
+    fi
+    # Capture without process substitution, which hides SSH/Flatpak failures from
+    # set -e. Non-terminal --columns output has no header; retain the first row.
+    for scope in user system; do
+        source_output=$(run_remote_command "flatpak remotes --$scope --show-disabled --columns=name,url") || return
+        target_output=$(flatpak remotes "--$scope" --show-disabled --columns=name,url) || return
+        enabled_output=$(flatpak remotes "--$scope" --columns=name,url) || return
+        for kind in source target enabled; do
+            case $kind in
+                source) output=$source_output ;;
+                target) output=$target_output ;;
+                enabled) output=$enabled_output ;;
+            esac
+            while IFS= read -r line; do
+                [[ -n $line ]] || continue
+                IFS=$'\t' read -r name url extra <<< "$line"
+                if ! flatpak_name_is_valid "$name" || ! flatpak_url_is_valid "$url" || [[ -n $extra ]]; then
+                    echo "Invalid $scope Flatpak remote inventory; expected tab-separated name and URL." >&2
+                    return 1
+                fi
+                key="$scope:$name"
+                case $kind in
+                    source)
+                        [[ ! ${source_urls[$key]+present} ]] || { echo "Duplicate source Flatpak remote: $key" >&2; return 1; }
+                        source_urls[$key]=$url ;;
+                    target)
+                        [[ ! ${target_urls[$key]+present} ]] || { echo "Duplicate destination Flatpak remote: $key" >&2; return 1; }
+                        target_urls[$key]=$url ;;
+                    enabled) enabled_urls[$key]=$url ;;
+                esac
+            done <<< "$output"
+        done
+        app_output=$(run_remote_command "flatpak list --$scope --app --columns=ref,origin") || return
+        while IFS= read -r line; do
+            [[ -n $line ]] || continue
+            IFS=$'\t' read -r ref origin extra <<< "$line"
+            if ! flatpak_ref_is_valid "$ref" || ! flatpak_name_is_valid "$origin" || [[ -n $extra ]]; then
+                echo "Invalid $scope Flatpak app inventory; expected complete ref and origin." >&2
+                return 1
+            fi
+            app_scopes+=("$scope")
+            app_refs+=("$ref")
+            app_origins+=("$origin")
+        done <<< "$app_output"
+    done
+    # An URL is not signing trust. Require reviewed, existing remotes, with the
+    # same name AND URL in each scope, before installing the first application.
+    for key in "${!source_urls[@]}"; do
+        if [[ ! ${target_urls[$key]+present} ]]; then
+            echo "Missing Flatpak remote $key (expected ${source_urls[$key]}). Configure its trusted repository manually before retrying." >&2
+            return 1
+        fi
+        if [[ ${target_urls[$key]} != "${source_urls[$key]}" ]]; then
+            echo "Conflicting URL for Flatpak remote $key. Review repository trust and configuration manually before retrying." >&2
+            return 1
+        fi
+    done
+    for ((i=0; i<${#app_refs[@]}; i++)); do
+        key="${app_scopes[$i]}:${app_origins[$i]}"
+        if [[ ! ${source_urls[$key]+present} || ! ${enabled_urls[$key]+present} ]]; then
+            echo "Missing source or disabled destination Flatpak remote $key. Review its configuration manually before retrying." >&2
+            return 1
+        fi
+    done
+    for ((i=0; i<${#app_refs[@]}; i++)); do
+        echo "Installing ${app_refs[$i]} from ${app_origins[$i]} (${app_scopes[$i]})..."
+        # argv values are validated and never interpolated into a shell command.
+        # Retain native confirmation, full architecture and original scope.
+        flatpak install "--${app_scopes[$i]}" "${app_origins[$i]}" "${app_refs[$i]}" || return
+    done
+}
+
+migrate_gnupg() {
+    local target="$HOME/.gnupg" ancestor="$HOME/.gnupg" staging existing status
+    # Refuse symlink targets and ancestors instead of following them during a
+    # sensitive keyring replacement. Existing identities/trust are never merged
+    # or overwritten implicitly by this complete-keyring migration.
+    while [[ $ancestor != / && -n $ancestor ]]; do
+        if [[ -L $ancestor ]]; then
+            echo "Cannot migrate GnuPG through symlink path: $ancestor" >&2
+            return 1
+        fi
+        ancestor=$(dirname -- "$ancestor")
+    done
+    if [[ -e $target ]]; then
+        if [[ ! -d $target ]]; then echo "GnuPG destination is not a directory: $target" >&2; return 1; fi
+        existing=$(find "$target" -mindepth 1 -maxdepth 1 -print -quit) || return
+        if [[ -n $existing ]]; then
+            echo "Existing nonempty $target will not be overwritten. Back it up and move it aside, or merge keyrings manually before retrying." >&2
+            return 1
+        fi
+    fi
+    if run_remote_command 'test -d "$HOME/.gnupg"'; then
+        :
+    else
+        status=$?
+        if [[ $status == 1 ]]; then
+            echo "No GnuPG keyring on the origin machine. Skipping."
+            return 0
+        fi
+        echo "Could not inspect the origin GnuPG keyring (remote exit $status); migration stopped." >&2
+        return "$status"
+    fi
+    staging=$(mktemp -d "$HOME/.gnupg-migration.XXXXXX") || return
+    mkdir -m 700 "$staging/keyring"
+    # Keep private keys, ownertrust, revocations and config. Agent sockets and
+    # transient locks cannot be migrated; do not stop either user's agent.
+    if ! rsync_from_remote "$user_home_origin/.gnupg/" "$staging/keyring/" '--no-specials --no-devices --exclude=S.gpg-agent* --exclude=S.dirmngr --exclude=S.keyboxd --exclude=*.lock --exclude=.#*'; then
+        rm -rf -- "$staging"
+        echo "GnuPG copy failed; destination keyring was not changed." >&2
+        return 1
+    fi
+    existing=$(find "$staging/keyring" -type l -print -quit)
+    if [[ -n $existing ]]; then
+        rm -rf -- "$staging"
+        echo "GnuPG source contains symlinks; migrate that keyring manually." >&2
+        return 1
+    fi
+    find "$staging/keyring" -type d -exec chmod 700 {} +
+    find "$staging/keyring" -type f -exec chmod 600 {} +
+    # -T refuses a directory merge; rename publishes only a completed keyring.
+    if ! mv -T -- "$staging/keyring" "$target"; then
+        rm -rf -- "$staging"
+        echo "Could not publish staged GnuPG keyring; review the destination before retrying." >&2
+        return 1
+    fi
+    rmdir -- "$staging"
+    restorecon_if_selinux "$target"
+    echo "Complete GnuPG keyring migrated. Reopen GnuPG applications to use it."
+}
+
+# Start the interactive workflow only when executed, so helpers can be tested.
+main() {
+require_local_bins
+doc_answer=n
+vid_answer=n
+pic_answer=n
+mus_answer=n
+dwn_answer=n
+network_answer=n
+toolbx_answer=n
+data_answer=n
+declare -a container_ids_and_names=()
 
 IFS= read -p "LINUX DESKTOP MIGRATION TOOL
 This is a tool that helps with migration to a new computer. It has several preconditions:
@@ -189,12 +397,15 @@ while true; do
     fi
 done
 
+# Exact group membership is available to every selected migration feature.
+detect_privileges
+
 # Asking whether to copy files in home directories
 IFS= read -p "Do you want to migrate files in home directories? ([y]/n): " -r copy_answer
 copy_answer=${copy_answer:-y}
 
 # Get the origin user home directory path
-user_home_origin=$(run_remote_command "eval echo \"~$username\"")
+user_home_origin=$(run_remote_command 'printf "%s\n" "$HOME"')
 
 if [[ "$copy_answer" =~ ^[yY] ]]; then
     # Asking about copying the XDG directories over
@@ -243,21 +454,7 @@ settings_answer=${settings_answer:-y}
 # Check whether the user on the origin machine is priviledged in order to know whether the tool can do operations that require a priviledged access on both machines. If conditions are safisfied, ask whether to migrate network settings.
 
 if run_remote_command "command -v nmcli &>/dev/null" "false" && command -v nmcli &>/dev/null; then
-    remote_user_groups=$(run_remote_command "groups" "false")
-    if [[ $remote_user_groups == *"sudo"* ]] || [[ $remote_user_groups == *"wheel"* ]]; then
-        remote_is_privileged=true
-    else
-        remote_is_privileged=false
-    fi
-
-    local_user_groups=$(groups)
-    if [[ $local_user_groups == *"sudo"* ]] || [[ $local_user_groups == *"wheel"* ]]; then
-        local_is_privileged=true
-    else
-        local_is_privileged=false
-    fi
-
-    if [[ $remote_is_privileged == true ]] || [[ $local_is_privileged == true ]]; then
+    if [[ $remote_is_privileged == true && $local_is_privileged == true ]]; then
         IFS= read -p "Do you want to migrate network settings? ([y]/n) " -r network_answer
         network_answer=${network_answer:-y}        
         # A loop to handle password verification
@@ -273,7 +470,7 @@ if run_remote_command "command -v nmcli &>/dev/null" "false" && command -v nmcli
                 # Password verification
                 if ! echo "$local_password" | sudo -S true 2>/dev/null; then
                     echo "❌ Incorrect password. Attempts left: $((MAX_PASSWORD_ATTEMPTS - attempt - 1))"
-                    ((attempt++))
+                    attempt=$((attempt + 1))
                 else
                     password_valid=true
                 fi
@@ -295,7 +492,7 @@ fi
 echo
 
 # Ask the user if they want to migrate credentials and secrets
-IFS= read -p "Do you want to migrate credentials and secrets (the keyring, ssh certificates and settings, PKI certificates)? ([y]/n) " -r secrets_answer
+IFS= read -p "Do you want to migrate credentials and secrets (the keyring, ssh certificates and settings, PKI certificates, complete GnuPG keyring)? ([y]/n) " -r secrets_answer
 secrets_answer=${secrets_answer:-y}
 
 # Ask the user if they want to reinstall Flatpak applications
@@ -313,7 +510,8 @@ if command -v toolbox &>/dev/null; then
     # Run toolbox list command and store the output
     toolbox_list_output=$(run_remote_command "toolbox list")
     # Extract container IDs and names using awk and store them in an array
-    IFS=$'\n' read -r -d '' -a container_ids_and_names <<< "$(echo "$toolbox_list_output" | awk '/^CONTAINER ID/{flag=1; next} flag && /^[a-f0-9]+/{print $1 "\t" $2}')"
+    container_list=$(printf '%s\n' "$toolbox_list_output" | awk '/^CONTAINER ID/{flag=1; next} flag && /^[a-f0-9]+/{print $1 "\t" $2}')
+    if [[ -n $container_list ]]; then mapfile -t container_ids_and_names <<< "$container_list"; fi
     # If there are any Toolbx containers on the origin machine, ask whether to migrate them
     if [ "${#container_ids_and_names[@]}" -gt 0 ]; then
         # Get the architecture of the local machine
@@ -352,24 +550,7 @@ done
 
 # Reinstall flatpaks from the origin machine and copy over their data
 if [[ "$reinstall_answer" =~ ^[yY] ]]; then
-    # Capture the list of installed flatpaks on the origin machine
-    installed_flatpaks_origin=$(run_remote_command "flatpak list --app --columns=application")
-    # Parse the list using awk to skip the header and get the flatpak names
-    flatpak_names_origin=$(echo "$installed_flatpaks_origin" | awk 'NR>1 {print}')
-    # Capture the list of installed flatpaks on the destination machine
-    installed_flatpaks_destination=$(flatpak list --app --columns=application)
-    # Loop through each installed flatpak on the origin machine and install those that are not already installed on the destination machine
-    while IFS= read -r flatpak_name <&3; do
-        if [ -n "$flatpak_name" ]; then
-            # Check if the flatpak is already installed on the destination machine
-            if echo "$installed_flatpaks_destination" | grep -q "$flatpak_name"; then
-                echo "Flatpak $flatpak_name is already installed. Skipping."
-            else
-                # Install the flatpak on the local machine
-                flatpak install -y flathub "$flatpak_name"
-            fi
-        fi
-    done 3<<< "$flatpak_names_origin"
+    migrate_flatpak_applications
     echo "Flatpak applications have been reinstalled on the new machine."
     # Copy flatpak app data in ~/.var/app/ over from the origin machine
     if [[ "$data_answer" =~ ^[yY] ]]; then
@@ -422,15 +603,7 @@ if [[ "$secrets_answer" =~ ^[yY] ]]; then
     if ! command -v gpg &> /dev/null || ! run_remote_command "command -v gpg &> /dev/null"; then
         echo "GPG (GNU Privacy Guard) is not detected on one or both machines. Skipping GPG key migration."
     else
-        # Export GPG keys on the origin machine
-        run_remote_command "gpg --armor --export > $user_home_origin/gpg_keys.asc"
-        # Copy the file with exported keys over
-        rsync_from_remote "$user_home_origin/gpg_keys.asc" "$HOME/"
-        # Import the keys from the file
-        gpg --import "$HOME"/gpg_keys.asc
-        # Delete the file with keys on both machines
-        run_remote_command "rm $user_home_origin/gpg_keys.asc"
-        rm "$HOME"/gpg_keys.asc
+        migrate_gnupg
     fi
     
     # Migrate GNOME Online Accounts
@@ -547,3 +720,9 @@ fi
 
 echo "
 The migration is finished! Log out and log in for all changes to take effect."
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
+

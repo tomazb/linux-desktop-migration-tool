@@ -1,53 +1,205 @@
-# linux-desktop-migration-tool
+# Linux Desktop Migration Tool
 
-Linux Desktop Migration Tool aims to make migration from one Linux desktop machine to another as easy as possible.
+Move selected settings and personal data from **Fedora XFCE 43 to a fresh Fedora
+XFCE 44 installation** using a portable, verified backup directory. The new
+`fedora-migration.py` workflow is separate from the original GNOME/SSH script.
+It does not install Fedora or perform an operating-system upgrade.
 
-## What It Can do
+**Validation status:** automated checks cover filesystem and command behavior.
+A live two-VM Fedora 43/44 migration rehearsal is still required; this is not a
+claim of successful migration on real Fedora desktops or your hardware.
 
-- Migrate data in XDG directories (Documents, Pictures, Downloads...) and other arbitrary directories in home.
-- Reinstall flatpaks on the new machine.
-- Migrate Flatpak app data.
-- Migrate Toolbx containers.
-- Migrate ssh certificates, PKI certificates and nss database, GPG keys, keyring, GNOME Online Accounts.
-- Migrate GNOME desktop/app settings.
-- Migrate network settings (wired, wi-fi, VPNs..., only NetworkManager supported).
+## Choose the workflow
 
-## Prerequisites
+| Goal | Workflow |
+| --- | --- |
+| Reinstall or move to a new Fedora XFCE 44 machine | Back up on 43, verify, install 44 separately, preview and restore |
+| Upgrade the existing Fedora 43 installation to 44 | Make a backup, then follow [DNF5 system upgrade](docs/FEDORA_43_TO_44.md#in-place-upgrade-is-a-separate-operation) |
+| Use the original GNOME/SSH migration script | See [Legacy workflow](#legacy-gnomessh-workflow) |
 
-- It is aimed for and tested on Fedora Silverblue, but it should work on any modern desktop distribution.
-- Both computers are expected to be on the same network.
-- The destination computer is expected to be freshly installed with the user set up.
-- Both users should have the same UID, names could be different.
-- Base tools: `rsync`, `sshpass`, `xdg-user-dirs`, `bc`.
-- Feature tools (only needed if you use the feature): `flatpak`, `toolbox` + `podman` (for Toolbx migration), `nmcli`/NetworkManager (for network migration), `gpg` (for key migration).
+## Requirements
 
-## How to Install and Run
+- Python 3; the Python workflow uses the standard library.
+- Backup: Fedora 43, run as the normal desktop user.
+- Restore: Fedora 44, run as the normal destination desktop user.
+- Log out of XFCE and close applications before backup or applying a restore. Run from a
+  console TTY with that user's XFCE session and `xfconfd` stopped. The tool does
+  not log you out or stop processes automatically.
+- A restore preview can run while XFCE is active.
+- A new output directory **outside the source home**, with sufficient space.
+  Prefer an encrypted external drive with a Linux filesystem.
+- Optional package installation: DNF5 and/or Flatpak, working repositories and
+  networking. Source and target architectures must match for package install.
+- `verify` only needs Python 3 and can run on another operating system.
+- Backup/restore require the default `~/.config` and `~/.local/share` XDG layout;
+  nondefault `XDG_CONFIG_HOME`/`XDG_DATA_HOME` values are rejected.
 
-- just download the migration.sh file, open the terminal app and run 'sh migration.sh' command.
+An active application may change files while they are read. Close browsers,
+mail clients and Flatpak apps as well as XFCE; this is not an application-aware
+backup of live databases.
 
-## Post-migration Steps
+## Quick start
 
-- Log out and log in for all changes to take effect.
-- You will be prompted to unlock the keyring with the password from the origin computer for the first time.
+Use your external disk's actual mount path in place of `/mnt/backup`.
+Do not use `sudo` to run the Python CLI.
 
-## SELinux
+### 1. Back up on Fedora XFCE 43
 
-- When SELinux is enabled, the script will call `restorecon` on copied data (XDG dirs, extra home dirs, Flatpak data, keyrings/PKI, GOA config, backgrounds, `.ssh`, and NetworkManager profiles) to ensure correct contexts.
+Save work, log out of XFCE, switch to a console TTY and log in as the source user.
+From this checkout:
 
-## FAQ
+```bash
+python3 fedora-migration.py backup --output /mnt/backup/fedora43-backup
+python3 fedora-migration.py verify --bundle /mnt/backup/fedora43-backup
+```
 
-### Why not to just copy over the entire home directory/partition?
+The output must be a new directory; choose a different name for another backup.
+The bundle is complete only after the command finishes writing the checksum
+manifest. Keep the entire directory together. Copy a completed bundle with:
 
-A new computer is always a fresh start from me, so I never copy over everything, but use it as an opportunity to leave unnecessary files behind. That is why the script gives more control over what is migrated.
+```bash
+rsync -a /mnt/backup/fedora43-backup/ /another/mount/fedora43-backup/
+python3 fedora-migration.py verify --bundle /another/mount/fedora43-backup
+```
 
-### Why is it not a desktop app?
+Verify the transferred copy before relying on it or erasing the source system.
+FAT/NTFS and some network filesystems may not preserve Unix modes or symlinks.
+Verify on the destination filesystem; verify checks content/tree/targets, while
+restore takes modes/times from the manifest. It does not certify the backup copy's
+actual file permissions. This workflow does not create a tar archive.
 
-I'd love it to be a desktop app, but I also would like it to be a nice app - polished, written in a modern toolkit... And I don't have time and skills for that. A shell script is great to quickly prototype and it's also easy to build your own solution on.
+### 2. Preview on Fedora XFCE 44
 
-### What desktop environments does it support?
+Install Fedora XFCE 44 separately, create the destination user and install required
+panel plugins, themes and applications. The same username/home path reduces
+absolute-path repairs. Log out of XFCE and use a console TTY:
 
-I primarily target GNOME since it's the desktop environment in Silverblue, but most operations are desktop environment agnostic if there is anything GNOME specific, it will be skipped if not available. I'm open to contributions that will add support for other desktop environments, but I will not work on it myself since I have very little experience with them.
+```bash
+python3 fedora-migration.py verify --bundle /mnt/backup/fedora43-backup
+python3 fedora-migration.py restore --bundle /mnt/backup/fedora43-backup
+```
 
-### Is there going to be support for snap or appimage applications?
+`restore` previews by default. It verifies the complete bundle and reports planned
+changes; it does not copy files until `--apply` is supplied.
 
-I'm open to contributions, but I will not work on it myself since I don't use those formats myself and thus have little experience with them.
+### 3. Apply and check
+
+```bash
+python3 fedora-migration.py restore \
+  --bundle /mnt/backup/fedora43-backup --apply
+```
+
+Restore overlays selected paths and keeps unrelated target files. Files it
+replaces are retained under a private rollback directory with a journal. Record
+that directory. Its journal is an intent plan written before copying: listed paths
+may have been touched; `previous/` contains only complete saved originals, which are
+assembled under `staging/` and moved into place when finished. Ctrl+C
+returns exit code 130 and reports the retained recovery directory. There is no
+automatic rollback command; see the
+[recovery instructions](docs/FEDORA_43_TO_44.md#recover-overwritten-files).
+File/type conflicts and symlink ancestors are rejected instead of followed.
+When SELinux is enabled, target `restorecon` relabels restored paths.
+
+Log in to XFCE and inspect the panel, shortcuts, display layout and key apps.
+Keep both the source backup and rollback files until the desktop is checked.
+
+## What is included
+
+Default settings cover XFCE, Thunar, GTK 3/4, autostart entries, MIME associations,
+user-directory configuration, personal themes/icons/fonts/backgrounds, launchers, Bash files
+and local executables. Default data covers configured XDG personal directories,
+Firefox (`.mozilla`), Thunderbird (`.thunderbird`) and Flatpak app data (`.var/app`).
+Only existing selected paths are copied; this is not an entire-home backup.
+XFCE saved-session caches are excluded.
+
+| Option | Effect |
+| --- | --- |
+| `backup --settings-only` | Exclude default personal/app data |
+| `backup --include Projects --include .config/my-app` | Add home-relative paths explicitly |
+| `backup --include-secrets` | Opt in to SSH/GPG/PKI/keyrings and GNOME Online Accounts configuration |
+| `backup --skip-rpm` / `--skip-flatpak` | Omit that package inventory |
+| `restore --apply --install-packages` | Opt in to package reinstallation with native confirmations |
+| `restore --skip-rpm` / `--skip-flatpak` | Skip that package installation path |
+| `restore --apply --rollback-dir /path/new-recovery-dir` | Choose a new private rollback directory |
+
+Known SSH/GPG/PKI/keyring/Online Accounts paths are excluded by default. `--include-secrets` may copy private keys
+and credentials; the bundle itself is not encrypted. App profiles may also contain
+credentials without this option. Store and transfer backups accordingly.
+Explicitly including one of those secret roots or a path beneath it also opts it
+in; broad parent includes do not silently opt in to the known secret trees.
+GnuPG includes the complete selected `.gnupg` tree, not just public keys. GNOME
+Online Accounts configuration is paired with keyring files, but may still require
+reauthorization on 44; the tool does not import keys or activate accounts.
+
+## Packages and scope
+
+RPM requests use `name.arch`, allowing Fedora 44 to select its current packages;
+old Fedora 43 versions are recorded for reference, not reinstalled. DNF5's
+`--userinstalled` also includes group/module and unknown installation reasons.
+DNF configuration excludes can affect requests and inventory.
+Review unavailable or renamed requests and configure compatible trusted repositories
+yourself. Package installation is optional and is not atomic with file restore.
+
+Flatpak records user/system scope, full ref and origin, plus remote name and URL.
+Configure matching trusted remotes on 44 before installation. The tool checks the
+remote URL and does not automatically add repositories or switch origins. Custom
+named Flatpak installations are unsupported; use `--skip-flatpak` and handle those
+manually. Flatpak app data and installation requests are separate.
+
+The Python workflow does not migrate system services, NetworkManager profiles,
+Toolbx/Podman containers, container volumes or arbitrary system configuration.
+Additional application settings outside the defaults need explicit `--include`.
+Selected directories are traversed even if they contain mounted subtrees; unrelated
+external mounts are not selected automatically. Review capacity before backup;
+the CLI reports the logical payload byte total, not extra filesystem overhead.
+
+## Preservation and trust limits
+
+Regular file modes, modification times and symlinks are preserved. Symlinks remain
+links; their external targets are not included. ACLs, extended attributes,
+ownership and source SELinux labels are not preserved. Restored files belong to
+the normal target user; target SELinux policy supplies labels.
+
+Checksums detect corruption. They do **not** authenticate a bundle whose contents
+and manifest an attacker can both replace. Only restore a bundle you trust.
+Rehearse changed home paths, external symlinks and monitor layouts before erasing 43.
+
+See [the Fedora 43 → 44 guide](docs/FEDORA_43_TO_44.md) for package commands,
+manual recovery, authoritative references and the two-VM rehearsal checklist.
+
+## Legacy GNOME/SSH workflow
+
+`migration.sh` is the original interactive SSH-based workflow aimed at Fedora
+Silverblue/GNOME. It includes separate GNOME, NetworkManager, keys and Toolbx
+operations. Selected changes from the newer Codeberg upstream preserve Flatpak
+origin/ref/scope, migrate the complete GnuPG directory and improve group checks,
+while retaining this fork's existing fixes. See the
+[commit-pinned comparison](docs/UPSTREAM_CODEBERG.md) for adaptations and deferrals.
+Flatpak retains native confirmations and requires matching configured remotes;
+it does not silently change scope or architecture. Legacy GnuPG stages persistent
+keyring files privately, skips sockets/devices/locks and refuses a nonempty target
+`.gnupg`; it does not automatically stop agents or merge existing keyrings.
+Close GnuPG clients and stop their agents manually before copying a keyring in
+either workflow. Custom `GNUPGHOME` locations need separate migration.
+The legacy workflow remains **unverified on live Fedora XFCE 43/44**. Do not assume
+the Python workflow's validation, preview or recovery behavior applies to it.
+
+For that legacy workflow, inspect the script and install its required tools
+(`rsync`, `sshpass`, `xdg-user-dir`, `bc` and feature-specific commands), then run:
+
+```bash
+bash migration.sh
+```
+
+It requires Bash; do not invoke it with `sh`.
+
+## Development checks
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n migration.sh
+```
+
+Passing automated checks does not replace the [live rehearsal](docs/FEDORA_43_TO_44.md#two-vm-rehearsal).
+GitHub Actions runs this suite in Fedora 43 and 44 containers and exercises the
+real DNF5 inventory commands and an empty Flatpak installation in each container.
