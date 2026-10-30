@@ -261,8 +261,9 @@ files with a hard link that fails rather than replaces, so a concurrent writer c
 most make one path fail with both versions kept; the error names both locations. The
 home and its ancestors are walked from `/` without following symlinks, so swapping a
 parent directory mid-run cannot redirect a write. Because of the hard-link step, a
-filesystem without hard links makes rollback refuse that path (restore it by hand
-from `previous/`).
+filesystem without hard links makes rollback stop with status `failed` at the first
+path it must put back; later paths are not processed. Restore the remaining put-back
+paths by hand from `previous/`, or retry only on a filesystem that supports hard links.
 
 ### Manual recovery (fallback)
 
