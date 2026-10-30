@@ -14,7 +14,7 @@ checked against SHA-256 values fetched over HTTPS only.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import os
@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import uuid
 
 IMAGE_INDEX_URL = ("https://download.fedoraproject.org/pub/fedora/linux/releases/"
                    "{release}/Cloud/x86_64/images/")
@@ -237,6 +238,7 @@ class Config:
     ssh_port_base: int = SSH_PORT_BASE
     ssh_timeout: int = 300
     repo_root: Path = Path(__file__).resolve().parents[1]
+    uuids: tuple = field(default_factory=lambda: (str(uuid.uuid4()), str(uuid.uuid4())))
 
     @property
     def run_dir(self):
@@ -271,8 +273,21 @@ class Config:
     def image_override(self, label):
         return self.source_image if label == "src" else self.dest_image
 
-    def base_image(self, label):
-        return self.image_override(label) or self.images_dir / f"fedora-cloud-base-{self.release(label)}.qcow2"
+    def domain_uuid(self, label):
+        """The UUID this run gives the VM; it proves ownership before anything is destroyed."""
+        return self.uuids[0 if label == "src" else 1]
+
+    def pinned_base_image(self, label):
+        """The immutable, build-specific backing image if it is known before the run, else None."""
+        override = self.image_override(label)
+        if override:
+            return override
+        if self.build(label):
+            return self.images_dir / image_name(self.release(label), self.build(label))
+        return None
+
+    def placeholder_base_image(self, label):
+        return self.images_dir / image_name(self.release(label), "<build>")
 
     def target(self, label):
         return Target(label=label, user=self.user(label), port=self.ssh_port(label), key=self.key_path)
@@ -378,6 +393,15 @@ def tool_command(*args):
 
 # --------------------------------------------------------------------------- steps and runner
 
+class RunState:
+    """What this run owns and learned: used to keep cleanup from touching anything else."""
+
+    def __init__(self):
+        self.owns_run_dir = False
+        self.unconfirmed_domains = set()
+        self.base_images = {}
+
+
 @dataclass
 class Step:
     id: str
@@ -394,6 +418,7 @@ class Step:
     wait: float = 0
     timeout: float | None = None
     record: bool = False
+    argv_from: object = None     # computes the real argv at run time (argv is the dry-run view)
 
 
 @dataclass
@@ -421,6 +446,18 @@ def display_command(step):
     return text
 
 
+def resolve_argv(step):
+    return step.argv_from() if step.argv_from else step.argv
+
+
+def _text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
+
+
 def _tail(text, lines=40, chars=4000):
     return "\n".join(text.splitlines()[-lines:])[-chars:]
 
@@ -437,7 +474,8 @@ class Runner:
         self.interval = interval
         self.results = []
         self.records = {}
-        self.created_domains = []
+        self.created_domains = []     # virt-install succeeded
+        self.attempted_domains = []   # virt-install was started; cleanup verifies the UUID first
 
     def out(self, text):
         (self._out or sys.stdout.write)(text)
@@ -456,8 +494,8 @@ class Runner:
         self.out(f"==> {step.id}: {step.description}\n    $ {command}\n")
         if self.dry_run:
             return self._finish(step, command, "dry-run", None, "", "", 0.0)
-        if step.creates_domain and step.creates_domain not in self.created_domains:
-            self.created_domains.append(step.creates_domain)
+        if step.creates_domain and step.creates_domain not in self.attempted_domains:
+            self.attempted_domains.append(step.creates_domain)
         started = self.clock()
         try:
             if step.argv is None:
@@ -465,9 +503,12 @@ class Runner:
                 result = self._finish(step, command, "passed", None, detail, "", self.clock() - started)
             else:
                 result = self._execute_argv(step, command, started)
-        except (RehearsalError, OSError, subprocess.SubprocessError) as error:
+        except Exception as error:
             result = self._finish(step, command, "failed", None, f"{type(error).__name__}: {error}", "",
                                   self.clock() - started)
+        if (step.creates_domain and result.status == "passed"
+                and step.creates_domain not in self.created_domains):
+            self.created_domains.append(step.creates_domain)
         self.out(f"    -> {result.status}" + (f": {result.detail}" if result.detail else "") + "\n")
         return result
 
@@ -475,7 +516,7 @@ class Runner:
         stdin = open(step.stdin_file, "rb") if step.stdin_file else None
         stdout = open(step.stdout_file, "wb") if step.stdout_file else None
         try:
-            return self.run(step.argv, stdin=stdin or subprocess.DEVNULL, stdout=stdout if stdout else subprocess.PIPE,
+            return self.run(resolve_argv(step), stdin=stdin or subprocess.DEVNULL, stdout=stdout if stdout else subprocess.PIPE,
                             stderr=subprocess.PIPE, text=stdout is None, errors=None if stdout else "replace",
                             timeout=step.timeout, check=False)
         finally:
@@ -491,9 +532,7 @@ class Runner:
                 break
             self.sleep(self.interval)
         code = completed.returncode
-        output = (completed.stdout or "") + (completed.stderr or "")
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", "replace")
+        output = _text(completed.stdout) + _text(completed.stderr)
         problems = []
         if step.expect == "zero" and code != 0:
             problems.append(f"expected exit 0, got {code}")
@@ -588,13 +627,19 @@ def _curl_text(url):
     return completed.stdout
 
 
-def fetch_image(config, label):
-    """Make the base image for LABEL available and verified; returns a short description."""
+def fetch_image(config, label, state=None):
+    """Make the base image for LABEL available and verified; returns a short description.
+
+    The image keeps its build-specific name and is never repointed, so a VM's backing
+    file cannot change under it when another run selects a different build.
+    """
+    state = state or RunState()
     override = config.image_override(label)
     release = config.release(label)
     if override:
         if not override.is_file():
             raise RehearsalError(f"Image not found: {override}")
+        state.base_images[label] = override
         return f"using local image {override} (no checksum available)"
     config.images_dir.mkdir(parents=True, exist_ok=True)
     build = config.build(label) or discover_build(_curl_text(index_url(release)), release)
@@ -622,14 +667,20 @@ def fetch_image(config, label):
         os.replace(partial, target)
         note = "downloaded"
     (config.images_dir / (checksum_name(release, build))).write_text(checksum_text)
-    link = config.base_image(label)
-    link.unlink(missing_ok=True)
-    link.symlink_to(name)
+    state.base_images[label] = target
     return f"{name} {note}, SHA-256 verified"
 
 
-def prepare_workdir(config):
-    config.run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+def prepare_workdir(config, state=None):
+    """Create this run's private directory; refuse to adopt an existing one."""
+    state = state or RunState()
+    config.run_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        config.run_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        raise RehearsalError(f"The run directory {config.run_dir} already exists; nothing in it will be "
+                             "used or deleted. Choose a new --run-id.") from None
+    state.owns_run_dir = True
     config.run_dir.chmod(0o700)
     return str(config.run_dir)
 
@@ -658,7 +709,15 @@ def make_repo_tarball(repo, output):
     return str(output)
 
 
-def remove_run_files(config):
+def remove_run_files(config, state=None):
+    """Delete scratch files of the run directory this run created, unless a VM may still use them."""
+    state = state or RunState()
+    if not state.owns_run_dir:
+        return "kept everything: this run did not create its run directory"
+    if state.unconfirmed_domains:
+        return ("kept overlays, seed images and the SSH key in " + str(config.run_dir)
+                + " because removal of " + ", ".join(sorted(state.unconfirmed_domains))
+                + " could not be confirmed")
     removed = []
     names = ["id_ed25519", "id_ed25519.pub", "repo.tar", "bundle.tar"]
     for label in ("src", "dst"):
@@ -674,6 +733,54 @@ def remove_run_files(config):
         except OSError:
             pass
     return "removed " + (", ".join(removed) if removed else "nothing")
+
+
+NOT_FOUND_MARKERS = ("failed to get domain", "domain not found")
+NOT_RUNNING_MARKERS = ("not running", "is not active")
+
+
+def _virsh(config, *args):
+    return subprocess.run(["virsh", "-c", config.connect, *args], capture_output=True, text=True, check=False,
+                          env={**os.environ, "LC_ALL": "C"}, timeout=120)
+
+
+def _domain_uuid(config, name):
+    """The UUID of a defined domain; None when libvirt says there is no such domain."""
+    completed = _virsh(config, "domuuid", name)
+    if completed.returncode == 0:
+        return completed.stdout.strip()
+    error = _text(completed.stderr).strip()
+    if any(marker in error.lower() for marker in NOT_FOUND_MARKERS):
+        return None
+    raise RehearsalError(f"Could not query libvirt domain {name}: {error or 'exit ' + str(completed.returncode)}")
+
+
+def remove_domain(config, state, name):
+    """Destroy and undefine NAME, but only if its UUID is the one this run gave it."""
+    scoped_domain(config, name)
+    label = "src" if name == config.domain_name("src") else "dst"
+    ours = config.domain_uuid(label)
+    try:
+        actual = _domain_uuid(config, name)
+        if actual is None:
+            return f"{name} is not defined; nothing to remove"
+        if actual.lower() != ours.lower():
+            raise RehearsalError(f"{name} exists with UUID {actual}, not this run's {ours}; left alone")
+        for verb, args, tolerated in (("destroy", ("destroy", name), NOT_RUNNING_MARKERS + NOT_FOUND_MARKERS),
+                                      ("undefine", ("undefine", "--nvram", name), NOT_FOUND_MARKERS)):
+            completed = _virsh(config, *args)
+            error = _text(completed.stderr).strip()
+            if completed.returncode != 0 and not any(m in error.lower() for m in tolerated):
+                raise RehearsalError(f"virsh {verb} {name} failed: {error or 'exit ' + str(completed.returncode)}")
+        if _domain_uuid(config, name) is not None:
+            raise RehearsalError(f"{name} is still defined after destroy and undefine")
+        return f"removed {name}"
+    except RehearsalError:
+        state.unconfirmed_domains.add(name)
+        raise
+    except (OSError, subprocess.SubprocessError) as error:
+        state.unconfirmed_domains.add(name)
+        raise RehearsalError(f"Could not remove {name}: {error}") from error
 
 
 # --------------------------------------------------------------------------- fixtures and checks
@@ -745,16 +852,31 @@ PREVIEW_UNCHANGED_SCRIPT = f"""cd "$HOME"
 echo "preview changed nothing"
 """
 
-RESTORED_FILES_SCRIPT = f"""cd "$HOME"; fail=0
+RESTORED_FILES_TEMPLATE = """cd "$HOME"; fail=0; checked=0
+exp=@EXPECTED@; want=@COUNT@
+if [ ! -r "$exp" ] || [ ! -s "$exp" ]; then echo "expectation file $exp is missing, unreadable or empty"; exit 1; fi
 while read -r sha mode mtime path; do
-  [ -f "$path" ] || {{ echo "MISSING $path"; fail=1; continue; }}
-  [ "$(sha256sum "$path" | cut -d' ' -f1)" = "$sha" ] || {{ echo "CONTENT differs: $path"; fail=1; }}
-  [ "$(stat -c %a "$path")" = "$mode" ] || {{ echo "MODE differs: $path"; fail=1; }}
-  [ "$(stat -c %Y "$path")" = "$mtime" ] || {{ echo "MTIME differs: $path"; fail=1; }}
-done < {EXPECTED_FILE}
-[ "$fail" = 0 ] && echo "all sampled files match"
-exit "$fail"
+  checked=$((checked + 1))
+  [ -n "$path" ] || { echo "malformed expectation line"; fail=1; continue; }
+  [ -f "$path" ] || { echo "MISSING $path"; fail=1; continue; }
+  [ "$(sha256sum "$path" | cut -d' ' -f1)" = "$sha" ] || { echo "CONTENT differs: $path"; fail=1; }
+  [ "$(stat -c %a "$path")" = "$mode" ] || { echo "MODE differs: $path"; fail=1; }
+  [ "$(stat -c %Y "$path")" = "$mtime" ] || { echo "MTIME differs: $path"; fail=1; }
+done < "$exp"
+if [ "$checked" -le 0 ] || [ "$checked" != "$want" ]; then
+  echo "checked $checked entries, expected $want"; fail=1
+fi
+[ "$fail" = 0 ] || exit 1
+echo "all $checked sampled files match"
 """
+
+
+def restored_files_script(expected_file=EXPECTED_FILE, count=len(SAMPLE_FILES)):
+    """Compare restored files with the source's recorded sha256, mode and mtime; fails without expectations."""
+    return RESTORED_FILES_TEMPLATE.replace("@EXPECTED@", shlex.quote(str(expected_file))).replace("@COUNT@", str(int(count)))
+
+
+RESTORED_FILES_SCRIPT = restored_files_script()
 
 SYMLINKS_SCRIPT = """cd "$HOME"
 [ -L Documents/fmr-link-internal ] && [ "$(readlink Documents/fmr-link-internal)" = fmr-note.txt ] \\
@@ -799,8 +921,9 @@ echo "files created by the restore are gone"
 
 # --------------------------------------------------------------------------- plan
 
-def build_plan(config):
+def build_plan(config, state=None):
     """The full ordered list of steps; building it runs nothing."""
+    state = state or RunState()
     steps = []
     add = steps.append
     src, dst = config.target("src"), config.target("dst")
@@ -816,16 +939,20 @@ def build_plan(config):
     def action(step_id, description, function, **kwargs):
         add(Step(id=step_id, description=description, action=function, **kwargs))
 
-    action("prepare-workdir", f"Create the private run directory {config.run_dir}", lambda: prepare_workdir(config))
+    action("prepare-workdir", f"Create the private run directory {config.run_dir}", lambda: prepare_workdir(config, state))
     add(Step(id="record-tool-commit", description="Record the tool commit under test",
              argv=["git", "-C", str(config.repo_root), "rev-parse", "HEAD"], kind="check", record=True))
     add(Step(id="record-tool-dirty", description="Record uncommitted changes in the checkout",
              argv=["git", "-C", str(config.repo_root), "status", "--porcelain"], kind="check", record=True))
+    for label in ("src", "dst"):
+        add(Step(id=f"check-domain-absent-{label}", vm=label, expect="nonzero",
+                 description=f"Refuse to continue if a libvirt domain named {config.domain_name(label)} exists",
+                 argv=["virsh", "-c", config.connect, "domuuid", config.domain_name(label)]))
     if config.source_image is None or config.dest_image is None:
         action("download-images",
                f"Download and SHA-256-verify the Fedora Cloud images for {config.source_release} and "
                f"{config.dest_release} (no GPG check of the CHECKSUM files)",
-               lambda: "; ".join(fetch_image(config, label) for label in ("src", "dst")
+               lambda: "; ".join(fetch_image(config, label, state) for label in ("src", "dst")
                                  if config.image_override(label) is None))
     add(Step(id="generate-ssh-key", description="Generate an ephemeral SSH key for this run",
              argv=["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"fmr-rehearsal-{config.run_id}",
@@ -839,12 +966,22 @@ def build_plan(config):
         add(Step(id=f"create-seed-{label}", description=f"Build the cloud-init seed image ({label})",
                  argv=seed_command(seed_tool, directory / "seed.iso", directory / "user-data",
                                    directory / "meta-data")))
-        add(Step(id=f"create-overlay-{label}", description=f"Create a qcow2 overlay on the Fedora "
-                 f"{config.release(label)} image ({label})",
-                 argv=["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(config.base_image(label)),
-                       str(directory / "disk.qcow2"), f"{config.disk_gib}G"]))
+        def overlay_argv(base, label=label, directory=directory):
+            return ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base),
+                    str(directory / "disk.qcow2"), f"{config.disk_gib}G"]
+
+        def late_overlay_argv(label=label, overlay_argv=overlay_argv):
+            if label not in state.base_images:
+                raise RehearsalError(f"The verified base image for {label} is not known yet.")
+            return overlay_argv(state.base_images[label])
+
+        pinned = config.pinned_base_image(label)
+        add(Step(id=f"create-overlay-{label}", description=f"Create a qcow2 overlay on the build-specific "
+                 f"Fedora {config.release(label)} image ({label})",
+                 argv=overlay_argv(pinned or config.placeholder_base_image(label)),
+                 argv_from=None if pinned else late_overlay_argv))
         add(Step(id=f"create-vm-{label}", description=f"Create and boot VM {domain}",
-                 argv=["virt-install", "--connect", config.connect, "--name", domain, "--import",
+                 argv=["virt-install", "--connect", config.connect, "--name", domain, "--uuid", str(config.domain_uuid(label)), "--import",
                        "--virt-type", "kvm", "--vcpus", str(config.vcpus), "--memory", str(config.memory_mib),
                        "--osinfo", config.osinfo,
                        "--disk", f"path={directory / 'disk.qcow2'},format=qcow2,bus=virtio",
@@ -955,19 +1092,24 @@ def scoped_domain(config, name):
     return name
 
 
-def cleanup_steps(config, created):
-    """Destroy and undefine only the domains this run created, then delete its scratch files."""
+def cleanup_steps(config, attempted, state=None):
+    """Remove only the domains this run started creating (verified by UUID), then its scratch files."""
     if config.keep:
         return []
+    state = state or RunState()
     steps = []
-    for name in dict.fromkeys(created):
+    for name in dict.fromkeys(attempted):
         scoped_domain(config, name)
-        steps.append(Step(id=f"destroy-{name}", description=f"Stop VM {name}", kind="cleanup", expect="any",
-                          argv=["virsh", "-c", config.connect, "destroy", name]))
-        steps.append(Step(id=f"undefine-{name}", description=f"Remove VM definition {name}", kind="cleanup",
-                          expect="any", argv=["virsh", "-c", config.connect, "undefine", "--nvram", name]))
-    steps.append(Step(id="remove-run-files", description="Delete overlays, seed images, the SSH key and archives",
-                      kind="cleanup", action=lambda: remove_run_files(config)))
+        label = "src" if name == config.domain_name("src") else "dst"
+        steps.append(Step(
+            id=f"remove-domain-{name}", kind="cleanup", vm=label,
+            description=f"Remove VM {name} (virsh destroy, undefine) only if its UUID is "
+                        f"{config.domain_uuid(label)}",
+            action=lambda name=name: remove_domain(config, state, name)))
+    steps.append(Step(id="remove-run-files", kind="cleanup",
+                      description="Delete overlays, seed images, the SSH key and archives (kept if a VM "
+                                  "could not be confirmed removed)",
+                      action=lambda: remove_run_files(config, state)))
     return steps
 
 
@@ -1060,6 +1202,37 @@ def dry_run(config, runner):
     return 0
 
 
+def write_reports(config, runner, state):
+    """Write report.json and report.md into the run directory this run created; returns the paths."""
+    base_images = {}
+    for label in ("src", "dst"):
+        image = config.pinned_base_image(label) or state.base_images.get(label)
+        base_images[label] = str(image) if image else None
+    meta = {
+        "run_id": config.run_id,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "tool_commit": runner.records.get("record-tool-commit", "unknown"),
+        "tool_dirty": "yes" if runner.records.get("record-tool-dirty") else "no",
+        "source_release": config.source_release,
+        "dest_release": config.dest_release,
+        "connect": config.connect,
+        "checksum_gpg_verified": False,
+        "base_images": base_images,
+        "records": runner.records,
+    }
+    json_text = render_report_json(meta, runner.results)
+    markdown_text = render_report_markdown(meta, runner.results)
+    if not state.owns_run_dir:
+        print("\nThe run directory was not created by this run, so no report file is written. Report:\n")
+        print(markdown_text)
+        return None, json.loads(json_text)["passed"]
+    json_path, markdown_path = config.run_dir / "report.json", config.run_dir / "report.md"
+    json_path.write_text(json_text)
+    markdown_path.write_text(markdown_text)
+    print(f"Report: {markdown_path}\n        {json_path}")
+    return markdown_path, json.loads(json_text)["passed"]
+
+
 def execute(config, runner):
     problems = preflight_static(config)
     if not problems:
@@ -1070,39 +1243,36 @@ def execute(config, runner):
             print("  - " + problem, file=sys.stderr)
         return 2
     print(CHECKSUM_GPG_NOTE)
+    state = RunState()
     interrupted = False
+    passed = False
     try:
-        run_plan(build_plan(config), runner)
-    except KeyboardInterrupt:
-        interrupted = True
-        print("Interrupted; cleaning up.", file=sys.stderr)
+        try:
+            run_plan(build_plan(config, state), runner)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("Interrupted; cleaning up.", file=sys.stderr)
+        except Exception as error:
+            runner.results.append(StepResult(
+                id="unexpected-error", description="Unexpected error while running the plan", kind="setup",
+                vm=None, command="", status="failed", returncode=None,
+                detail=f"{type(error).__name__}: {error}", output_tail="", duration=0.0))
+            print(f"Unexpected error: {type(error).__name__}: {error}", file=sys.stderr)
+        finally:
+            for step in cleanup_steps(config, runner.attempted_domains, state):
+                runner.execute(step)
     finally:
-        for step in cleanup_steps(config, runner.created_domains):
-            runner.execute(step)
-    meta = {
-        "run_id": config.run_id,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "tool_commit": runner.records.get("record-tool-commit", "unknown"),
-        "tool_dirty": "yes" if runner.records.get("record-tool-dirty") else "no",
-        "source_release": config.source_release,
-        "dest_release": config.dest_release,
-        "connect": config.connect,
-        "checksum_gpg_verified": False,
-        "records": runner.records,
-    }
-    config.run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    json_path, markdown_path = config.run_dir / "report.json", config.run_dir / "report.md"
-    json_text = render_report_json(meta, runner.results)
-    json_path.write_text(json_text)
-    markdown_path.write_text(render_report_markdown(meta, runner.results))
-    counts = _summary(runner.results)
-    print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped.")
-    print(f"Report: {markdown_path}\n        {json_path}")
+        _, passed = write_reports(config, runner, state)
+        counts = _summary(runner.results)
+        print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped.")
+        if state.unconfirmed_domains:
+            print("Could not confirm removal of: " + ", ".join(sorted(state.unconfirmed_domains))
+                  + ". Overlays, seed images and the SSH key were kept; inspect with virsh and remove by hand.")
     if config.keep:
         print_kept(config)
     if interrupted:
         return 130
-    return 0 if json.loads(json_text)["passed"] else 1
+    return 0 if passed else 1
 
 
 def main(argv=None):

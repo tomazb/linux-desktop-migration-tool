@@ -15,7 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and apply with `--rewrite-home`, the package-triage preview and rollback, with
   checks and a JSON and Markdown report. It is a dry run unless `--execute` is
   given, refuses to start without `/dev/kvm`, the required tools or libvirt, and
-  cleans up only its own `fmr-src-ID` / `fmr-dst-ID` domains.
+  cleans up only its own `fmr-src-ID` / `fmr-dst-ID` domains, verified by a generated
+  UUID, and refuses to reuse an existing run directory or domain name.
 - Unit tests (`tests/test_rehearsal.py`) cover the planning, checksum parsing,
   cloud-init rendering, quoting, cleanup scoping and report rendering with every
   external command faked. The script has so far been exercised only in dry-run

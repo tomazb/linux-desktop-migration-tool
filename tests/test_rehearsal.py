@@ -56,6 +56,52 @@ def all_argvs(steps):
     return [step.argv for step in steps if step.argv]
 
 
+class FakeLibvirt:
+    """A tiny stand-in for virsh/virt-install state: domain name -> UUID."""
+
+    NOT_FOUND = "error: failed to get domain '{}'\n"
+
+    def __init__(self, domains=None, foreign_on_create=False, destroy_error=None, destroy_not_running=False):
+        self.domains = dict(domains or {})
+        self.foreign_on_create = foreign_on_create
+        self.destroy_error = destroy_error
+        self.destroy_not_running = destroy_not_running
+        self.installs = []
+
+    def handle(self, argv, install_fails=False):
+        """A CompletedProcess for libvirt commands, or None for anything else."""
+        if argv[0] == "virt-install":
+            name, uuid = argv[argv.index("--name") + 1], argv[argv.index("--uuid") + 1]
+            self.installs.append(name)
+            if self.foreign_on_create:
+                self.domains[name] = "99999999-9999-9999-9999-999999999999"
+                return completed(argv, 1, "", "ERROR: domain already exists")
+            self.domains[name] = uuid
+            return completed(argv, 1 if install_fails else 0, "", "boom" if install_fails else "")
+        if argv[0] != "virsh" or len(argv) < 5:
+            return None
+        verb, name = argv[3], argv[-1]
+        if verb == "domuuid":
+            if name in self.domains:
+                return completed(argv, 0, self.domains[name] + "\n")
+            return completed(argv, 1, "", self.NOT_FOUND.format(name))
+        if verb == "destroy":
+            if name not in self.domains:
+                return completed(argv, 1, "", self.NOT_FOUND.format(name))
+            if self.destroy_error and name in self.destroy_error:
+                return completed(argv, 1, "", "error: internal error: qemu is stuck")
+            if self.destroy_not_running:
+                return completed(argv, 1, "", "error: Requested operation is not valid: domain is not running")
+            return completed(argv, 0)
+        if verb == "undefine":
+            if name not in self.domains:
+                return completed(argv, 1, "", self.NOT_FOUND.format(name))
+            del self.domains[name]
+            return completed(argv, 0)
+        return None
+
+
+
 class DryRunDefaultTests(unittest.TestCase):
     def test_default_is_dry_run(self):
         config = rehearsal.parse_args([])
@@ -429,20 +475,104 @@ class DomainScopingTests(unittest.TestCase):
         self.assertEqual(config.domain_name("src"), "fmr-src-abc123")
         self.assertEqual(config.domain_name("dst"), "fmr-dst-abc123")
 
+    def run_cleanup(self, config, libvirt, created, state=None):
+        state = state or rehearsal.RunState()
+        runner = rehearsal.Runner(dry_run=False, out=lambda text: None)
+        with patch.object(subprocess, "run", side_effect=lambda argv, **kw: libvirt.handle(argv)):
+            results = [runner.execute(step) for step in rehearsal.cleanup_steps(config, created, state)]
+        return results, state
+
+    def spy(self, libvirt):
+        calls = []
+        original = libvirt.handle
+        libvirt.handle = lambda argv, **kw: (calls.append(list(argv)), original(argv))[1]
+        return calls
+
     def test_cleanup_targets_only_created_domains(self):
         config = make_config("/tmp/x")
-        steps = rehearsal.cleanup_steps(config, ["fmr-src-abc123"])
-        argvs = all_argvs(steps)
-        self.assertTrue(argvs)
-        for argv in argvs:
-            self.assertEqual(argv[:3], ["virsh", "-c", "qemu:///session"])
-            names = [item for item in argv if item.startswith("fmr-")]
-            self.assertEqual(names, ["fmr-src-abc123"])
-        flat = " ".join(" ".join(a) for a in argvs)
+        libvirt = FakeLibvirt({"fmr-src-abc123": str(config.domain_uuid("src")),
+                               "fmr-dst-abc123": str(config.domain_uuid("dst"))})
+        calls = self.spy(libvirt)
+        results, _ = self.run_cleanup(config, libvirt, ["fmr-src-abc123"])
+        self.assertTrue(all(r.status == "passed" for r in results), results)
+        self.assertEqual(set(libvirt.domains), {"fmr-dst-abc123"})
+        flat = " ".join(" ".join(c) for c in calls)
         self.assertIn("destroy", flat)
         self.assertIn("undefine", flat)
         self.assertNotIn("fmr-dst-abc123", flat)
         self.assertNotIn("--all", flat)
+        for argv in calls:
+            self.assertEqual(argv[:3], ["virsh", "-c", "qemu:///session"])
+
+    def test_cleanup_leaves_domain_with_foreign_uuid_alone(self):
+        config = make_config("/tmp/x")
+        libvirt = FakeLibvirt({"fmr-src-abc123": "11111111-1111-1111-1111-111111111111"})
+        calls = self.spy(libvirt)
+        results, state = self.run_cleanup(config, libvirt, ["fmr-src-abc123"])
+        self.assertIn("fmr-src-abc123", libvirt.domains)
+        self.assertFalse([c for c in calls if c[3] in ("destroy", "undefine")])
+        self.assertIn("failed", [r.status for r in results])
+        self.assertIn("fmr-src-abc123", state.unconfirmed_domains)
+
+    def test_cleanup_of_partially_created_own_domain_succeeds(self):
+        config = make_config("/tmp/x")
+        libvirt = FakeLibvirt({"fmr-dst-abc123": str(config.domain_uuid("dst"))})
+        results, state = self.run_cleanup(config, libvirt, ["fmr-dst-abc123"])
+        self.assertEqual(libvirt.domains, {})
+        self.assertFalse(state.unconfirmed_domains)
+        self.assertTrue(all(r.status == "passed" for r in results))
+
+    def test_cleanup_of_absent_domain_is_fine_and_runs_no_destroy(self):
+        config = make_config("/tmp/x")
+        libvirt = FakeLibvirt()
+        calls = self.spy(libvirt)
+        results, state = self.run_cleanup(config, libvirt, ["fmr-src-abc123"])
+        self.assertTrue(all(r.status == "passed" for r in results))
+        self.assertFalse([c for c in calls if c[3] in ("destroy", "undefine")])
+        self.assertFalse(state.unconfirmed_domains)
+
+    def test_cleanup_tolerates_domain_not_running(self):
+        config = make_config("/tmp/x")
+        libvirt = FakeLibvirt({"fmr-src-abc123": str(config.domain_uuid("src"))}, destroy_not_running=True)
+        results, state = self.run_cleanup(config, libvirt, ["fmr-src-abc123"])
+        self.assertEqual(libvirt.domains, {})
+        self.assertTrue(all(r.status == "passed" for r in results), results)
+
+    def test_cleanup_failure_is_a_failed_step_and_keeps_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp) / "w")
+            state = rehearsal.RunState()
+            rehearsal.prepare_workdir(config, state)
+            (config.run_dir / "id_ed25519").write_text("key")
+            (config.run_dir / "report.json").write_text("{}")
+            libvirt = FakeLibvirt({"fmr-src-abc123": str(config.domain_uuid("src"))},
+                                  destroy_error={"fmr-src-abc123"})
+            results, state = self.run_cleanup(config, libvirt, ["fmr-src-abc123"], state)
+            self.assertIn("failed", [r.status for r in results])
+            self.assertIn("fmr-src-abc123", libvirt.domains)
+            self.assertTrue((config.run_dir / "id_ed25519").exists(), "key must be kept")
+            files_step = next(r for r in results if r.id == "remove-run-files")
+            self.assertIn("kept", files_step.detail)
+
+    def test_cleanup_removes_artifacts_when_domains_confirmed_gone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp) / "w")
+            state = rehearsal.RunState()
+            rehearsal.prepare_workdir(config, state)
+            (config.run_dir / "id_ed25519").write_text("key")
+            (config.run_dir / "report.json").write_text("{}")
+            libvirt = FakeLibvirt({"fmr-src-abc123": str(config.domain_uuid("src"))})
+            self.run_cleanup(config, libvirt, ["fmr-src-abc123"], state)
+            self.assertFalse((config.run_dir / "id_ed25519").exists())
+            self.assertTrue((config.run_dir / "report.json").exists())
+
+    def test_cleanup_does_not_delete_files_of_a_run_dir_it_did_not_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp) / "w")
+            config.run_dir.mkdir(parents=True)
+            (config.run_dir / "id_ed25519").write_text("someone else's")
+            self.run_cleanup(config, FakeLibvirt(), [], rehearsal.RunState())
+            self.assertTrue((config.run_dir / "id_ed25519").exists())
 
     def test_cleanup_refuses_foreign_domains(self):
         config = make_config("/tmp/x")
@@ -533,13 +663,47 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(bad.status, "failed")
         self.assertIn("kaput", bad.detail)
 
-    def test_created_domain_recorded_even_when_step_fails(self):
-        runner = rehearsal.Runner(dry_run=False, run=lambda argv, **kw: completed(argv, 1),
-                                  out=lambda text: None)
+    def test_domain_ownership_recorded_only_after_success(self):
         step = rehearsal.Step(id="v", description="d", argv=["virt-install"], kind="setup",
                               creates_domain="fmr-src-abc123")
-        runner.execute(step)
-        self.assertEqual(runner.created_domains, ["fmr-src-abc123"])
+        failing = rehearsal.Runner(dry_run=False, run=lambda argv, **kw: completed(argv, 1), out=lambda t: None)
+        failing.execute(step)
+        self.assertEqual(failing.created_domains, [])
+        self.assertEqual(failing.attempted_domains, ["fmr-src-abc123"])
+        working = rehearsal.Runner(dry_run=False, run=lambda argv, **kw: completed(argv, 0), out=lambda t: None)
+        working.execute(step)
+        self.assertEqual(working.created_domains, ["fmr-src-abc123"])
+        self.assertEqual(working.attempted_domains, ["fmr-src-abc123"])
+
+    def test_binary_transfer_stderr_is_decoded_not_crashing(self):
+        def fake_run(argv, **kw):
+            kw["stdout"].write(b"tar-bytes")
+            return subprocess.CompletedProcess(argv, 1, None, b"tar: \xff\xfe cannot stat\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = rehearsal.Runner(dry_run=False, run=fake_run, out=lambda text: None)
+            result = runner.execute(rehearsal.Step(id="pull", description="pull", argv=["ssh"],
+                                                   stdout_file=Path(tmp) / "b.tar", kind="tool"))
+        self.assertEqual(result.status, "failed")
+        self.assertIn("cannot stat", result.output_tail)
+        self.assertEqual(result.returncode, 1)
+
+    def test_str_stdout_and_bytes_stderr_mix(self):
+        runner = rehearsal.Runner(
+            dry_run=False, out=lambda text: None,
+            run=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "out\n", b"err\n"))
+        result = runner.execute(rehearsal.Step(id="m", description="m", argv=["x"]))
+        self.assertIn("out", result.output_tail)
+        self.assertIn("err", result.output_tail)
+
+    def test_unexpected_exception_in_a_step_becomes_a_failed_result(self):
+        def boom():
+            raise TypeError("unexpected")
+
+        runner = rehearsal.Runner(dry_run=False, out=lambda text: None)
+        result = runner.execute(rehearsal.Step(id="b", description="b", action=boom))
+        self.assertEqual(result.status, "failed")
+        self.assertIn("unexpected", result.detail)
 
     def test_run_plan_aborts_after_fatal_failure_but_continues_after_check_failure(self):
         def fake_run(argv, **kw):
@@ -579,12 +743,16 @@ class RunnerTests(unittest.TestCase):
 class ExecuteFlowTests(unittest.TestCase):
     """Drive main(--execute) with every external command faked."""
 
-    def run_main(self, tmp, fail_on=None, extra=()):
+    def run_main(self, tmp, fail_on=None, extra=(), libvirt=None, prepare=None, patches=()):
         calls = []
+        libvirt = libvirt or FakeLibvirt()
+        self.libvirt = libvirt
         src = Path(tmp) / "src.qcow2"
         dst = Path(tmp) / "dst.qcow2"
         src.write_bytes(b"s")
         dst.write_bytes(b"d")
+        if prepare:
+            prepare()
 
         def fake_run(argv, **kwargs):
             calls.append(list(argv))
@@ -592,16 +760,23 @@ class ExecuteFlowTests(unittest.TestCase):
                 key = Path(argv[argv.index("-f") + 1])
                 key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n")
                 Path(str(key) + ".pub").write_text(PUBLIC_KEY + "\n")
-            if fail_on and fail_on(argv):
+            failing = bool(fail_on and fail_on(argv))
+            handled = libvirt.handle(argv, install_fails=failing)
+            if handled is not None:
+                return handled
+            if failing:
                 return completed(argv, 1, "", "boom")
             return completed(argv, 0, "ok\n", "")
 
         out = io.StringIO()
-        with patch.object(rehearsal, "which", return_value="/usr/bin/x"), \
-                patch.object(rehearsal, "kvm_present", return_value=True), \
-                patch.object(subprocess, "run", side_effect=fake_run), \
-                patch.object(rehearsal.time, "sleep", lambda s: None), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.ExitStack() as stack:
+            for item in (patch.object(rehearsal, "which", return_value="/usr/bin/x"),
+                         patch.object(rehearsal, "kvm_present", return_value=True),
+                         patch.object(subprocess, "run", side_effect=fake_run),
+                         patch.object(rehearsal.time, "sleep", lambda s: None),
+                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()),
+                         *patches):
+                stack.enter_context(item)
             code = rehearsal.main(["--execute", "--workdir", str(Path(tmp) / "w"), "--run-id", "abc123",
                                    "--source-image", str(src), "--dest-image", str(dst), *extra])
         return code, calls, out.getvalue()
@@ -655,6 +830,224 @@ class ExecuteFlowTests(unittest.TestCase):
             self.assertEqual(names, {"fmr-src-abc123", "fmr-dst-abc123"})
             self.assertIn(str(run_dir / "report.md"), out)
             self.assertIn("GPG", out)  # the unverified-CHECKSUM-signature caveat is stated
+
+
+    def run_dir(self, tmp):
+        return Path(tmp) / "w" / "runs" / "abc123"
+
+    def destructive(self, calls):
+        return [c for c in calls if c[0] == "virsh" and c[3] in ("destroy", "undefine")]
+
+    def test_refuses_when_domain_name_already_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            libvirt = FakeLibvirt({"fmr-src-abc123": "11111111-1111-1111-1111-111111111111"})
+            code, calls, _ = self.run_main(tmp, libvirt=libvirt)
+        self.assertEqual(code, 1)
+        self.assertEqual(libvirt.installs, [])
+        self.assertEqual(self.destructive(calls), [])
+        self.assertEqual(libvirt.domains, {"fmr-src-abc123": "11111111-1111-1111-1111-111111111111"})
+
+    def test_domain_that_appears_during_create_is_never_destroyed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            libvirt = FakeLibvirt(foreign_on_create=True)
+            code, calls, _ = self.run_main(tmp, libvirt=libvirt)
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+        self.assertEqual(code, 1)
+        self.assertEqual(self.destructive(calls), [])
+        self.assertIn("fmr-src-abc123", libvirt.domains)
+        self.assertFalse(data["passed"])
+
+    def test_uuid_passed_to_virt_install_matches_cleanup_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, calls, _ = self.run_main(tmp)
+        installs = [c for c in calls if c[0] == "virt-install"]
+        uuids = {c[c.index("--name") + 1]: c[c.index("--uuid") + 1] for c in installs}
+        self.assertEqual(set(uuids), {"fmr-src-abc123", "fmr-dst-abc123"})
+        self.assertEqual(self.libvirt.domains, {})  # both were ours and are gone
+
+    def test_run_dir_reuse_is_refused_and_nothing_is_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = self.run_dir(tmp)
+
+            def prepare():
+                existing.mkdir(parents=True)
+                (existing / "id_ed25519").write_text("precious")
+                (existing / "report.json").write_text("old report")
+
+            code, calls, out = self.run_main(tmp, prepare=prepare)
+            self.assertEqual(code, 1)
+            self.assertEqual((existing / "id_ed25519").read_text(), "precious")
+            self.assertEqual((existing / "report.json").read_text(), "old report")
+            self.assertFalse((existing / "report.md").exists())
+            self.assertEqual(self.destructive(calls), [])
+            self.assertEqual([c for c in calls if c[0] == "virt-install"], [])
+        self.assertIn("--run-id", out)
+
+    def test_failed_domain_removal_fails_report_and_keeps_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            libvirt = FakeLibvirt(destroy_error={"fmr-src-abc123"})
+            code, calls, out = self.run_main(tmp, libvirt=libvirt)
+            run_dir = self.run_dir(tmp)
+            data = json.loads((run_dir / "report.json").read_text())
+            self.assertEqual(code, 1)
+            self.assertFalse(data["passed"])
+            failed = {s["id"] for s in data["steps"] if s["status"] == "failed"}
+            self.assertTrue(any(i.startswith("remove-domain-") for i in failed), failed)
+            self.assertTrue((run_dir / "id_ed25519").exists())
+        self.assertIn("kept", out)
+
+    def test_report_written_when_run_plan_raises(self):
+        def boom(steps, runner):
+            runner.execute(steps[0])
+            raise ValueError("kaboom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, calls, _ = self.run_main(tmp, patches=(patch.object(rehearsal, "run_plan", boom),))
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+        self.assertEqual(code, 1)
+        self.assertFalse(data["passed"])
+        self.assertIn("kaboom", json.dumps(data["steps"]))
+
+    def test_report_records_base_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp)
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+            self.assertEqual(data["meta"]["base_images"]["src"], str(Path(tmp) / "src.qcow2"))
+
+
+class DomainOwnershipPlanTests(unittest.TestCase):
+    def test_uuid_is_passed_to_virt_install(self):
+        config = make_config("/tmp/x")
+        for label in ("src", "dst"):
+            step = next(s for s in rehearsal.build_plan(config) if s.id == f"create-vm-{label}")
+            self.assertEqual(step.argv[step.argv.index("--uuid") + 1], str(config.domain_uuid(label)))
+        self.assertNotEqual(config.domain_uuid("src"), config.domain_uuid("dst"))
+
+    def test_name_precheck_precedes_creation_and_expects_absence(self):
+        plan = rehearsal.build_plan(make_config("/tmp/x"))
+        ids = [s.id for s in plan]
+        for label in ("src", "dst"):
+            check = plan[ids.index(f"check-domain-absent-{label}")]
+            self.assertLess(ids.index(check.id), ids.index(f"create-vm-{label}"))
+            self.assertEqual(check.expect, "nonzero")
+            self.assertEqual(check.kind, "setup")
+            self.assertEqual(check.argv[-2:], ["domuuid", f"fmr-{label}-abc123"])
+
+
+class RunDirTests(unittest.TestCase):
+    def test_prepare_workdir_creates_exclusively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp) / "w")
+            state = rehearsal.RunState()
+            rehearsal.prepare_workdir(config, state)
+            self.assertTrue(state.owns_run_dir)
+            self.assertEqual(config.run_dir.stat().st_mode & 0o777, 0o700)
+            again = rehearsal.RunState()
+            with self.assertRaisesRegex(rehearsal.RehearsalError, "--run-id"):
+                rehearsal.prepare_workdir(config, again)
+            self.assertFalse(again.owns_run_dir)
+
+
+class ImmutableBackingImageTests(unittest.TestCase):
+    NAME = "Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
+
+    def fake_curl(self, content):
+        digest = hashlib.sha256(content).hexdigest()
+
+        def fake(argv, **kw):
+            self.assertEqual(argv[0], "curl")
+            if "-o" in argv:
+                Path(argv[argv.index("-o") + 1]).write_bytes(content)
+                return completed(argv, 0)
+            if argv[-1].endswith("/images/"):
+                return completed(argv, 0, f'<a href="{self.NAME}">x</a>')
+            return completed(argv, 0, f"SHA256 ({self.NAME}) = {digest}\n")
+        return fake
+
+    def test_fetch_records_build_specific_file_and_creates_no_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp) / "w")
+            state = rehearsal.RunState()
+            with patch.object(subprocess, "run", side_effect=self.fake_curl(b"qcow")):
+                rehearsal.fetch_image(config, "src", state)
+            expected = config.images_dir / self.NAME
+            self.assertEqual(state.base_images["src"], expected)
+            self.assertTrue(expected.is_file())
+            self.assertEqual([p.name for p in config.images_dir.iterdir() if p.is_symlink()], [])
+            self.assertFalse((config.images_dir / "fedora-cloud-base-43.qcow2").exists())
+            overlay = next(s for s in rehearsal.build_plan(config, state) if s.id == "create-overlay-src")
+            argv = rehearsal.resolve_argv(overlay)
+            self.assertEqual(argv[argv.index("-b") + 1], str(expected))
+
+    def test_dry_run_overlay_never_names_a_mutable_alias(self):
+        config = make_config("/tmp/fmr-x")
+        overlay = next(s for s in rehearsal.build_plan(config) if s.id == "create-overlay-src")
+        text = rehearsal.display_command(overlay)
+        self.assertNotIn("fedora-cloud-base-43", text)
+        self.assertIn("Fedora-Cloud-Base-Generic-43-", text)
+
+    def test_known_build_gives_static_absolute_path(self):
+        config = make_config("/tmp/fmr-x", "--source-build", "1.6")
+        overlay = next(s for s in rehearsal.build_plan(config) if s.id == "create-overlay-src")
+        self.assertIn(str(config.images_dir / self.NAME), overlay.argv)
+
+
+class RestoredFilesScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        self.files = ["a.txt", "b.txt"]
+        for name in self.files:
+            path = self.home / name
+            path.write_text("content " + name)
+            path.chmod(0o640)
+        self.expected = Path(self.tmp.name) / "expected.txt"
+
+    def entries(self, names):
+        lines = []
+        for name in names:
+            path = self.home / name
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            lines.append(f"{sha} 640 {int(path.stat().st_mtime)} {name}\n")
+        return "".join(lines)
+
+    def run_script(self, count=2):
+        script = rehearsal.restored_files_script(str(self.expected), count)
+        return subprocess.run(["bash", "-c", script], env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+                              capture_output=True, text=True)
+
+    def test_correct_expectations_pass(self):
+        self.expected.write_text(self.entries(self.files))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 2 sampled files match", result.stdout)
+
+    def test_missing_expectation_file_fails(self):
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("match", result.stdout)
+
+    def test_empty_expectation_file_fails(self):
+        self.expected.write_text("")
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("match", result.stdout)
+
+    def test_partial_expectation_file_fails(self):
+        self.expected.write_text(self.entries(self.files[:1]))
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected 2", result.stdout)
+
+    def test_content_difference_fails(self):
+        self.expected.write_text(self.entries(self.files))
+        (self.home / "a.txt").write_text("tampered")
+        self.assertNotEqual(self.run_script().returncode, 0)
+
+    def test_plan_uses_sample_size(self):
+        self.assertIn(f"want={len(rehearsal.SAMPLE_FILES)}", rehearsal.RESTORED_FILES_SCRIPT)
 
 
 class ReportTests(unittest.TestCase):

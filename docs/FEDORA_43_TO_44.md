@@ -439,9 +439,15 @@ written to `WORKDIR/runs/ID/report.json` and `report.md`. Exit status is 0 only 
 every step passed.
 
 Unless `--keep` is given, the VMs, overlays, seed images and key are removed at the
-end and also after a failure. Cleanup only touches the two domains this run created,
-named `fmr-src-ID` and `fmr-dst-ID`; other libvirt domains are never listed or
-changed. The downloaded images stay cached in the work directory.
+end and also after a failure. The script refuses to start if a domain with either name
+already exists, gives each VM a generated UUID, and destroys or undefines a domain
+only after checking that it carries that UUID; other libvirt domains are never listed
+or changed. If removal of a VM cannot be confirmed, the cleanup step fails (so does the
+report) and the overlays, seed images and SSH key are kept. The run directory
+`WORKDIR/runs/ID` is created exclusively: reusing a `--run-id` is refused and nothing in
+the existing directory is touched. Overlays back onto the build-specific image file
+(for example `Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2`), which the report records.
+The downloaded images stay cached in the work directory.
 
 Limits: the Fedora CHECKSUM files are not GPG-verified (out of scope), so the
 SHA-256 check relies on HTTPS to the Fedora mirror network. Images given with
