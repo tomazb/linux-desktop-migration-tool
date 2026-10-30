@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, bundle, packages
+from . import __version__, bundle, packages, report
 
 
 class MigrationError(RuntimeError):
@@ -193,6 +193,64 @@ def print_manifest_summary(manifest):
     print_warnings(manifest["packages"].get("warnings", []))
 
 
+MAX_LISTED = 25
+
+
+def print_limited(lines):
+    for line in lines[:MAX_LISTED]:
+        print(line)
+    if len(lines) > MAX_LISTED:
+        print(f"    ... and {len(lines) - MAX_LISTED} more")
+
+
+def print_destination_checks(source_path, manifest, home, plan, *, rewrite, apply):
+    """Report, read-only, what a restore will replace and what may need repair.
+
+    These findings are informational and never block the restore.
+    """
+    print("Destination checks (informational; they do not block the restore):")
+    print(f"  Will replace {plan['replace_count']} existing files or symlinks "
+          "(originals are kept in the rollback directory) and create "
+          f"{plan['new_count']} new ones.")
+    source_home = manifest["source"]["home"]
+    if source_home == str(home):
+        if rewrite:
+            print("  --rewrite-home has no effect: the source and destination homes are the same.")
+    else:
+        references = report.find_home_references(source_path, manifest, source_home)
+        if not references:
+            print(f"  No references to the old home path {source_home} were found in the "
+                  "settings files that --rewrite-home can change.")
+        else:
+            total = sum(count for _, count in references)
+            print(f"  The old home path {source_home} appears {total} times in "
+                  f"{len(references)} bundle files:")
+            print_limited([f"    {path}: {count}" for path, count in references])
+            if not rewrite:
+                print(f"  Not rewritten. Add --rewrite-home (with --apply) to replace it with "
+                      f"{home} in exactly these files; no other file is changed.")
+            elif apply:
+                print(f"  --rewrite-home: these references will be rewritten to {home} after "
+                      "each file's checksum is validated.")
+            else:
+                print(f"  --rewrite-home: these references would be rewritten to {home} "
+                      "when you add --apply.")
+    panel = report.check_panel_plugins(source_path, manifest, home)
+    autostart = report.check_autostart(source_path, manifest, home, source_home)
+    if panel["missing"]:
+        print("  Panel plugins used by the bundled panel but not installed here: "
+              + ", ".join(panel["missing"]))
+        print("    Install the packages that provide them before first login, for example "
+              "find them with: dnf provides '*/xfce4/panel/plugins/NAME.desktop'")
+    if autostart["missing"]:
+        print("  Autostart programs not found on this system:")
+        print_limited([f"    {path}: {program}" for path, program in autostart["missing"]])
+    print_warnings(panel["warnings"] + autostart["warnings"])
+    if not (panel["missing"] or panel["warnings"] or autostart["missing"]
+            or autostart["warnings"]):
+        print("  Panel plugins and autostart programs: no problems found.")
+
+
 def backup_command(args):
     info = platform_info()
     require_platform(info, "43")
@@ -263,6 +321,9 @@ def restore_command(args):
         print(f"  {relative}")
     if source["home"] != str(home):
         print(f"Note: source home was {source['home']!r}. Review absolute paths in launchers and XFCE settings.")
+    print_destination_checks(source_path, manifest, home, plan,
+                             rewrite=args.rewrite_home, apply=args.apply)
+    rewrite_home = (source["home"], str(home)) if args.rewrite_home else None
     commands = []
     if args.install_packages:
         commands = packages.package_commands(
@@ -296,12 +357,16 @@ def restore_command(args):
 
     print("Restoring selected files and retaining prior versions...", flush=True)
     result = bundle.restore_bundle(source_path, home, dry_run=False, backup_dir=rollback,
-                                   before_write=recheck_before_writing)
+                                   before_write=recheck_before_writing,
+                                   rewrite_home=rewrite_home)
     if result["backup_dir"]:
         print(f"Rollback directory: {result['backup_dir']}", flush=True)
     if selinux:
         relabel_paths(home, result["selected_paths"])
     print(f"Restored {result['files']} files and {result['symlinks']} symlinks.")
+    if rewrite_home and result["rewritten_count"]:
+        count = result["rewritten_count"]
+        print(f"Rewrote the old home path in {count} file{'s' if count != 1 else ''}.")
     print_warnings(result.get("warnings", []))
     print("Log into XFCE and check your panel, shortcuts, themes, applications, and files.")
     print("Keep the source backup and rollback directory until you have checked the result.")
@@ -333,6 +398,7 @@ def parser():
     restore.add_argument("--install-packages", action="store_true", help="Also reinstall recorded RPMs and Flatpaks, retaining manager confirmations")
     restore.add_argument("--skip-rpm", action="store_true", help="Omit RPMs when installing packages")
     restore.add_argument("--skip-flatpak", action="store_true", help="Omit Flatpaks when installing packages")
+    restore.add_argument("--rewrite-home", action="store_true", help="With --apply, replace the old home path with this home in the settings files listed by the preview (never browser or Flatpak data); the preview shows what would change")
     restore.add_argument("--rollback-dir", type=Path, help="New directory for overwritten files and restore journal")
     restore.set_defaults(handler=restore_command)
     return result

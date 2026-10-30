@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from fedora_migration import bundle as bundle_module
 from fedora_migration.bundle import (
-    BundleError, create_bundle, restore_bundle, verify_bundle,
+    BundleError, create_bundle, plan_restore, restore_bundle, verify_bundle,
 )
 
 
@@ -793,6 +793,174 @@ class RestoreWriteHookTests(BundleFixture):
         self.write(self.home / ".bashrc")
         self.backup()
         restore_bundle(self.bundle, self.target, before_write=self.fail)
+
+
+class RestorePlanCountTests(BundleFixture):
+    def mixed_bundle(self):
+        self.write(self.home / ".bashrc", b"new bashrc")
+        self.write(self.home / ".bash_profile", b"new profile")
+        self.write(self.home / ".config/xfce4/a.xml", b"a")
+        self.write(self.home / ".config/xfce4/b.xml", b"b")
+        (self.home / ".config/xfce4/link").symlink_to("/somewhere")
+        self.backup(settings_only=True)
+        # Existing file, existing symlink (even dangling) and existing file in a
+        # directory; directories themselves never count as replaced.
+        self.write(self.target / ".bashrc", b"old")
+        (self.target / ".bash_profile").symlink_to("/dangling/target")
+        self.write(self.target / ".config/xfce4/a.xml", b"old a")
+        return verify_bundle(self.bundle)
+
+    def test_plan_counts_replaced_and_new_non_directory_entries(self):
+        manifest = self.mixed_bundle()
+        summary = plan_restore(self.bundle, self.target, manifest)
+        self.assertEqual(summary["replace_count"], 3)
+        self.assertEqual(summary["new_count"], 2)
+        self.assertEqual(summary["replace_count"] + summary["new_count"],
+                         summary["files"] + summary["symlinks"])
+
+    def test_plan_counts_do_not_write_anything(self):
+        manifest = self.mixed_bundle()
+        before = sorted(str(p) for p in self.target.rglob("*"))
+        plan_restore(self.bundle, self.target, manifest)
+        self.assertEqual(sorted(str(p) for p in self.target.rglob("*")), before)
+
+    def test_preview_and_apply_summaries_carry_the_counts(self):
+        self.mixed_bundle()
+        preview = restore_bundle(self.bundle, self.target)
+        self.assertEqual((preview["replace_count"], preview["new_count"]), (3, 2))
+        applied = restore_bundle(self.bundle, self.target, dry_run=False)
+        self.assertEqual((applied["replace_count"], applied["new_count"]), (3, 2))
+        saved = [p for p in (Path(applied["backup_dir"]) / "previous").rglob("*")
+                 if not p.is_dir() or p.is_symlink()]
+        self.assertEqual(len(saved), 3)
+
+
+OLD_HOME = "/home/alice"
+NEW_HOME = "/home/bob"
+
+
+class RewriteHomeRestoreTests(BundleFixture):
+    DESKTOP = b"[Desktop Entry]\nExec=/home/alice/bin/tool\nIcon=/home/alice2/i.png\n"
+    XML = (b'<property value="file:///home/alice/Pictures/a.png"/>\n'
+           b'<property value="/home/alice2/keep"/> /home/alice')
+    XML_REWRITTEN = (b'<property value="file:///home/bob/Pictures/a.png"/>\n'
+                     b'<property value="/home/alice2/keep"/> /home/bob')
+    XML_PATH = ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+
+    def populate(self):
+        self.write(self.home / self.XML_PATH, self.XML, 0o600)
+        self.write(self.home / ".local/share/applications/tool.desktop", self.DESKTOP, 0o755)
+        self.write(self.home / ".config/gtk-3.0/bookmarks", b"file:///home/alice/Documents Docs\n")
+        # Ineligible even though they contain the old home path.
+        self.write(self.home / ".bashrc", b"export P=/home/alice/bin\n")
+        self.write(self.home / ".mozilla/firefox/p/prefs.js", b'user_pref("a", "/home/alice/x");\n')
+        self.write(self.home / ".var/app/org.example/config/x.desktop", self.DESKTOP)
+        self.write(self.home / ".config/xfce4/notes.txt", b"/home/alice/notes")
+        self.backup()
+
+    def restore(self, **kwargs):
+        return restore_bundle(self.bundle, self.target, dry_run=False,
+                              rewrite_home=(OLD_HOME, NEW_HOME), **kwargs)
+
+    def test_only_eligible_files_are_rewritten_byte_exactly(self):
+        self.populate()
+        summary = self.restore()
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), self.XML_REWRITTEN)
+        self.assertEqual(
+            (self.target / ".local/share/applications/tool.desktop").read_bytes(),
+            b"[Desktop Entry]\nExec=/home/bob/bin/tool\nIcon=/home/alice2/i.png\n")
+        self.assertEqual((self.target / ".config/gtk-3.0/bookmarks").read_bytes(),
+                         b"file:///home/bob/Documents Docs\n")
+        for relative in (".bashrc", ".mozilla/firefox/p/prefs.js",
+                         ".var/app/org.example/config/x.desktop",
+                         ".config/xfce4/notes.txt"):
+            with self.subTest(relative=relative):
+                self.assertEqual((self.target / relative).read_bytes(),
+                                 (self.home / relative).read_bytes())
+        self.assertEqual(summary["rewritten_count"], 3)
+
+    def test_mode_and_mtime_come_from_the_manifest(self):
+        self.populate()
+        os.utime(self.home / self.XML_PATH, ns=(1700000000000000000, 1700000000123456789))
+        self.backup_again()
+        self.restore()
+        restored = self.target / self.XML_PATH
+        self.assertEqual(restored.read_bytes(), self.XML_REWRITTEN)
+        self.assertEqual(stat.S_IMODE(restored.stat().st_mode), 0o600)
+        self.assertEqual(restored.stat().st_mtime_ns, 1700000000123456789)
+        desktop = self.target / ".local/share/applications/tool.desktop"
+        self.assertEqual(stat.S_IMODE(desktop.stat().st_mode), 0o755)
+
+    def backup_again(self):
+        shutil.rmtree(self.bundle)
+        self.backup()
+
+    def test_rollback_keeps_the_previous_destination_original(self):
+        self.populate()
+        self.write(self.target / self.XML_PATH, b"destination original", 0o640)
+        summary = self.restore()
+        saved = Path(summary["backup_dir"]) / "previous" / self.XML_PATH
+        self.assertEqual(saved.read_bytes(), b"destination original")
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), self.XML_REWRITTEN)
+
+    def test_corrupted_payload_is_rejected_and_destination_unchanged(self):
+        self.populate()
+        self.write(self.target / self.XML_PATH, b"destination original")
+        payload = self.bundle / "payload" / self.XML_PATH
+        payload.write_bytes(payload.read_bytes().replace(b"Pictures", b"Pict_res"))
+        with self.assertRaisesRegex(BundleError, "Checksum/size mismatch"):
+            self.restore()
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), b"destination original")
+
+    def test_checksum_is_validated_before_any_rewrite(self):
+        self.write(self.home / self.XML_PATH, self.XML)
+        self.backup()
+        self.write(self.target / self.XML_PATH, b"destination original")
+        real = bundle_module._copy_regular
+
+        def copy_then_corrupt(source, destination, *args, **kwargs):
+            digest = real(source, destination, *args, **kwargs)
+            # The payload changed after verification but before the copy was
+            # validated: the temporary no longer matches the manifest checksum.
+            with open(destination, "r+b") as stream:
+                stream.write(b"X")
+            return digest
+
+        with patch.object(bundle_module, "_copy_regular", side_effect=copy_then_corrupt), \
+             patch.object(bundle_module, "replace_home_references") as rewrite:
+            with self.assertRaisesRegex(BundleError, "Payload changed during restore"):
+                self.restore()
+        rewrite.assert_not_called()
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), b"destination original")
+        self.assertEqual(list(self.target.rglob(".fedora-migration-*")), [])
+
+    def test_without_the_option_nothing_is_rewritten(self):
+        self.populate()
+        summary = restore_bundle(self.bundle, self.target, dry_run=False)
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), self.XML)
+        self.assertEqual(summary["rewritten_count"], 0)
+
+    def test_preview_with_the_option_writes_nothing(self):
+        self.populate()
+        summary = restore_bundle(self.bundle, self.target,
+                                 rewrite_home=(OLD_HOME, NEW_HOME))
+        self.assertEqual(list(self.target.iterdir()), [])
+        self.assertEqual(summary["rewritten_count"], 0)
+
+    def test_oversized_eligible_file_is_left_alone(self):
+        big = b"/home/alice/x\n" + b"#" * (1024 * 1024)
+        self.write(self.home / ".config/gtk-3.0/bookmarks", big)
+        self.backup()
+        summary = self.restore()
+        self.assertEqual((self.target / ".config/gtk-3.0/bookmarks").read_bytes(), big)
+        self.assertEqual(summary["rewritten_count"], 0)
+
+    def test_relative_paths_are_rejected_before_anything_changes(self):
+        self.populate()
+        with self.assertRaises(BundleError):
+            restore_bundle(self.bundle, self.target, dry_run=False,
+                           rewrite_home=("home/alice", NEW_HOME))
+        self.assertEqual(list(self.target.iterdir()), [])
 
 
 if __name__ == "__main__":

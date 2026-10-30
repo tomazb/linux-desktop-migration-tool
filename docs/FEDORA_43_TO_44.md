@@ -87,6 +87,35 @@ files under `previous/` with a journal. The journal is a complete intent plan
 Directory/type conflicts and symlink
 ancestors are rejected. Use a new rollback directory for each apply.
 
+Preview and apply print "Destination checks" before anything changes: how many
+existing files or symlinks the restore replaces and how many new ones it creates,
+which bundle files still contain the old home path (when the home paths differ),
+and the panel plugin and autostart findings described under
+[XFCE settings and application checks](#xfce-settings-and-application-checks).
+They are informational and never block the restore.
+
+When the destination home differs from the source's, add `--rewrite-home` to
+`--apply` to replace the old home path with the new one:
+
+```bash
+python3 fedora-migration.py restore --bundle /mnt/backup/fedora43-backup \
+  --apply --rewrite-home
+```
+
+The preview with the same flag lists what would be rewritten and still writes
+nothing. A reference is the old home path followed by `/`, the end of the file or a
+character other than letters, digits, `.`, `_` and `-`; `/home/alice` is therefore
+not matched inside `/home/alice2`, while `file:///home/alice/x` is. Only files of
+at most 1 MiB are considered: `*.xml` under `.config/xfce4/`, `*.desktop`
+launchers, `.gtkrc-2.0`, `.config/gtk-3.0/bookmarks`, `.config/gtk-4.0/bookmarks`,
+`.config/user-dirs.dirs`, `.config/mimeapps.list` and text files in
+`.config/Thunar/`. Anything under `.mozilla`, `.thunderbird` or `.var`, and every
+other path, is neither scanned nor modified. Each file is rewritten only after its
+SHA-256 has been validated against the manifest; the new content is written to a
+private temporary file, synced, given the manifest mode and mtime and then moved
+into place. Replaced originals remain in the rollback directory. Without the flag
+no file content changes.
+
 Regular-file modes and mtime and symlinks are preserved. Ownership, ACLs, xattrs
 and source security labels are not. Symlinks remain links: their external targets
 are not backed up. Review links to old disks or paths after migration.
@@ -128,6 +157,25 @@ references in launchers and app settings. Verify browser profiles/bookmarks,
 Thunderbird accounts/local mail and important Flatpak apps before deleting 43.
 Closed applications are required; the tool does not provide consistent snapshots
 of live application databases.
+
+The restore preview automates part of this check without changing anything:
+
+- **Panel plugins.** Plugin types in the bundled `xfce4-panel.xml` (the `value` of
+  each `plugin-N` property under `plugins`) are looked up as `TYPE.desktop` in
+  `/usr/share/xfce4/panel/plugins`, `/usr/local/share/xfce4/panel/plugins` and
+  `~/.local/share/xfce4/panel/plugins` of the destination user. Missing types are
+  listed; install the packages that provide them before the first login, for
+  example by searching with `dnf provides '*/xfce4/panel/plugins/TYPE.desktop'`.
+  A panel file that is too large or is not plain XML without entity declarations
+  is reported as a warning rather than parsed.
+- **Autostart programs.** For each `.config/autostart/*.desktop` entry that is not
+  `Hidden=true`, the program is `TryExec` if present, otherwise the first word of
+  `Exec` after any leading `env` and `NAME=value` words. It must be an existing
+  executable (an absolute path, or one the bundle itself restores) or be found on
+  `PATH`. Missing programs are listed per entry, and an `Exec` that cannot be split
+  is reported as unparseable. The entries are only read, never run.
+- **Old home paths.** See `--rewrite-home` under
+  [Restore into Fedora XFCE 44](#restore-into-fedora-xfce-44).
 
 ## RPM and Flatpak installation
 
