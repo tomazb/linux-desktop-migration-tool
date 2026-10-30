@@ -282,5 +282,103 @@ class AutostartTests(BundleFixture):
         self.assertFalse(marker.exists())
 
 
+class ReviewFindingTests(BundleFixture):
+    PANEL = ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+
+    def setUp(self):
+        super().setUp()
+        self.system_plugins = self.root / "system-plugins"
+        self.system_plugins.mkdir()
+        for patcher in (patch.object(report, "PANEL_PLUGIN_DIRS", (str(self.system_plugins),)),
+                        patch.dict(os.environ, {"PATH": str(self.root / "bin")})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        (self.root / "bin").mkdir()
+
+    def panel(self, body):
+        self.write(self.home / self.PANEL, body)
+        self.backup()
+        return report.check_panel_plugins(self.bundle, verify_bundle(self.bundle), self.target)
+
+    def autostart(self, exec_line, **kwargs):
+        self.write(self.home / ".config/autostart/a.desktop",
+                   f"[Desktop Entry]\nExec={exec_line}\n".encode())
+        self.backup()
+        manifest = verify_bundle(self.bundle)
+        return report.check_autostart(self.bundle, manifest, self.target, **kwargs)
+
+    def test_unknown_xml_encoding_is_a_warning(self):
+        result = self.panel(b'<?xml version="1.0" encoding="unknown-encoding"?><channel/>')
+        self.assertEqual(result["missing"], [])
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("Could not check panel plugins", result["warnings"][0])
+
+    def test_nested_plugins_properties_are_checked_linearly(self):
+        depth = 6000
+        body = (b'<channel name="xfce4-panel">' + b'<property name="plugins" type="empty">' * depth
+                + b'<property name="plugin-1" type="string" value="ghost"/>'
+                + b"</property>" * depth + b"</channel>")
+        import time
+        started = time.monotonic()
+        result = self.panel(body)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(result["missing"], ["ghost"])
+
+    def test_long_plugin_names_are_truncated(self):
+        name = "a" * 5000
+        result = self.panel(f'<channel><property name="plugins" type="empty">'
+                            f'<property name="plugin-1" type="string" value="{name}"/>'
+                            f'</property></channel>'.encode())
+        rendered = " ".join(result["missing"] + result["warnings"])
+        self.assertLess(len(rendered), 400)
+        self.assertIn("...", rendered)
+
+    def test_non_executable_bundled_program_is_missing(self):
+        self.write(self.home / ".local/bin/tool", b"#!/bin/sh\n", 0o600)
+        result = self.autostart(f"{self.target}/.local/bin/tool")
+        self.assertEqual(result["missing"], [(".config/autostart/a.desktop",
+                                              f"{self.target}/.local/bin/tool")])
+
+    def test_old_home_program_counts_only_when_rewritten(self):
+        self.write(self.home / ".local/bin/tool", b"#!/bin/sh\n", 0o755)
+        program = "/home/alice/.local/bin/tool"
+        missing = [(".config/autostart/a.desktop", program)]
+        self.assertEqual(self.autostart(program, source_home="/home/alice")["missing"], missing)
+        self.bundle_cleanup()
+        self.assertEqual(self.autostart(program, source_home="/home/alice",
+                                        rewrite=True)["missing"], [])
+
+    def bundle_cleanup(self):
+        import shutil
+        shutil.rmtree(self.bundle)
+
+    def test_env_wrappers_and_options_are_skipped(self):
+        present = self.root / "bin/present"
+        present.write_text("#!/bin/sh\n")
+        present.chmod(0o755)
+        cases = {
+            "/usr/bin/env FOO=1 ghost-program": [(".config/autostart/a.desktop", "ghost-program")],
+            "env -u SESSION_MANAGER present": [],
+            "env -i --unset=X -C /tmp FOO=1 present --flag": [],
+        }
+        for exec_line, expected in cases.items():
+            with self.subTest(exec_line=exec_line):
+                if self.bundle.exists():
+                    self.bundle_cleanup()
+                self.assertEqual(self.autostart(exec_line)["missing"], expected)
+
+    def test_desktop_files_outside_settings_locations_are_not_rewrite_candidates(self):
+        for relative, expected in (
+                (".local/share/applications/a.desktop", True),
+                (".config/autostart/a.desktop", True),
+                (".config/xfce4/panel/launcher-3/16.desktop", True),
+                ("Desktop/launcher.desktop", True),
+                ("Desktop/sub/launcher.desktop", False),
+                ("Projects/app/data/app.desktop", False),
+                ("Documents/notes.desktop", False)):
+            with self.subTest(relative=relative):
+                self.assertEqual(report.is_rewrite_candidate(relative), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

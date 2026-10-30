@@ -34,6 +34,18 @@ PANEL_PLUGIN_DIRS = (
 USER_PLUGIN_DIR = ".local/share/xfce4/panel/plugins"
 
 AUTOSTART_DIR = ".config/autostart"
+# Launchers are settings only in these places; elsewhere a .desktop file can be
+# user data, such as a file in a software project.
+DESKTOP_FILE_ROOTS = (".config", ".local/share/applications")
+DESKTOP_LAUNCHER_DIR = "Desktop"
+# Longest value shown in a finding; longer ones are truncated.
+MAX_SHOWN = 120
+
+
+def clip(value, limit=MAX_SHOWN):
+    """Shorten a value from bundle data before it is shown."""
+    value = str(value)
+    return value if len(value) <= limit else value[:limit] + "..."
 
 
 def _within(relative, root):
@@ -45,8 +57,11 @@ def is_rewrite_candidate(relative):
     if any(_within(relative, root) for root in NEVER_SCANNED):
         return False
     path = PurePosixPath(relative)
-    if relative in SCANNED_FILES or path.suffix == ".desktop":
+    if relative in SCANNED_FILES:
         return True
+    if path.suffix == ".desktop":
+        return (any(_within(relative, root) for root in DESKTOP_FILE_ROOTS)
+                or path.parent.as_posix() == DESKTOP_LAUNCHER_DIR)
     if path.suffix == ".xml" and relative.startswith(".config/xfce4/"):
         return True
     return path.parent.as_posix() == ".config/Thunar"
@@ -156,21 +171,24 @@ def check_panel_plugins(bundle, manifest, home):
         return result
     try:
         root = ElementTree.fromstring(data)
-    except ElementTree.ParseError as exc:
+    except (ElementTree.ParseError, LookupError, ValueError) as exc:
         result["warnings"].append(
             f"Could not check panel plugins: {PANEL_XML} is not valid XML ({exc}).")
         return result
     directories = [*PANEL_PLUGIN_DIRS, str(Path(home) / USER_PLUGIN_DIR)]
     seen = set()
+    # plugin-N properties are direct children of a "plugins" property; looking
+    # only at direct children keeps nested input linear.
     for plugins in (p for p in root.iter("property") if p.get("name") == "plugins"):
-        for prop in plugins.iter("property"):
+        for prop in plugins:
             kind = prop.get("value")
-            if (prop is plugins or not re.fullmatch(r"plugin-\d+", prop.get("name", ""))
+            if (prop.tag != "property"
+                    or not re.fullmatch(r"plugin-\d+", prop.get("name", ""))
                     or prop.get("type") != "string" or not kind or kind in seen):
                 continue
             seen.add(kind)
-            if not re.fullmatch(r"[A-Za-z0-9._+-]+", kind):
-                result["warnings"].append(f"Ignored unusual panel plugin type {kind!r}.")
+            if len(kind) > MAX_SHOWN or not re.fullmatch(r"[A-Za-z0-9._+-]+", kind):
+                result["warnings"].append(f"Ignored unusual panel plugin type {clip(kind)!r}.")
             elif not any(os.path.exists(os.path.join(d, kind + ".desktop"))
                          for d in directories):
                 result["missing"].append(kind)
@@ -201,7 +219,16 @@ def _program(values):
     if values.get("TryExec"):
         return values["TryExec"]
     tokens = shlex.split(values.get("Exec", ""))
-    while tokens and (tokens[0] == "env" or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[0])):
+    if tokens and os.path.basename(tokens[0]) == "env":
+        tokens.pop(0)
+        # Skip env's options; these take a separate argument.
+        while tokens and tokens[0].startswith("-") and tokens[0] != "-":
+            option = tokens.pop(0)
+            if option == "--":
+                break
+            if option in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and tokens:
+                tokens.pop(0)
+    while tokens and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
         tokens.pop(0)
     return tokens[0] if tokens else None
 
@@ -212,19 +239,20 @@ def _program_available(program, provided):
     return shutil.which(program) is not None
 
 
-def check_autostart(bundle, manifest, home, source_home=None):
+def check_autostart(bundle, manifest, home, source_home=None, rewrite=False):
     """Find autostart entries whose program is not available; nothing is executed.
 
-    A program at an absolute path inside the source or destination home counts
-    as available when the bundle itself restores that file.
+    A program counts as available if it is executable now, or if the bundle
+    restores an executable file to that destination path. With rewrite=True a
+    path under the old home is checked where --rewrite-home will point it.
     """
     result = {"missing": [], "warnings": []}
     files = _file_entries(manifest)
-    provided = set()
-    for root in (home, source_home):
-        if root:
-            prefix = str(root).rstrip("/") + "/"
-            provided.update(prefix + relative for relative in files)
+    destination = str(home).rstrip("/") + "/"
+    provided = {destination + relative for relative, entry in files.items()
+                if entry["mode"] & 0o111}
+    old_prefix = (str(source_home).rstrip("/") + "/"
+                  if rewrite and source_home and str(source_home).rstrip("/") else None)
     for relative in sorted(files):
         path = PurePosixPath(relative)
         if path.parent.as_posix() != AUTOSTART_DIR or path.suffix != ".desktop":
@@ -240,6 +268,9 @@ def check_autostart(bundle, manifest, home, source_home=None):
         except ValueError:
             result["warnings"].append(f"{relative}: unparseable Exec")
             continue
-        if program and not _program_available(program, provided):
-            result["missing"].append((relative, program))
+        effective = program
+        if program and old_prefix and program.startswith(old_prefix):
+            effective = destination + program[len(old_prefix):]
+        if program and not _program_available(effective, provided):
+            result["missing"].append((relative, clip(program)))
     return result

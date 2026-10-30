@@ -236,16 +236,18 @@ def print_destination_checks(source_path, manifest, home, plan, *, rewrite, appl
                 print(f"  --rewrite-home: these references would be rewritten to {home} "
                       "when you add --apply.")
     panel = report.check_panel_plugins(source_path, manifest, home)
-    autostart = report.check_autostart(source_path, manifest, home, source_home)
+    autostart = report.check_autostart(source_path, manifest, home, source_home,
+                                       rewrite=rewrite)
     if panel["missing"]:
-        print("  Panel plugins used by the bundled panel but not installed here: "
-              + ", ".join(panel["missing"]))
+        print("  Panel plugins used by the bundled panel but not installed here:")
+        print_limited([f"    {report.clip(kind)}" for kind in panel["missing"]])
         print("    Install the packages that provide them before first login, for example "
               "find them with: dnf provides '*/xfce4/panel/plugins/NAME.desktop'")
     if autostart["missing"]:
         print("  Autostart programs not found on this system:")
         print_limited([f"    {path}: {program}" for path, program in autostart["missing"]])
-    print_warnings(panel["warnings"] + autostart["warnings"])
+    print_limited([f"  Note: {report.clip(warning, 300)}"
+                   for warning in panel["warnings"] + autostart["warnings"]])
     if not (panel["missing"] or panel["warnings"] or autostart["missing"]
             or autostart["warnings"]):
         print("  Panel plugins and autostart programs: no problems found.")
@@ -319,8 +321,6 @@ def restore_command(args):
     print("Selected paths:")
     for relative in plan["selected_paths"]:
         print(f"  {relative}")
-    if source["home"] != str(home):
-        print(f"Note: source home was {source['home']!r}. Review absolute paths in launchers and XFCE settings.")
     print_destination_checks(source_path, manifest, home, plan,
                              rewrite=args.rewrite_home, apply=args.apply)
     rewrite_home = (source["home"], str(home)) if args.rewrite_home else None

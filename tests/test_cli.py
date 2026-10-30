@@ -303,6 +303,17 @@ class CLITests(unittest.TestCase):
         self.assertEqual((target / ".bashrc").read_text(), f"export P={self.home}/bin\n")
         self.assertIn("Rewrote the old home path in 1 file", out)
 
+    def test_old_source_home_note_is_not_duplicated(self):
+        cli = cli_module()
+        bundle = self.backup_fixture()
+        target = self.root / "target-home"
+        target.mkdir()
+        info = dict(self.info, version_id="44", home=str(target))
+        with patch.object(cli, "platform_info", return_value=info):
+            code, out, err = self.invoke(["restore", "--bundle", str(bundle)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Note: source home was", out)
+
     def test_same_home_has_no_reference_report(self):
         bundle = self.backup_fixture()
         info = dict(self.info, version_id="44")

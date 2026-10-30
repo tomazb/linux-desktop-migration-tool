@@ -107,7 +107,8 @@ nothing. A reference is the old home path followed by `/`, the end of the file o
 character other than letters, digits, `.`, `_` and `-`; `/home/alice` is therefore
 not matched inside `/home/alice2`, while `file:///home/alice/x` is. Only files of
 at most 1 MiB are considered: `*.xml` under `.config/xfce4/`, `*.desktop`
-launchers, `.gtkrc-2.0`, `.config/gtk-3.0/bookmarks`, `.config/gtk-4.0/bookmarks`,
+launchers under `.config/`, `.local/share/applications/` or directly in
+`Desktop/` (elsewhere they may be project files), `.gtkrc-2.0`, `.config/gtk-3.0/bookmarks`, `.config/gtk-4.0/bookmarks`,
 `.config/user-dirs.dirs`, `.config/mimeapps.list` and text files in
 `.config/Thunar/`. Anything under `.mozilla`, `.thunderbird` or `.var`, and every
 other path, is neither scanned nor modified. Each file is rewritten only after its
@@ -170,8 +171,9 @@ The restore preview automates part of this check without changing anything:
   is reported as a warning rather than parsed.
 - **Autostart programs.** For each `.config/autostart/*.desktop` entry that is not
   `Hidden=true`, the program is `TryExec` if present, otherwise the first word of
-  `Exec` after any leading `env` and `NAME=value` words. It must be an existing
-  executable (an absolute path, or one the bundle itself restores) or be found on
+  `Exec` after any leading `env` (with its options) and `NAME=value` words. It must
+  be an existing executable (an absolute path, or an executable file the bundle
+  restores to that path, following `--rewrite-home` when given) or be found on
   `PATH`. Missing programs are listed per entry, and an `Exec` that cannot be split
   is reported as unparseable. The entries are only read, never run.
 - **Old home paths.** See `--rewrite-home` under

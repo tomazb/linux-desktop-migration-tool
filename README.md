@@ -120,7 +120,7 @@ If the destination home path differs from the source's, `--rewrite-home` (with
 listed. Only the old path is replaced, byte for byte, and only where it is followed
 by `/`, the end of the file or a character that cannot continue a name (so
 `/home/alice` never changes `/home/alice2`). Only small XFCE `*.xml` settings, `*.desktop`
-launchers, `.gtkrc-2.0`, GTK bookmarks, `user-dirs.dirs`, `mimeapps.list` and
+launchers under `.config/`, `.local/share/applications/` or directly in `Desktop/`, `.gtkrc-2.0`, GTK bookmarks, `user-dirs.dirs`, `mimeapps.list` and
 Thunar text files are considered; browser, mail and Flatpak data are never
 touched. Each file is rewritten only after its checksum has been validated, and the
 overwritten originals still go to the rollback directory. Without the option nothing
