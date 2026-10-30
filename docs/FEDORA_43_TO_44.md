@@ -254,6 +254,16 @@ empty. Before any overwrite or removal the current version is copied to
 that left conflicts (`partial`) or failed can be run again. Package installs are not
 undone. With SELinux enabled the put-back paths are relabeled.
 
+Threat model: rollback assumes the home is quiescent, which the command checks
+(no XFCE session, no browser, mail or Flatpak applications). It never overwrites or
+deletes an entry it has not first captured under `undone-*`, and it publishes put-back
+files with a hard link that fails rather than replaces, so a concurrent writer can at
+most make one path fail with both versions kept; the error names both locations. The
+home and its ancestors are walked from `/` without following symlinks, so swapping a
+parent directory mid-run cannot redirect a write. Because of the hard-link step, a
+filesystem without hard links makes rollback refuse that path (restore it by hand
+from `previous/`).
+
 ### Manual recovery (fallback)
 
 Read the journal in the rollback directory and identify the exact paths to recover.

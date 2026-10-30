@@ -10,6 +10,17 @@ rollback never loses data either.
 
 The rollback directory and the destination home must be controlled by the user
 and quiescent while this runs, like the restore itself.
+
+Threat model: rollback assumes the home is quiescent, which the CLI checks (no
+XFCE session, no browser, mail or Flatpak applications). It never overwrites or
+deletes an entry it has not captured: a destination's parent is pinned by file
+descriptor, walked from "/" without following symlinks; the current entry is
+moved (renamed) into undone-<time>/ before anything is published; and the
+original is published with a hard link, which fails instead of replacing. A
+concurrent writer can therefore at most make one path fail, with both versions
+kept. Writes inside the rollback directory itself use ordinary paths: it is the
+user's own directory, and a swapped ancestor there can misplace saved copies but
+never delete anything outside it.
 """
 
 import contextlib
@@ -191,20 +202,30 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
 
     put_back, remove, unchanged, absent, conflicts = [], [], [], [], []
     everything = journal["replaced"] + journal["new"]
+    # Compare canonical as well as lexical paths, so an alias of the bundle or
+    # the rollback directory cannot hide an overlap.
+    rollbacks = {rollback, Path(os.path.realpath(rollback))}
+    bundles = {bundle_path, Path(os.path.realpath(bundle_path))}
+
+    def canonical(destination):
+        return Path(os.path.realpath(destination.parent)) / destination.name
+
     for relative in everything:
         destination = home / relative
-        if _within(destination, rollback) or _within(destination, bundle_path):
-            raise BundleError(
-                f"Journal path {relative} lies inside the rollback directory or the bundle.")
+        for candidate in (destination, canonical(destination)):
+            if any(_within(candidate, protected) for protected in rollbacks | bundles):
+                raise BundleError(
+                    f"Journal path {relative} lies inside the rollback directory or the bundle.")
         _assert_no_symlink_ancestors(destination)
     for relative in journal["created_directories"]:
         # A created directory may legitimately contain the rollback directory
-        # (the restore made it first), so only the other three overlaps are refused.
+        # (the restore made it first), so only the other overlaps are refused.
         directory = home / relative
-        if (_within(directory, rollback) or _within(directory, bundle_path)
-                or _within(bundle_path, directory)):
-            raise BundleError(
-                f"Journal directory {relative} overlaps the rollback directory or the bundle.")
+        for candidate in (directory, canonical(directory)):
+            if any(_within(candidate, protected) for protected in rollbacks | bundles) or any(
+                    _within(protected, candidate) for protected in bundles):
+                raise BundleError(
+                    f"Journal directory {relative} overlaps the rollback directory or the bundle.")
 
     for relative in journal["replaced"]:
         saved = previous / relative
@@ -288,37 +309,47 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getatt
 
 
 def _open_parent(home, relative, *, create=False):
-    """Open the directory holding relative, one component at a time, never following links.
+    """Open the directory holding relative, walking from "/" without following links.
 
-    Returns a descriptor, or None if a parent is missing and create is false.
+    home must be a real absolute path (no symlink in any component). Returns a
+    descriptor, or None if a parent below home is missing and create is false.
     The caller closes it. Every later operation uses names relative to it, so
-    swapping a path component for a symlink afterwards cannot redirect them.
+    swapping any path component for a symlink afterwards cannot redirect them.
     """
-    descriptor = os.open(home, _DIRECTORY_FLAGS)
+    home = Path(home)
+    if not home.is_absolute() or os.path.realpath(home) != str(home):
+        raise BundleError(
+            f"The home directory must be an absolute path without symlinks: {home}")
+    names = home.parts[1:] + PurePosixPath(relative).parent.parts
+    below_home = len(home.parts) - 1
+    owned = [os.open("/", _DIRECTORY_FLAGS)]
     try:
-        for name in PurePosixPath(relative).parent.parts:
+        for index, name in enumerate(names):
             try:
-                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=owned[0])
             except FileNotFoundError:
+                if index < below_home:
+                    raise BundleError(f"The home directory does not exist: {home}") from None
                 if not create:
-                    os.close(descriptor)
                     return None
-                os.mkdir(name, 0o700, dir_fd=descriptor)
-                os.fsync(descriptor)
-                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                os.mkdir(name, 0o700, dir_fd=owned[0])
+                os.fsync(owned[0])
+                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=owned[0])
             except OSError as exc:
                 if exc.errno in (errno.ELOOP, errno.ENOTDIR):
                     raise BundleError(
-                        f"Refusing symlink or non-directory ancestor {name!r} of {home / relative}"
-                    ) from exc
+                        f"Refusing symlink or non-directory ancestor {name!r} of "
+                        f"{home / relative}") from exc
                 raise
-            os.close(descriptor)
-            descriptor = child
-        return descriptor
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(descriptor)
-        raise
+            owned.append(child)
+            # Ownership of the parent ends before it is closed, so an interrupt
+            # around the close can neither leak the child nor close a stale number.
+            os.close(owned.pop(0))
+        return owned.pop()
+    finally:
+        for descriptor in owned:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
 
 def _pin(home, relative, *, create=False):
@@ -336,10 +367,6 @@ def _pin(home, relative, *, create=False):
     except BaseException:
         os.close(descriptor)
         raise
-
-
-def _entry_fingerprint(info):
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _stage_saved(saved, descriptor):
@@ -373,19 +400,36 @@ def _stage_saved(saved, descriptor):
     return name
 
 
-def _copy_entry_out(descriptor, leaf, destination, staging):
-    """Copy the entry named leaf to destination (staged, synced, never partial).
+def _link_no_replace(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+    """Hard-link source to destination; fail instead of replacing an existing entry.
 
-    Used when the entry cannot be renamed into place (another filesystem).
-    Returns the copied entry's fingerprint so the caller can detect a change.
+    Python has no renameat2(RENAME_NOREPLACE). linkat fails with EEXIST where
+    rename would silently overwrite, and with follow_symlinks=False it links a
+    symlink itself. Raises FileExistsError if destination exists, BundleError if
+    the filesystem cannot hard-link (never falling back to a replacing rename).
     """
+    try:
+        os.link(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+                follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV):
+            raise BundleError(
+                f"This filesystem cannot hard-link {destination!r} ({exc.strerror}), which "
+                "rollback needs to publish a file without overwriting; restore this path "
+                "by hand from previous/.") from exc
+        raise
+
+
+def _copy_entry_out(descriptor, leaf, destination, staging):
+    """Copy the entry named leaf to destination (staged, synced, never partial)."""
     temporary = staging / uuid.uuid4().hex
     try:
         info = os.stat(leaf, dir_fd=descriptor, follow_symlinks=False)
         if stat.S_ISLNK(info.st_mode):
             temporary.symlink_to(os.readlink(leaf, dir_fd=descriptor))
             os.utime(temporary, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
-            copied = info
         else:
             with os.fdopen(os.open(leaf, _FILE_FLAGS, dir_fd=descriptor), "rb") as reader:
                 before = os.fstat(reader.fileno())
@@ -400,26 +444,89 @@ def _copy_entry_out(descriptor, leaf, destination, staging):
                     os.utime(writer.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
                     os.fsync(writer.fileno())
                 if _fingerprint(before) != _fingerprint(os.fstat(reader.fileno())):
-                    raise BundleError(f"{leaf} changed while it was being saved; "
-                                      "nothing was removed.")
-                copied = before
+                    raise BundleError(f"{leaf} changed while it was being saved.")
         _private_parents(destination.parent)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
-        return _entry_fingerprint(copied)
     finally:
         with contextlib.suppress(OSError):
             if os.path.lexists(temporary):
                 temporary.unlink()
 
 
+def _restore_by_link(source, leaf, where, *, src_dir_fd, dst_dir_fd):
+    """Link a captured entry back to leaf without replacing; name where it is otherwise kept."""
+    try:
+        _link_no_replace(source, leaf, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+    except FileExistsError:
+        raise BundleError(
+            f"{leaf} was created by someone else while rolling back and was left untouched; "
+            f"the entry that was there before is kept in {where}.") from None
+    os.unlink(source, dir_fd=src_dir_fd)
+
+
+def _capture_across_devices(descriptor, leaf, destination, staging):
+    """Capture by quarantine when undone/ is on another filesystem.
+
+    The entry is renamed (atomically, same filesystem) into a private directory
+    next to it, then copied out. Returns (restore, finish): restore links it back
+    to leaf without replacing, finish discards the quarantine once the caller is done.
+    """
+    name = ".fedora-migration-quarantine-" + uuid.uuid4().hex
+    os.mkdir(name, 0o700, dir_fd=descriptor)
+    quarantine = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+    where = f"{name}/entry beside {leaf}"
+
+    def discard():
+        with contextlib.suppress(OSError):
+            os.unlink("entry", dir_fd=quarantine)
+        os.close(quarantine)
+        os.rmdir(name, dir_fd=descriptor)
+        os.fsync(descriptor)
+
+    copied = []
+
+    def restore():
+        try:
+            _restore_by_link("entry", leaf, where, src_dir_fd=quarantine, dst_dir_fd=descriptor)
+        except BundleError:
+            if not copied:
+                raise
+            # Something new occupies leaf. The complete copy is in undone/, so the
+            # quarantined original is redundant.
+            discard()
+            raise BundleError(
+                f"{leaf} was created by someone else while rolling back and was left "
+                f"untouched; the entry that was there before is kept in {destination}.") from None
+        discard()
+
+    try:
+        os.rename(leaf, "entry", src_dir_fd=descriptor, dst_dir_fd=quarantine)
+        try:
+            _copy_entry_out(quarantine, "entry", destination, staging)
+            copied.append(True)
+        except BaseException as exc:
+            try:
+                restore()
+            except (BundleError, OSError) as problem:
+                if not isinstance(exc, KeyboardInterrupt):
+                    raise BundleError(f"{exc}; {problem}") from exc
+            raise
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(quarantine)
+        with contextlib.suppress(OSError):
+            os.rmdir(name, dir_fd=descriptor)
+        raise
+    return restore, discard
+
+
 def _capture(descriptor, leaf, destination, staging):
-    """Move the current entry into the undone directory; return (pending, moved).
+    """Move the current entry into the undone directory; return (restore, finish).
 
     A rename moves the exact entry, so no edit can fall between saving and
-    removing it. Across filesystems that is impossible: the entry is copied
-    instead and pending holds its fingerprint, to be re-checked before the
-    caller removes or replaces it.
+    removing it. Across filesystems a quarantine does the same. restore() puts
+    the entry back without replacing anything; finish() completes the capture.
     """
     if os.path.lexists(destination):
         raise BundleError(f"Undone copy already exists: {destination}")
@@ -429,20 +536,19 @@ def _capture(descriptor, leaf, destination, staging):
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-        return _copy_entry_out(descriptor, leaf, destination, staging), False
+        return _capture_across_devices(descriptor, leaf, destination, staging)
     _fsync_directory(destination.parent)
     os.fsync(descriptor)
-    return None, True
+    return (lambda: _restore_by_link(os.fspath(destination), leaf, destination,
+                                     src_dir_fd=None, dst_dir_fd=descriptor),
+            lambda: None)
 
 
-def _assert_unchanged(descriptor, leaf, pending):
-    try:
-        current = _entry_fingerprint(os.stat(leaf, dir_fd=descriptor, follow_symlinks=False))
-    except FileNotFoundError:
-        current = None
-    if current != pending:
-        raise BundleError(f"{leaf} changed after it was saved; nothing was removed. "
-                          "Run rollback again to review it.")
+def _check_hard_links(descriptor, staged, destination):
+    """Refuse a path early, before touching it, if hard links are unavailable."""
+    probe = ".fedora-migration-" + uuid.uuid4().hex
+    _link_no_replace(staged, probe, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+    os.unlink(probe, dir_fd=descriptor)
 
 
 def _apply_action(home, relative, action, rollback, undone, staging):
@@ -453,7 +559,7 @@ def _apply_action(home, relative, action, rollback, undone, staging):
     if descriptor is None:
         return  # the parent is gone, so there is nothing to remove
     staged = None
-    captured = False
+    restore = None
     try:
         try:
             info = os.stat(leaf, dir_fd=descriptor, follow_symlinks=False)
@@ -466,27 +572,32 @@ def _apply_action(home, relative, action, rollback, undone, staging):
             if not os.path.lexists(saved):
                 raise BundleError(f"Saved original disappeared: {saved}")
             staged = _stage_saved(saved, descriptor)
-        pending = None
+            _check_hard_links(descriptor, staged, destination)
+        finish = None
         if info is not None:
-            pending, captured = _capture(descriptor, leaf, undone / relative, staging)
-        if pending is not None:
-            _assert_unchanged(descriptor, leaf, pending)
+            restore, finish = _capture(descriptor, leaf, undone / relative, staging)
         if action == "put_back":
-            os.replace(staged, leaf, src_dir_fd=descriptor, dst_dir_fd=descriptor)
-            staged = None
-        elif pending is not None:
-            os.unlink(leaf, dir_fd=descriptor)
-        os.fsync(descriptor)
-    except BaseException:
-        if captured and action == "put_back":
-            # Best effort: leave the user's entry where it was rather than only in undone/.
             try:
-                os.stat(leaf, dir_fd=descriptor, follow_symlinks=False)
-            except FileNotFoundError:
-                with contextlib.suppress(OSError):
-                    os.rename(undone / relative, leaf, dst_dir_fd=descriptor)
-            except OSError:
-                pass
+                _link_no_replace(staged, leaf, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            except FileExistsError:
+                raise BundleError(
+                    f"{destination} was created by someone else while rolling back and was "
+                    "left untouched; the entry that was there before is kept in "
+                    f"{undone / relative if restore else 'nowhere (it did not exist)'}.") from None
+            os.unlink(staged, dir_fd=descriptor)
+            staged = None
+        if finish is not None:
+            finish()
+            restore = None
+        os.fsync(descriptor)
+    except BaseException as exc:
+        if restore is not None and action == "put_back":
+            # Leave the user's entry where it was, never over anything new.
+            try:
+                restore()
+            except (BundleError, OSError) as problem:
+                if not isinstance(exc, KeyboardInterrupt) and str(problem) not in str(exc):
+                    raise BundleError(f"{exc} Also: {problem}") from exc
         raise
     finally:
         if staged is not None:
