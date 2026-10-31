@@ -38,18 +38,23 @@ from .bundle import (
     BundleError, BundleInterrupted, MIN_MTIME_NS, MAX_MTIME_NS,
     _absolute, _assert_no_symlink_ancestors,
     _digest, _fingerprint, _fsync_directory, _kind, _owner_accessible,
-    _private_parents, _safe_path, _update_journal, _validated_rewrite, _within,
+    _private_parents, _safe_path, _update_journal, _within,
     _within_secret, verify_bundle,
 )
 from .report import entry_is_rewritable, replace_home_references, rewritable
 
 JOURNAL = "journal.json"
 ROLLBACK_JOURNAL = "rollback-journal.json"
+QUARANTINE_RECORDS = "quarantine-records"
 RESTORE_STATUSES = ("in_progress", "complete", "failed", "interrupted")
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+# Two relative Linux paths, including JSON escaping, still fit this bounded
+# record. Ordinary records are a few hundred bytes; never serialize the full
+# growing action/recovery set for an individual capture.
+MAX_QUARANTINE_RECORD_BYTES = 64 * 1024
 
 
-def _read_json_file(path, what):
+def _read_json_file(path, what, *, max_bytes=MAX_JOURNAL_BYTES):
     """Read a regular, bounded JSON file without following a symlink."""
     try:
         info = path.lstat()
@@ -57,7 +62,7 @@ def _read_json_file(path, what):
         raise BundleError(f"No {what} found: {path}") from None
     if _kind(info.st_mode) != "file":
         raise BundleError(f"The {what} must be a regular file: {path}")
-    if info.st_size > MAX_JOURNAL_BYTES:
+    if info.st_size > max_bytes:
         raise BundleError(f"The {what} is implausibly large: {path}")
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -118,7 +123,16 @@ def _load_journal(rollback):
         if (not isinstance(rewrite, list) or len(rewrite) != 2
                 or not all(isinstance(value, str) for value in rewrite)):
             raise BundleError("Invalid journal: rewrite_home must be null or two strings.")
-        rewrite = _validated_rewrite(rewrite)
+        # Historical restores allowed names that the new-write validator now
+        # refuses across XML/desktop/shell formats. This pair only reproduces
+        # their already-written bytes for comparison; it never authorizes a
+        # new home rewrite. Preserve the former structural checks here.
+        rewrite = tuple(_absolute_string(value, "rewrite_home path").rstrip("/")
+                        for value in rewrite)
+        if not all(rewrite):
+            raise BundleError("Journal home rewrite refuses the filesystem root.")
+        if rewrite[0] == rewrite[1]:
+            rewrite = None
     return journal, rewrite
 
 
@@ -156,6 +170,42 @@ def _retained_quarantines(previous, home):
                 or str(path) in seen):
             raise BundleError(f"Invalid rollback journal quarantine: {path}")
         seen.add(str(path))
+    return records
+
+
+def _load_quarantine_records(rollback, previous, home):
+    """Merge bounded durable capture records with an older or lagging summary."""
+    records = list(_retained_quarantines(previous, home))
+    directory = rollback / QUARANTINE_RECORDS
+    _assert_no_symlink_ancestors(directory, include_leaf=True)
+    if not os.path.lexists(directory):
+        return records
+    if not directory.is_dir():
+        raise BundleError(f"Quarantine recovery records must be a directory: {directory}")
+    by_path = {item["quarantine"]: item for item in records}
+    for path in sorted(directory.iterdir()):
+        # A crash before an atomic record publication may leave a partial temp;
+        # the capture is not allowed to rename its source until publication ends.
+        if path.name.startswith("journal-") and path.suffix == ".tmp":
+            continue
+        identifier = path.stem
+        if (path.suffix != ".json" or len(identifier) != 32
+                or any(c not in "0123456789abcdef" for c in identifier)):
+            raise BundleError(f"Invalid quarantine recovery record filename: {path}")
+        record = _read_json_file(path, "quarantine recovery record",
+                                 max_bytes=MAX_QUARANTINE_RECORD_BYTES)
+        _retained_quarantines({"home": previous.get("home", str(home)),
+                               "retained_quarantines": [record]}, home)
+        if PurePosixPath(record["quarantine"]).parent.name != (
+                ".fedora-migration-quarantine-" + identifier):
+            raise BundleError(f"Quarantine recovery record does not match its filename: {path}")
+        earlier = by_path.get(record["quarantine"])
+        if earlier is not None:
+            if earlier != record:
+                raise BundleError(f"Conflicting quarantine recovery records: {path}")
+        else:
+            records.append(record)
+            by_path[record["quarantine"]] = record
     return records
 
 
@@ -243,7 +293,7 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
             f"This rollback directory belongs to home {journal['home']}, not {home}. "
             "Refusing to change another home.")
     previous_rollback = _refuse_if_rolled_back(rollback)
-    retained_quarantines = _retained_quarantines(previous_rollback, home)
+    retained_quarantines = _load_quarantine_records(rollback, previous_rollback, home)
     bundle_path = _absolute(bundle if bundle is not None else journal["bundle"])
     entries, problem = _verified_manifest(bundle_path)
     previous = rollback / "previous"
@@ -842,20 +892,33 @@ def apply_rollback(rollback_dir, home, *, bundle=None, include_changed=False,
         "restore_directory_metadata": plan["restore_directory_metadata"],
         "retained_quarantines": list(plan["retained_quarantines"]),
     }
+    record_directory = rollback / QUARANTINE_RECORDS
+    records_ready = False
 
     def retain_quarantine(relative, name):
+        nonlocal records_ready
         path = (PurePosixPath(relative).parent / name / "entry").as_posix()
         record = {"path": relative, "quarantine": path}
+        size = len(json.dumps(record, indent=2, ensure_ascii=True).encode("utf-8")) + 1
+        if size > MAX_QUARANTINE_RECORD_BYTES:
+            raise BundleError("Quarantine recovery reference is too large; no entry was moved.")
+        if not records_ready:
+            _assert_no_symlink_ancestors(record_directory, include_leaf=True)
+            _private_parents(record_directory)
+            _assert_no_symlink_ancestors(record_directory, include_leaf=True)
+            if not record_directory.is_dir():
+                raise BundleError(f"Quarantine recovery records must be a directory: {record_directory}")
+            records_ready = True
+        filename = name.removeprefix(".fedora-migration-quarantine-") + ".json"
+        # This small atomic write fsyncs both the record and its directory before
+        # the caller may rename an entry. The full summary can lag after a crash.
+        _update_journal(record_directory, record, filename)
         journal["retained_quarantines"].append(record)
-        try:
-            _update_journal(rollback, journal, ROLLBACK_JOURNAL)
-        except BaseException:
-            journal["retained_quarantines"].remove(record)
-            raise
 
         def release():
+            (record_directory / filename).unlink()
+            _fsync_directory(record_directory)
             journal["retained_quarantines"].remove(record)
-            _update_journal(rollback, journal, ROLLBACK_JOURNAL)
 
         return str(home / path), release
 
@@ -931,7 +994,8 @@ def apply_rollback(rollback_dir, home, *, bundle=None, include_changed=False,
             locations = ", ".join(str(home / item["quarantine"])
                                   for item in journal["retained_quarantines"][:3])
             saved += (f" Captured cross-filesystem originals remain at {locations}; "
-                      f"all recovery locations are listed in {rollback / ROLLBACK_JOURNAL}.")
+                      f"recovery locations are recorded in {record_directory} and "
+                      f"{rollback / ROLLBACK_JOURNAL} (the summary may lag after a failure).")
         if interrupted:
             raise BundleInterrupted(
                 f"Rollback interrupted. {saved} Retained rollback directory: {rollback}. "

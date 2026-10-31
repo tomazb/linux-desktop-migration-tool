@@ -478,6 +478,8 @@ def print_rollback_plan(plan, *, apply):
         print("Previously captured cross-filesystem originals remain at:")
         print_limited([f"    {Path(plan['home']) / item['quarantine']}"
                        for item in plan["retained_quarantines"]])
+        print(f"Durable recovery records: {Path(plan['rollback_dir']) / rollback.QUARANTINE_RECORDS}; "
+              "the summary journal may lag after an interruption.")
     if plan["kept_directories"]:
         print_limited([f"    kept {report.clip(item['path'])}: {item['reason']}"
                        for item in plan["kept_directories"]])
@@ -521,7 +523,8 @@ def rollback_command(args):
         print_limited([f"    {home / item['quarantine']}"
                        for item in result["retained_quarantines"]])
         print("Keep these private quarantine directories until all writers are stopped and you "
-              "have checked the result; rollback-journal.json lists every recovery location.")
+              "have checked the result; rollback-journal.json and quarantine-records/ "
+              "record the recovery locations.")
     for item in result["kept_directories"]:
         print(f"  Kept directory {report.clip(item['path'])}: {item['reason']}")
     if result["skipped"]:

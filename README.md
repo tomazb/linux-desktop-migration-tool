@@ -152,8 +152,10 @@ restore's `journal.json` and `previous/`, then puts the saved originals back and
 removes the files and symlinks the restore added, but only where a path still
 holds what the restore wrote. That check re-verifies the bundle in full (the path in
 the journal, or `--bundle PATH` if it moved) and compares each current file with the
-bundle payload; files changed by `--rewrite-home` count as restored. Anything
-else is a CONFLICT: it is listed with the reason and left alone. If the bundle is
+bundle payload; files changed by `--rewrite-home` count as restored. Files
+written by an older restore remain comparable even if the old or new home has
+spaces, Unicode or punctuation that new `--rewrite-home` operations now refuse.
+Anything else is a CONFLICT: it is listed with the reason and left alone. If the bundle is
 missing or invalid, no path can be verified and every existing path is a conflict.
 `--include-changed` processes conflicts too, except file paths now holding
 directories or special files.
@@ -178,8 +180,11 @@ requires a manual access repair before rollback can proceed safely.
 When the rollback directory is on another filesystem, captured originals also
 remain under private `.fedora-migration-quarantine-*/entry` directories beside
 their former paths. Keeping the inode preserves late writes through already-open
-file descriptors. The output and `rollback-journal.json` list these recovery
-locations, including across retries. These directories can keep otherwise empty
+file descriptors. Each capture first writes a durable individual recovery record
+under `ROLLBACK/quarantine-records/`; these records remain usable if an abrupt
+interruption leaves `rollback-journal.json` behind. The output and summary journal
+also list recovery locations, and retries merge both sources. Keep the individual
+records with the rollback directory. Quarantine directories can keep otherwise empty
 restore-created parents from being removed. Stop all writers, inspect both the
 retained original and the `undone-*` copy, and keep any newer data before manually
 removing a quarantine directory.

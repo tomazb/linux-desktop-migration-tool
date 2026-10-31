@@ -281,6 +281,9 @@ interrupted. Saved originals are put back over the restored files, and files or
 symlinks the restore added are removed, but only where the path still holds what
 the restore wrote. The bundle is verified in full for that comparison (pass
 `--bundle PATH` if it moved); files changed by `--rewrite-home` count as restored.
+Historical home-rewrite pairs containing spaces, Unicode or punctuation remain
+usable for comparing already-written files. The stricter home-name requirements
+for new `--rewrite-home` restores still apply to new writes.
 Changed files are a CONFLICT and are left alone; if the bundle cannot be verified,
 every existing path is a conflict. Review each reason, then add `--include-changed`
 to process them anyway. Directories the restore created are removed only when
@@ -304,12 +307,20 @@ undone. With SELinux enabled the put-back paths are relabeled.
 
 Across filesystems, rollback moves the original inode into a private
 `.fedora-migration-quarantine-*/entry` directory beside the former path, then makes
-a durable copy under `undone-*`. It journals the recovery location before moving
-anything. The original inode remains there after success so that writes through
+a durable copy under `undone-*`. Before moving anything, it atomically writes and
+syncs a small individual recovery record under
+`ROLLBACK/quarantine-records/<identifier>.json`. The original inode remains there
+after success so that writes through
 an already-open descriptor remain recoverable, including writes after rollback
-finishes. The command prints the locations; `retained_quarantines` in
-`rollback-journal.json` lists every home-relative location and is carried forward
-on retries. A failed put-back removes a quarantine only after returning that same
+finishes. These individual records are durable recovery evidence after an abrupt
+interruption: the summary `rollback-journal.json` may not yet list the latest
+captures. Keep `quarantine-records/` with the rollback directory. Each record is an
+intent reference, so its entry may be absent if interruption happened before the
+move or just after a successful put-back. Retries validate and merge the records
+with older `retained_quarantines` references from the summary, and normal
+completion or failure consolidates the locations into the summary. The command
+prints the locations. A failed put-back removes a quarantine and its individual
+record only after returning that same
 inode to its former path without replacing anything. Otherwise, keep these
 directories until all writers have stopped, compare the retained originals with
 the `undone-*` copies, and save any newer data before removing a quarantine by

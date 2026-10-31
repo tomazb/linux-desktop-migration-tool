@@ -356,6 +356,47 @@ class RewriteHomeRollbackTests(RollbackFixture):
         (self.target / ".bashrc").write_bytes(b"export P=/home/bob/bin\n")
         self.assertEqual([c["path"] for c in self.plan()["conflicts"]], [".bashrc"])
 
+    def test_legacy_rewritten_homes_remain_recoverable(self):
+        for old, target_name in (("/home/alice&bob", "target-ampersand-source"),
+                                 (OLD_HOME, "target&home"),
+                                 (OLD_HOME, "target home"),
+                                 (OLD_HOME, "target-é")):
+            with self.subTest(old=old, target_name=target_name):
+                source = self.root / (target_name + "-source")
+                target = self.root / target_name
+                saved_bundle = self.root / (target_name + "-bundle")
+                recovery = self.root / (target_name + "-rollback")
+                self.write(source / XML_PATH, ('<p value="' + old + '/x"/>').encode())
+                self.write(target / XML_PATH, b"original destination")
+                bundle_module.create_bundle(source, saved_bundle, {"version_id": "43"}, {})
+                restore_bundle(saved_bundle, target, dry_run=False, backup_dir=recovery)
+                # Legacy restores performed this literal substitution and wrote
+                # this pair. Reproduce their persisted bytes without relaxing
+                # the validation used for any new restore.
+                (target / XML_PATH).write_bytes(('<p value="' + str(target) + '/x"/>').encode())
+                journal = json.loads((recovery / "journal.json").read_text())
+                journal["rewrite_home"] = [old, str(target)]
+                journal.pop("original_directories", None)
+                (recovery / "journal.json").write_text(json.dumps(journal))
+                plan = rollback_module().plan_rollback(recovery, target)
+                self.assertIn(XML_PATH, plan["put_back"])
+                self.assertEqual(plan["conflicts"], [])
+                result = rollback_module().apply_rollback(recovery, target)
+                self.assertEqual(result["status"], "complete")
+                self.assertEqual((target / XML_PATH).read_bytes(), b"original destination")
+
+    def test_legacy_rewrite_records_still_require_safe_absolute_nonroot_paths(self):
+        self.populate()
+        self.restore()
+        original = self.journal()
+        for pair in (["/", NEW_HOME], [OLD_HOME, "//"], ["home/alice", NEW_HOME],
+                     [OLD_HOME, "relative"], [OLD_HOME, "/home/bob\0bad"], [OLD_HOME, 3]):
+            with self.subTest(pair=pair):
+                (self.rollback_dir / "journal.json").write_text(
+                    json.dumps(dict(original, rewrite_home=pair)))
+                with self.assertRaises(BundleError):
+                    self.plan()
+
 
 class BundleAvailabilityTests(RollbackFixture):
     def test_missing_bundle_means_cannot_verify_and_conflicts(self):
@@ -1070,7 +1111,7 @@ class PinnedWriteTests(RollbackFixture):
         real_update = module._update_journal
 
         def fail_quarantine_record(directory, journal, name):
-            if journal.get("retained_quarantines"):
+            if "quarantine" in journal:
                 raise OSError("injected journal write failure")
             return real_update(directory, journal, name)
 
@@ -1094,9 +1135,10 @@ class PinnedWriteTests(RollbackFixture):
         def capture_then_swap(descriptor, leaf, *args, **kwargs):
             result = real_capture(descriptor, leaf, *args, **kwargs)
             if leaf == ".bashrc":
-                journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
-                record = next(item for item in journal["retained_quarantines"]
-                              if item["path"] == ".bashrc")
+                record = next(item for item in (
+                    json.loads(path.read_text())
+                    for path in (self.rollback_dir / "quarantine-records").glob("*.json"))
+                    if item["path"] == ".bashrc")
                 directory = (self.target / record["quarantine"]).parent
                 directory.rename(retained)
                 directory.symlink_to(outside, target_is_directory=True)
@@ -1220,6 +1262,180 @@ class PinnedWriteTests(RollbackFixture):
                 self.apply()
         self.assertEqual((self.target / ".bashrc").read_bytes(), b"restored bashrc")
         self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
+
+
+class QuarantineJournalTests(RollbackFixture):
+    def restore_one(self):
+        self.write(self.home / ".bashrc", b"restored")
+        self.write(self.target / ".bashrc", b"original")
+        self.backup()
+        self.restore()
+        self.real_rename = os.rename
+
+    def exdev(self, source, destination, **kwargs):
+        if kwargs.get("src_dir_fd") is not None and kwargs.get("dst_dir_fd") is None:
+            raise OSError(errno.EXDEV, "cross-device link")
+        return self.real_rename(source, destination, **kwargs)
+
+    def test_restart_loads_durable_records_when_summary_journal_lags(self):
+        self.restore_one()
+        module = rollback_module()
+        real_action = module._apply_action
+
+        class AbruptCrash(BaseException):
+            pass
+
+        def action_then_crash(*args, **kwargs):
+            real_action(*args, **kwargs)
+            raise AbruptCrash()
+
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+             patch.object(module, "_apply_action", side_effect=action_then_crash):
+            with self.assertRaises(AbruptCrash):
+                self.apply()
+        summary = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+        self.assertEqual(summary["status"], "in_progress")
+        self.assertEqual(summary["retained_quarantines"], [],
+                         "the full journal should not be rewritten for each capture")
+        plan = self.plan()
+        self.assertEqual(len(plan["retained_quarantines"]), 1)
+        retained = self.target / plan["retained_quarantines"][0]["quarantine"]
+        self.assertEqual(retained.read_bytes(), b"restored")
+        result = self.apply()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["retained_quarantines"], plan["retained_quarantines"])
+
+    def test_recovery_record_precedes_the_quarantine_rename(self):
+        self.restore_one()
+
+        def inspect_then_rename(source, destination, **kwargs):
+            if destination == "entry" and kwargs.get("dst_dir_fd") is not None:
+                records = list((self.rollback_dir / "quarantine-records").glob("*.json"))
+                self.assertEqual(len(records), 1)
+                record = json.loads(records[0].read_text())
+                self.assertEqual(record["path"], ".bashrc")
+                self.assertTrue((self.target / ".bashrc").exists())
+            return self.exdev(source, destination, **kwargs)
+
+        with patch("fedora_migration.rollback.os.rename", side_effect=inspect_then_rename):
+            self.apply()
+
+    def test_returning_the_captured_inode_removes_its_individual_record(self):
+        self.restore_one()
+        real_link = os.link
+        descriptor = os.open(self.target / ".bashrc", os.O_WRONLY)
+
+        def fail_publication(source, destination, **kwargs):
+            if destination == ".bashrc" and str(source).startswith(".fedora-migration-"):
+                raise OSError("publication failed")
+            return real_link(source, destination, **kwargs)
+
+        try:
+            with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+                 patch("fedora_migration.rollback.os.link", side_effect=fail_publication):
+                with self.assertRaises(BundleError):
+                    self.apply()
+            self.assertEqual((self.target / ".bashrc").stat().st_ino, os.fstat(descriptor).st_ino)
+            self.assertEqual(list((self.rollback_dir / "quarantine-records").glob("*.json")), [])
+            summary = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+            self.assertEqual(summary["retained_quarantines"], [])
+        finally:
+            os.close(descriptor)
+
+    def test_individual_records_are_validated_and_merged_with_old_summaries(self):
+        self.restore_one()
+        identifier = "a" * 32
+        record = {"path": ".bashrc", "quarantine": ".fedora-migration-quarantine-" + identifier + "/entry"}
+        summary = {"status": "partial", "home": str(self.target), "retained_quarantines": [record]}
+        (self.rollback_dir / "rollback-journal.json").write_text(json.dumps(summary))
+        directory = self.rollback_dir / "quarantine-records"
+        directory.mkdir(mode=0o700)
+        path = directory / (identifier + ".json")
+        path.write_text(json.dumps(record))
+        self.assertEqual(self.plan()["retained_quarantines"], [record])
+        path.write_text(json.dumps(dict(record, path=".bash_profile")))
+        with self.assertRaises(BundleError):
+            self.plan()
+
+    def test_unsafe_or_oversized_individual_records_are_refused_before_writes(self):
+        self.restore_one()
+        directory = self.rollback_dir / "quarantine-records"
+        directory.mkdir(mode=0o700)
+        path = directory / ("a" * 32 + ".json")
+        invalid = [json.dumps({"path": ".bashrc", "quarantine": "../outside/entry"}),
+                   " " * (64 * 1024 + 1)]
+        for contents in invalid:
+            with self.subTest(contents_length=len(contents)):
+                path.write_text(contents)
+                before = snapshot(self.target)
+                with self.assertRaises(BundleError):
+                    self.plan()
+                with self.assertRaises(BundleError):
+                    self.apply()
+                self.assertEqual(snapshot(self.target), before)
+
+    def test_recovery_record_directory_symlink_is_refused(self):
+        self.restore_one()
+        outside = self.root / "outside-records"
+        outside.mkdir()
+        (self.rollback_dir / "quarantine-records").symlink_to(outside, target_is_directory=True)
+        before = snapshot(self.target)
+        with self.assertRaises(BundleError):
+            self.apply()
+        self.assertEqual(snapshot(self.target), before)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_long_valid_escaped_paths_fit_a_bounded_individual_record(self):
+        self.restore_one()
+        identifier = "b" * 32
+        parent = ".config/" + "/".join(["\x01" * 200] * 12)
+        record = {"path": parent + "/file",
+                  "quarantine": parent + "/.fedora-migration-quarantine-" + identifier + "/entry"}
+        directory = self.rollback_dir / "quarantine-records"
+        directory.mkdir(mode=0o700)
+        contents = json.dumps(record, ensure_ascii=True)
+        self.assertGreater(len(contents), 16 * 1024)
+        (directory / (identifier + ".json")).write_text(contents)
+        self.assertEqual(self.plan()["retained_quarantines"], [record])
+
+    def test_exdev_record_io_has_linear_serialized_byte_and_operation_budgets(self):
+        module = rollback_module()
+        totals = []
+        for count in (40, 80):
+            root = self.root / str(count)
+            source, target, saved, recovery = (root / name for name in ("source", "target", "bundle", "rollback"))
+            source.mkdir(parents=True)
+            target.mkdir()
+            for number in range(count):
+                self.write(source / (".config/xfce4/file-%03d" % number), b"settings")
+            bundle_module.create_bundle(source, saved, {"version_id": "43"}, {})
+            restore_bundle(saved, target, dry_run=False, backup_dir=recovery)
+            writes, record_reads = [], []
+            real_update, real_read = module._update_journal, module._read_json_file
+            self.real_rename = os.rename
+
+            def measure_write(directory, journal, name):
+                length = len(json.dumps(journal, indent=2, ensure_ascii=True).encode()) + 1
+                writes.append((name, length))
+                return real_update(directory, journal, name)
+
+            def measure_read(path, what, **kwargs):
+                if path.parent.name == "quarantine-records":
+                    record_reads.append(path)
+                return real_read(path, what, **kwargs)
+
+            with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+                 patch.object(module, "_update_journal", side_effect=measure_write), \
+                 patch.object(module, "_read_json_file", side_effect=measure_read):
+                result = module.apply_rollback(recovery, target)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(sum(name == "rollback-journal.json" for name, _ in writes), 2)
+            individual = [length for name, length in writes if name != "rollback-journal.json"]
+            self.assertEqual(len(individual), count)
+            self.assertLess(max(individual), 1024)
+            self.assertEqual(record_reads, [], "new captures must not reread the growing recovery set")
+            totals.append(sum(length for _, length in writes))
+        self.assertLess(totals[1], totals[0] * 2.2)
 
 
 class NoReplaceTests(RollbackFixture):
