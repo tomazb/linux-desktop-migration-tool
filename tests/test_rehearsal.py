@@ -914,6 +914,65 @@ class ExecuteFlowTests(unittest.TestCase):
             data = json.loads((self.run_dir(tmp) / "report.json").read_text())
             self.assertEqual(data["meta"]["base_images"]["src"], str(Path(tmp) / "src.qcow2"))
 
+    def test_interruption_after_preparation_marks_both_reports_failed(self):
+        def interrupt(steps, runner):
+            runner.execute(steps[0])
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, _ = self.run_main(tmp, patches=(patch.object(rehearsal, "run_plan", interrupt),))
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+            markdown = (self.run_dir(tmp) / "report.md").read_text()
+        self.assertEqual(code, 130)
+        self.assertFalse(data["passed"])
+        self.assertGreater(data["summary"]["failed"], 0)
+        self.assertIn("**FAILED**", markdown)
+
+    def test_interrupted_tool_marks_report_failed_and_runs_cleanup(self):
+        def interrupt():
+            raise KeyboardInterrupt
+
+        def plan(config, state):
+            return [
+                rehearsal.Step(id="prepare-workdir", description="Prepare",
+                               action=lambda: rehearsal.prepare_workdir(config, state)),
+                rehearsal.Step(id="backup-src", description="Run backup", kind="tool", action=interrupt),
+                rehearsal.Step(id="remaining-check", description="Must not run", action=self.fail),
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, _ = self.run_main(tmp, patches=(patch.object(rehearsal, "build_plan", plan),))
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+            markdown = (self.run_dir(tmp) / "report.md").read_text()
+        self.assertEqual(code, 130)
+        self.assertFalse(data["passed"])
+        self.assertIn("**FAILED**", markdown)
+        self.assertIn("remove-run-files", [step["id"] for step in data["steps"]])
+        self.assertNotIn("remaining-check", [step["id"] for step in data["steps"]])
+
+    def test_interrupted_cleanup_marks_report_failed(self):
+        def interrupt():
+            raise KeyboardInterrupt
+
+        def prepared(steps, runner):
+            runner.execute(steps[0])
+
+        cleanup = [rehearsal.Step(id="cleanup-interrupted", description="Cleanup",
+                                  kind="cleanup", action=interrupt)]
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                code, _, _ = self.run_main(tmp, patches=(
+                    patch.object(rehearsal, "run_plan", prepared),
+                    patch.object(rehearsal, "cleanup_steps", return_value=cleanup),
+                ))
+            except KeyboardInterrupt:
+                self.fail("Cleanup interruption escaped without returning exit 130")
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+            markdown = (self.run_dir(tmp) / "report.md").read_text()
+        self.assertEqual(code, 130)
+        self.assertFalse(data["passed"])
+        self.assertIn("**FAILED**", markdown)
+
 
 class DomainOwnershipPlanTests(unittest.TestCase):
     def test_uuid_is_passed_to_virt_install(self):

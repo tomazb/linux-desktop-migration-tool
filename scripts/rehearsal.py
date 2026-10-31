@@ -1259,9 +1259,19 @@ def execute(config, runner):
                 detail=f"{type(error).__name__}: {error}", output_tail="", duration=0.0))
             print(f"Unexpected error: {type(error).__name__}: {error}", file=sys.stderr)
         finally:
-            for step in cleanup_steps(config, runner.attempted_domains, state):
-                runner.execute(step)
+            try:
+                for step in cleanup_steps(config, runner.attempted_domains, state):
+                    runner.execute(step)
+            except KeyboardInterrupt:
+                interrupted = True
+                print("Cleanup interrupted; remaining run files were kept.", file=sys.stderr)
     finally:
+        if interrupted:
+            runner.results.append(StepResult(
+                id="interrupted", description="Rehearsal interrupted before completion", kind="setup",
+                vm=None, command="", status="failed", returncode=130,
+                detail="Interrupted by user; a complete rehearsal was not recorded.",
+                output_tail="", duration=0.0))
         _, passed = write_reports(config, runner, state)
         counts = _summary(runner.results)
         print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped.")
