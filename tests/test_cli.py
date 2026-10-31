@@ -45,6 +45,10 @@ class CLITests(unittest.TestCase):
         self.addCleanup(environment.stop)
         for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
             os.environ.pop(variable, None)
+        # Running-application checks inspect the real host; tests opt in.
+        guard = patch.object(cli_module(), "assert_applications_closed")
+        self.applications_guard = guard.start()
+        self.addCleanup(guard.stop)
 
     def invoke(self, args):
         out, err = io.StringIO(), io.StringIO()
@@ -120,6 +124,80 @@ class CLITests(unittest.TestCase):
         code, _, err = self.invoke(["verify", "--bundle", str(dest)])
         self.assertEqual(code, 0, err)
 
+    def test_backup_passes_excludes_and_checks_applications_with_secret_scope(self):
+        cli = cli_module()
+        dest = self.root / "backup"
+        displays = self.home / ".config/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
+        displays.parent.mkdir(parents=True)
+        displays.write_text("<monitor/>")
+        (self.home / "Projects/build").mkdir(parents=True)
+        (self.home / "Projects/build/out.o").write_text("object")
+        (self.home / "Projects/main.c").write_text("code")
+        with patch.object(cli, "platform_info", return_value=self.info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli.packages, "collect_packages", return_value=package_fixture()):
+            code, out, err = self.invoke([
+                "backup", "--output", str(dest), "--settings-only", "--include", "Projects",
+                "--exclude", "Projects/build", "--include", ".ssh/config",
+            ])
+        self.assertEqual(code, 0, err)
+        self.assertFalse((dest / "payload/Projects/build").exists())
+        self.assertTrue((dest / "payload/Projects/main.c").exists())
+        self.assertFalse((dest / "payload/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml").exists())
+        self.assertIn("Excluded 1 path matching 'Projects/build'", out)
+        self.applications_guard.assert_called_once_with(secrets=True)
+
+    def test_backup_can_keep_default_excluded_paths(self):
+        cli = cli_module()
+        dest = self.root / "backup"
+        displays = self.home / ".config/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
+        displays.parent.mkdir(parents=True)
+        displays.write_text("<monitor/>")
+        with patch.object(cli, "platform_info", return_value=self.info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli.packages, "collect_packages", return_value=package_fixture()):
+            code, _, err = self.invoke(["backup", "--output", str(dest), "--settings-only",
+                                        "--no-default-excludes"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue((dest / "payload/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml").exists())
+        self.applications_guard.assert_called_once_with(secrets=False)
+
+    def test_running_applications_block_backup_before_writing(self):
+        cli = cli_module()
+        self.applications_guard.side_effect = cli.MigrationError("Close firefox")
+        dest = self.root / "backup"
+        with patch.object(cli, "platform_info", return_value=self.info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli.packages, "collect_packages") as collect:
+            code, _, err = self.invoke(["backup", "--output", str(dest)])
+        self.assertEqual(code, 1)
+        self.assertIn("Close firefox", err)
+        collect.assert_not_called()
+        self.assertFalse(dest.exists())
+
+    def test_restore_apply_checks_applications_and_secret_agents_from_bundle(self):
+        cli = cli_module()
+        from fedora_migration.bundle import create_bundle
+        (self.home / ".ssh").mkdir()
+        (self.home / ".ssh/config").write_text("Host example\n")
+        bundle = self.root / "secret-backup"
+        create_bundle(self.home, bundle, self.info, package_fixture(),
+                      settings_only=True, include_secrets=True)
+        target = self.root / "target-home"
+        target.mkdir()
+        info = dict(self.info, version_id="44", home=str(target))
+        with patch.object(cli, "platform_info", return_value=info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli, "check_selinux_tools", return_value=False):
+            code, _, err = self.invoke(["restore", "--bundle", str(bundle)])
+            self.assertEqual(code, 0, err)
+            self.applications_guard.assert_not_called()
+            code, _, err = self.invoke(["restore", "--bundle", str(bundle), "--apply"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.applications_guard.call_args_list)
+        for call in self.applications_guard.call_args_list:
+            self.assertEqual(call.kwargs, {"secrets": True})
+
     def test_restore_is_preview_by_default_even_with_install_packages(self):
         cli = cli_module()
         bundle = self.backup_fixture()
@@ -170,14 +248,18 @@ class CLITests(unittest.TestCase):
 
         cases = (
             (["restore", "--bundle", str(bundle)], ["verify"]),
+            # Session and application guards run before package installation and
+            # again after the final verification, immediately before writing.
             (["restore", "--bundle", str(bundle), "--apply", "--install-packages"],
-             ["verify", "install", "verify"]),
+             ["verify", "xfce", "apps", "install", "verify", "xfce", "apps"]),
         )
+        self.applications_guard.side_effect = lambda **kwargs: events.append("apps")
         for argv, expected in cases:
             with self.subTest(argv=argv):
                 events.clear()
                 with patch.object(cli, "platform_info", return_value=info), \
-                     patch.object(cli, "assert_xfce_stopped"), \
+                     patch.object(cli, "assert_xfce_stopped",
+                                  side_effect=lambda: events.append("xfce")), \
                      patch.object(cli, "check_selinux_tools", return_value=False), \
                      patch.object(cli.packages, "install_packages",
                                   side_effect=lambda *a, **k: events.append("install")), \
@@ -268,6 +350,67 @@ class CLITests(unittest.TestCase):
         self.assertIn(str(rollback), out + err)
         self.assertEqual((rollback / "previous/.config/xfce4/settings.xml").read_text(), "original")
         self.assertEqual(json.loads((rollback / "journal.json").read_text())["status"], "interrupted")
+
+
+class ApplicationGuardTests(unittest.TestCase):
+    def run_guard(self, *, pgrep, flatpak=None, flatpak_installed=True, secrets=False):
+        cli = cli_module()
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == "pgrep":
+                return subprocess.CompletedProcess(argv, *pgrep)
+            return subprocess.CompletedProcess(argv, *flatpak)
+
+        def fake_which(name):
+            return None if name == "flatpak" and not flatpak_installed else f"/usr/bin/{name}"
+
+        with patch.object(cli.subprocess, "run", side_effect=fake_run), \
+             patch.object(cli.shutil, "which", side_effect=fake_which):
+            try:
+                cli.assert_applications_closed(secrets=secrets)
+            except cli.MigrationError as error:
+                return calls, str(error)
+        return calls, None
+
+    def test_nothing_running_passes(self):
+        calls, error = self.run_guard(pgrep=(1, "", ""), flatpak=(0, "", ""))
+        self.assertIsNone(error)
+        self.assertEqual(calls[0][:4], ["pgrep", "-u", str(os.getuid()), "-x"])
+        self.assertNotIn("gpg-agent", calls[0][-1])
+        self.assertEqual(calls[1], ["flatpak", "ps", "--columns=application"])
+
+    def test_running_browser_or_mail_blocks(self):
+        _, error = self.run_guard(pgrep=(0, "1234 firefox\n2345 thunderbird\n", ""),
+                                  flatpak=(0, "", ""))
+        self.assertIn("firefox", error)
+        self.assertIn("thunderbird", error)
+
+    def test_running_flatpak_application_blocks(self):
+        _, error = self.run_guard(pgrep=(1, "", ""),
+                                  flatpak=(0, "org.mozilla.firefox\norg.mozilla.firefox\n", ""))
+        self.assertIn("org.mozilla.firefox", error)
+        self.assertEqual(error.count("org.mozilla.firefox"), 1)
+
+    def test_secret_agents_checked_only_with_secrets(self):
+        calls, error = self.run_guard(pgrep=(0, "77 gpg-agent\n", ""), flatpak=(0, "", ""),
+                                      secrets=True)
+        self.assertIn("gpg-agent", calls[0][-1])
+        self.assertIn("gnome-keyring-d", calls[0][-1])
+        self.assertIn("gpg-agent", error)
+        self.assertIn("gpgconf --kill all", error)
+
+    def test_missing_flatpak_is_skipped(self):
+        calls, error = self.run_guard(pgrep=(1, "", ""), flatpak_installed=False)
+        self.assertIsNone(error)
+        self.assertEqual(len(calls), 1)
+
+    def test_check_failures_fail_closed(self):
+        _, error = self.run_guard(pgrep=(2, "", "bad pattern"), flatpak=(0, "", ""))
+        self.assertIn("Could not check running applications", error)
+        _, error = self.run_guard(pgrep=(1, "", ""), flatpak=(1, "", "no session bus"))
+        self.assertIn("Could not check running Flatpak applications", error)
 
 
 if __name__ == "__main__":

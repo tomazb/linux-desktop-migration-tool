@@ -1,3 +1,4 @@
+import cProfile
 import errno
 import json
 import os
@@ -634,6 +635,181 @@ class BackslashNameTests(BundleFixture):
                 self.backup(include=["Documents"], settings_only=True)
         self.assertEqual(copied, [])
         self.assertFalse(os.path.lexists(self.bundle))
+
+
+class ExcludeTests(BundleFixture):
+    DISPLAYS = ".config/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
+    PANEL = ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+
+    def populate(self):
+        self.write(self.home / self.DISPLAYS, b"<monitor name='eDP-1'/>")
+        self.write(self.home / self.PANEL, b"<panel/>")
+        self.write(self.home / ".var/app/org.example.App/cache/blob", b"x" * 1024)
+        self.write(self.home / ".var/app/org.example.App/config/settings", b"keep")
+
+    def paths(self, manifest):
+        return {entry["path"] for entry in manifest["entries"]}
+
+    def test_default_excludes_skip_display_layout_and_flatpak_caches(self):
+        self.populate()
+        manifest = self.backup()
+        paths = self.paths(manifest)
+        self.assertNotIn(self.DISPLAYS, paths)
+        self.assertIn(self.PANEL, paths)
+        self.assertFalse(any(path.startswith(".var/app/org.example.App/cache") for path in paths))
+        self.assertIn(".var/app/org.example.App/config/settings", paths)
+        warnings = "\n".join(manifest["warnings"])
+        self.assertIn(f"Excluded 1 path matching '{self.DISPLAYS}' (default", warnings)
+        self.assertIn("Excluded 1 path matching '.var/app/*/cache' (default", warnings)
+        verify_bundle(self.bundle)
+        # The destination keeps its own monitor layout.
+        target_displays = self.write(self.target / self.DISPLAYS, b"<monitor name='HDMI-1'/>")
+        restore_bundle(self.bundle, self.target, dry_run=False)
+        self.assertEqual(target_displays.read_bytes(), b"<monitor name='HDMI-1'/>")
+
+    def test_default_excludes_can_be_disabled(self):
+        self.populate()
+        paths = self.paths(self.backup(default_excludes=False))
+        self.assertIn(self.DISPLAYS, paths)
+        self.assertIn(".var/app/org.example.App/cache/blob", paths)
+
+    def test_user_exclude_overrides_include_and_matches_one_segment(self):
+        self.write(self.home / "Projects/app/src/main.c", b"code")
+        self.write(self.home / "Projects/app/build/out.o", b"object")
+        self.write(self.home / "Projects/app/nested/build/keep.o", b"deeper")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects/*/build"])
+        paths = self.paths(manifest)
+        self.assertIn("Projects/app/src/main.c", paths)
+        self.assertNotIn("Projects/app/build", paths)
+        self.assertNotIn("Projects/app/build/out.o", paths)
+        # "*" matches exactly one path segment.
+        self.assertIn("Projects/app/nested/build/keep.o", paths)
+        self.assertIn("Excluded 1 path matching 'Projects/*/build'",
+                      "\n".join(manifest["warnings"]))
+
+    def test_excluding_a_selected_root_omits_it(self):
+        self.write(self.home / "Projects/notes.txt")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects"])
+        self.assertNotIn("Projects", manifest["selected_paths"])
+        self.assertNotIn("Projects/notes.txt", self.paths(manifest))
+
+    def test_unsafe_exclude_patterns_rejected_before_writing(self):
+        for pattern in ("../outside", "/home/user/x", "", "a//b", "./a"):
+            with self.subTest(pattern=pattern):
+                with self.assertRaisesRegex(BundleError, "Unsafe relative path"):
+                    self.backup(exclude=[pattern])
+                self.assertFalse(os.path.lexists(self.bundle))
+
+
+class BackupHashingTests(BundleFixture):
+    def test_backup_reads_each_copied_file_once_for_its_checksum(self):
+        for index in range(3):
+            self.write(self.home / f".config/xfce4/file{index}", bytes([index]) * 100)
+        calls = []
+        digest = bundle_module._digest
+
+        def counted(path):
+            calls.append(Path(path).name)
+            return digest(path)
+
+        with patch("fedora_migration.bundle._digest", side_effect=counted):
+            manifest = self.backup()
+        # Hashed while copying; only final bundle verification reads files back.
+        self.assertEqual(sorted(calls), ["file0", "file1", "file2"])
+        verify_bundle(self.bundle)
+        recorded = {entry["path"]: entry["sha256"] for entry in manifest["entries"]
+                    if entry["type"] == "file"}
+        for index in range(3):
+            relative = f".config/xfce4/file{index}"
+            self.assertEqual(recorded[relative], digest(self.home / relative))
+
+
+class ExcludeReportingTests(BundleFixture):
+    def warnings(self, manifest):
+        return "\n".join(manifest["warnings"])
+
+    def test_unmatched_user_pattern_is_reported(self):
+        self.write(self.home / "Projects/build/out.o")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects/buid"])
+        self.assertIn("Exclusion 'Projects/buid' matched nothing", self.warnings(manifest))
+        self.assertIn("Projects/build/out.o", {e["path"] for e in manifest["entries"]})
+
+    def test_each_existing_path_counted_once_under_first_matching_pattern(self):
+        self.write(self.home / "Projects/build/out.o")
+        self.write(self.home / "Projects/main.c")
+        manifest = self.backup(include=["Projects", "Projects/build"], settings_only=True,
+                               exclude=["Projects/build", "Projects/*"])
+        text = self.warnings(manifest)
+        self.assertIn("Excluded 1 path matching 'Projects/build'", text)
+        self.assertIn("Excluded 1 path matching 'Projects/*'", text)
+
+    def test_missing_paths_are_not_counted(self):
+        manifest = self.backup(exclude=[".config"])
+        self.assertIn("Exclusion '.config' matched nothing", self.warnings(manifest))
+        self.assertNotIn("Excluded", self.warnings(manifest))
+
+    def test_unmatched_default_patterns_stay_quiet(self):
+        self.write(self.home / ".bashrc")
+        self.assertNotIn("matched nothing", self.warnings(self.backup()))
+
+    def test_many_sibling_exclusions_have_bounded_prefix_work(self):
+        count = 300
+        for index in range(count):
+            self.write(self.home / f"Downloads/{index}.iso", b"")
+        # Measure prefix operations instead of elapsed time so slow CI hosts
+        # do not change the result. An all-pairs scan exceeds this budget.
+        profiler = cProfile.Profile()
+        with profiler:
+            manifest = self.backup(include=["Downloads"], settings_only=True,
+                                   exclude=["Downloads/*.iso"])
+        prefix_calls = sum(entry.callcount for entry in profiler.getstats()
+                           if isinstance(entry.code, str) and "'startswith'" in entry.code)
+        self.assertIn("Excluded 300 paths matching 'Downloads/*.iso'", self.warnings(manifest))
+        self.assertEqual({entry["path"] for entry in manifest["entries"]}, {"Downloads"})
+        self.assertLess(prefix_calls, count * 50)
+
+
+class RestoreWriteHookTests(BundleFixture):
+    def test_before_write_runs_after_verification_and_before_any_change(self):
+        self.write(self.home / ".bashrc", b"new")
+        self.backup()
+        events = []
+        verify = bundle_module.verify_bundle
+
+        def counted(path):
+            events.append("verify")
+            return verify(path)
+
+        def hook():
+            events.append("hook")
+            self.assertEqual(list(self.target.iterdir()), [])
+
+        with patch("fedora_migration.bundle.verify_bundle", side_effect=counted):
+            restore_bundle(self.bundle, self.target, dry_run=False, before_write=hook)
+        self.assertEqual(events, ["verify", "hook"])
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"new")
+
+    def test_failing_hook_prevents_all_writes(self):
+        self.write(self.home / ".bashrc", b"new")
+        self.backup()
+        rollback = self.root / "rollback"
+
+        def refuse():
+            raise RuntimeError("firefox started")
+
+        with self.assertRaisesRegex(RuntimeError, "firefox started"):
+            restore_bundle(self.bundle, self.target, dry_run=False,
+                           backup_dir=rollback, before_write=refuse)
+        self.assertEqual(list(self.target.iterdir()), [])
+        self.assertFalse(os.path.lexists(rollback))
+
+    def test_preview_never_calls_hook(self):
+        self.write(self.home / ".bashrc")
+        self.backup()
+        restore_bundle(self.bundle, self.target, before_write=self.fail)
 
 
 if __name__ == "__main__":

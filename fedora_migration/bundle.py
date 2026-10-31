@@ -7,6 +7,7 @@ an attacker. Symlinks are copied as links and are never traversed.
 
 import contextlib
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 import functools
 import hashlib
 import json
@@ -45,6 +46,42 @@ PROFILE_DATA = (".mozilla", ".thunderbird", ".var/app")
 SECRETS = (
     ".ssh", ".gnupg", ".pki", ".local/share/keyrings", ".config/goa-1.0",
 )
+# Hardware-bound or disposable data that a fresh installation should not inherit:
+# the XFCE monitor layout names the source machine's outputs, and Flatpak app
+# caches can be large and are rebuilt on demand.
+DEFAULT_EXCLUDES = (
+    ".config/xfce4/xfconf/xfce-perchannel-xml/displays.xml",
+    ".var/app/*/cache",
+)
+
+
+def _within_secret(relative):
+    return any(relative == secret or relative.startswith(secret + "/") for secret in SECRETS)
+
+
+def selects_secrets(include=(), include_secrets=False):
+    """Whether a backup selection opts in to any known secret tree."""
+    return include_secrets or any(_within_secret(os.fspath(value)) for value in include)
+
+
+def manifest_has_secrets(manifest):
+    """Whether a verified manifest contains files from a known secret tree."""
+    return any(_within_secret(entry["path"]) for entry in manifest["entries"])
+
+
+def _exclusion(patterns, relative):
+    """Return the first pattern matching relative or one of its ancestors.
+
+    Patterns are home-relative; each segment is matched separately, so "*"
+    never crosses a "/".
+    """
+    parts = relative.split("/")
+    for pattern in patterns:
+        segments = pattern.split("/")
+        if len(segments) <= len(parts) and all(
+                fnmatchcase(part, segment) for part, segment in zip(parts, segments)):
+            return pattern
+    return None
 
 # A deliberately bounded, portable nanosecond range for schema 1. Validate this
 # before any destination changes rather than discovering an overflow in utime.
@@ -148,12 +185,28 @@ def _digest(path):
     return digest.hexdigest()
 
 
+class _HashingReader:
+    """Hash bytes as they are read, so a copy needs no second read for its checksum."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.digest = hashlib.sha256()
+
+    def read(self, size=-1):
+        block = self._stream.read(size)
+        self.digest.update(block)
+        return block
+
+    def fileno(self):
+        return self._stream.fileno()
+
+
 def _copy_regular(source, destination, expected=None, *, preserve_metadata=True):
     """Copy an opened regular file; reject replacement or mutation during copy.
 
-    The new destination is private (0600) from creation, whatever the umask.
-    With preserve_metadata=False it stays private so the caller can validate it
-    before applying the intended mode and timestamps itself.
+    Returns the SHA-256 of the bytes read. The new destination is private
+    (0600) from creation. With preserve_metadata=False it stays private so the
+    caller can validate it before applying the intended mode and timestamps.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(source, flags)
@@ -165,8 +218,9 @@ def _copy_regular(source, destination, expected=None, *, preserve_metadata=True)
             raise BundleError(f"Source changed before copying: {source}")
         out_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                      | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        hashing = _HashingReader(reader)
         with os.fdopen(os.open(destination, out_flags, 0o600), "wb") as writer:
-            shutil.copyfileobj(reader, writer, 1024 * 1024)
+            shutil.copyfileobj(hashing, writer, 1024 * 1024)
             writer.flush()
             # Apply metadata before fsync so content and metadata are durable together.
             if preserve_metadata:
@@ -178,7 +232,7 @@ def _copy_regular(source, destination, expected=None, *, preserve_metadata=True)
         if (_fingerprint(before) != _fingerprint(after)
                 or _fingerprint(before) != _fingerprint(current)):
             raise BundleError(f"Source changed while copying: {source}")
-    return before
+    return hashing.digest.hexdigest()
 
 
 def _fsync_directory(path):
@@ -301,7 +355,8 @@ def _write_json(path, data):
 
 @_owner_accessible
 def create_bundle(home, output, source, packages, *, include=(),
-                  include_secrets=False, settings_only=False):
+                  include_secrets=False, settings_only=False, exclude=(),
+                  default_excludes=True):
     """Create a new private bundle outside HOME, publishing only on success."""
     home, output = _absolute(home), _absolute(output)
     stage = None
@@ -325,6 +380,19 @@ def create_bundle(home, output, source, packages, *, include=(),
             paths.extend(SECRETS)
         explicit = tuple(_safe_path(os.fspath(value)) for value in include)
         paths.extend(explicit)
+        user_excludes = tuple(_safe_path(os.fspath(value)) for value in exclude)
+        defaults = DEFAULT_EXCLUDES if default_excludes else ()
+        excludes = tuple(dict.fromkeys(user_excludes + defaults))
+        # Existing paths left out, recorded under the first pattern that matches.
+        excluded = {pattern: set() for pattern in excludes}
+
+        def is_excluded(relative):
+            pattern = _exclusion(excludes, relative)
+            if pattern is None:
+                return False
+            if os.path.lexists(home / relative):
+                excluded[pattern].add(relative)
+            return True
 
         def secret_excluded(relative):
             for secret in SECRETS:
@@ -342,7 +410,7 @@ def create_bundle(home, output, source, packages, *, include=(),
 
         selected = []
         for relative in sorted(set(paths)):
-            if secret_excluded(relative):
+            if secret_excluded(relative) or is_excluded(relative):
                 continue
             path = home / relative
             _assert_no_symlink_ancestors(path)
@@ -359,7 +427,7 @@ def create_bundle(home, output, source, packages, *, include=(),
         entries = {}
 
         def copy_entry(relative, recurse=True):
-            if relative in entries or secret_excluded(relative):
+            if relative in entries or secret_excluded(relative) or is_excluded(relative):
                 return
             # Fail at the offending name, not after copying everything else.
             _safe_path(relative)
@@ -390,12 +458,29 @@ def create_bundle(home, output, source, packages, *, include=(),
                 os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns),
                          follow_symlinks=False)
             else:
-                _copy_regular(source_path, destination, info)
-                entry.update(size=info.st_size, sha256=_digest(destination))
+                checksum = _copy_regular(source_path, destination, info)
+                entry.update(size=info.st_size, sha256=checksum)
                 entries[relative] = entry
 
         for relative in selected:
             copy_entry(relative)
+        for pattern in excludes:
+            paths_left_out = excluded[pattern]
+            # Count each excluded tree once, not also its separately listed members.
+            count = 0
+            for path in paths_left_out:
+                parent = path.rpartition("/")[0]
+                while parent and parent not in paths_left_out:
+                    parent = parent.rpartition("/")[0]
+                if not parent:
+                    count += 1
+            if count:
+                note = (" (default; use --no-default-excludes to include)"
+                        if pattern in defaults and pattern not in user_excludes else "")
+                warnings.append(f"Excluded {count} path{'s' if count != 1 else ''} "
+                                f"matching {pattern!r}{note}")
+            elif pattern in user_excludes:
+                warnings.append(f"Exclusion {pattern!r} matched nothing; check the path")
         # Apply directory times after copying children. Keep owner access during
         # assembly and verification; source directory modes live in the manifest.
         manifest = {
@@ -595,8 +680,12 @@ def plan_restore(bundle, home, manifest, *, backup_dir=None):
 
 
 @_owner_accessible
-def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
-    """Preview or overlay a validated bundle, retaining originals and a journal."""
+def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=None):
+    """Preview or overlay a validated bundle, retaining originals and a journal.
+
+    before_write, if given, runs after verification and destination checks and
+    immediately before the first change; an exception from it prevents all writes.
+    """
     bundle, home = _absolute(bundle), _absolute(home)
     rollback = None
     staging = None
@@ -607,6 +696,8 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None):
         summary, candidate = _plan(bundle, home, manifest, backup_dir)
         if dry_run:
             return summary
+        if before_write is not None:
+            before_write()
         directories = sorted((e for e in entries if e["type"] == "directory"),
                              key=lambda e: (e["path"].count("/"), e["path"]))
         planned_replaced = {
