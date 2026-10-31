@@ -11,7 +11,6 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-import tomllib
 
 
 class PackageError(RuntimeError):
@@ -375,8 +374,11 @@ def _collect_repos(warnings):
     """Enabled repositories as descriptive records; failures only produce warnings."""
     try:
         output = _run(["dnf5", "repo", "info", "--enabled", "--json"])
-    except (PackageError, FileNotFoundError) as exc:
-        warnings.append(f"Could not read enabled DNF repositories, so none were recorded: {_oneline(exc)}")
+    except (PackageError, FileNotFoundError):
+        # Package-manager diagnostics can contain authenticated URLs or tokens.
+        # Keep them out of the portable manifest and its later summaries.
+        warnings.append("Could not read enabled DNF repositories, so none were recorded. "
+                        "Review repository configuration separately.")
         return []
     try:
         items = json.loads(output)
@@ -406,7 +408,11 @@ def _collect_repos(warnings):
 
 
 def _state_table(path, table):
-    """The `table` mapping of a DNF5 state file, or raise ValueError/OSError."""
+    """The `table` mapping of a DNF5 state file, or raise ImportError/ValueError/OSError."""
+    # Python 3.11 added tomllib. Offline verification and the rest of the tool
+    # also work without it; this optional backup inventory is its only consumer.
+    import tomllib
+
     if path.stat().st_size > _MAX_STATE_BYTES:
         raise ValueError("file is unexpectedly large")
     with open(path, "rb") as stream:
@@ -447,6 +453,10 @@ def _environment_records(section):
 def _collect_state(path, table, build, warnings):
     try:
         return build(_state_table(path, table))
+    except ModuleNotFoundError:
+        warnings.append(f"Could not read DNF {table}: Python TOML support is unavailable, "
+                        "so none were recorded.")
+        return []
     # TOMLDecodeError and UnicodeDecodeError are ValueErrors; deeply nested
     # input exhausts the parser's recursion.
     except (OSError, ValueError, RecursionError) as exc:
