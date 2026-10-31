@@ -1,3 +1,4 @@
+import cProfile
 import errno
 import json
 import os
@@ -753,6 +754,22 @@ class ExcludeReportingTests(BundleFixture):
     def test_unmatched_default_patterns_stay_quiet(self):
         self.write(self.home / ".bashrc")
         self.assertNotIn("matched nothing", self.warnings(self.backup()))
+
+    def test_many_sibling_exclusions_have_bounded_prefix_work(self):
+        count = 300
+        for index in range(count):
+            self.write(self.home / f"Downloads/{index}.iso", b"")
+        # Measure prefix operations instead of elapsed time so slow CI hosts
+        # do not change the result. An all-pairs scan exceeds this budget.
+        profiler = cProfile.Profile()
+        with profiler:
+            manifest = self.backup(include=["Downloads"], settings_only=True,
+                                   exclude=["Downloads/*.iso"])
+        prefix_calls = sum(entry.callcount for entry in profiler.getstats()
+                           if isinstance(entry.code, str) and "'startswith'" in entry.code)
+        self.assertIn("Excluded 300 paths matching 'Downloads/*.iso'", self.warnings(manifest))
+        self.assertEqual({entry["path"] for entry in manifest["entries"]}, {"Downloads"})
+        self.assertLess(prefix_calls, count * 50)
 
 
 class RestoreWriteHookTests(BundleFixture):
