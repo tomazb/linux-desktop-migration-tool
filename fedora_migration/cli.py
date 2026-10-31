@@ -6,6 +6,7 @@ import getpass
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -48,21 +49,72 @@ def platform_info():
     }
 
 
-def require_platform(info, version):
+MIN_RELEASE = 43
+TESTED_PAIR = (43, 44)
+MAX_UPGRADE = 2  # releases; Fedora supports upgrading across at most two
+
+
+def parse_release(version_id):
+    """A Fedora VERSION_ID as an int, or None unless it is a plain decimal integer."""
+    if isinstance(version_id, str) and re.fullmatch(r"[1-9][0-9]{0,3}", version_id):
+        return int(version_id)
+    return None
+
+
+def platform_release(info):
+    """The running Fedora release (>= MIN_RELEASE); refuse anything else."""
+    release = parse_release(info.get("version_id")) if info.get("id") == "fedora" else None
+    if release is None or release < MIN_RELEASE:
+        raise MigrationError(
+            f"This command requires Fedora {MIN_RELEASE} or newer; found "
+            f"{info.get('pretty_name', info.get('id'))} (release {info.get('version_id')}). "
+            "The verify command can run on other systems."
+        )
+    return release
+
+
+def source_release(source):
+    """The Fedora release a bundle was made on, from its source metadata."""
+    release = parse_release(source.get("version_id")) if source.get("id") == "fedora" else None
+    if release is None:
+        raise MigrationError(
+            "This workflow expects a backup made on Fedora with a numeric release; the "
+            f"bundle's source is {source.get('id')} release {source.get('version_id')}.")
+    return release
+
+
+def restore_release_note(source, destination):
+    """Check a source -> destination pair; return a note unless it is the tested pair.
+
+    Restoring on the same release or up to MAX_UPGRADE releases later is allowed.
+    """
+    if destination < source:
+        raise MigrationError(
+            f"Cannot restore a Fedora {source} backup on Fedora {destination}: downgrades "
+            f"are not supported. Restore on Fedora {source} to {source + MAX_UPGRADE}.")
+    if destination > source + MAX_UPGRADE:
+        raise MigrationError(
+            f"Cannot restore a Fedora {source} backup on Fedora {destination}: that is more "
+            f"than two releases apart, beyond Fedora's supported upgrade path. Restore on "
+            f"Fedora {source} to {source + MAX_UPGRADE}, or make a new backup on a closer release.")
+    if (source, destination) == TESTED_PAIR:
+        return None
+    return (f"Fedora {source} → {destination} has not been tested with this tool; "
+            "review the preview carefully.")
+
+
+def require_platform(info):
+    """Refuse root, unsupported releases and an unusable home; return the release."""
     if info["uid"] == 0:
         raise MigrationError(
             "Run this command as your normal desktop user, without sudo. "
             "Package installation requests sudo separately when needed."
         )
-    if info["id"] != "fedora" or info["version_id"] != version:
-        raise MigrationError(
-            f"This command requires Fedora {version}; found "
-            f"{info.get('pretty_name', info['id'])} (release {info['version_id']}). "
-            "The verify command can run on other systems."
-        )
+    release = platform_release(info)
     home = Path(info["home"])
     if not home.is_dir() or home == Path("/"):
         raise MigrationError("The current user's home must be an existing directory other than /.")
+    return release
 
 
 def assert_xfce_stopped():
@@ -170,7 +222,7 @@ def validate_manifest_metadata(manifest):
         raise MigrationError("Invalid source metadata: uid")
     if not Path(source["home"]).is_absolute() or ".." in Path(source["home"]).parts:
         raise MigrationError("Invalid source metadata: home must be an absolute path.")
-    packages.validate_package_manifest(manifest.get("packages"))
+    packages.validate_package_manifest(manifest.get("packages"), manifest["schema_version"])
 
 
 def print_warnings(warnings):
@@ -255,7 +307,7 @@ def print_destination_checks(source_path, manifest, home, plan, *, rewrite, appl
 
 def backup_command(args):
     info = platform_info()
-    require_platform(info, "43")
+    require_platform(info)
     assert_xfce_stopped()
     assert_applications_closed(
         secrets=bundle.selects_secrets(args.include, args.include_secrets))
@@ -294,13 +346,14 @@ def verify_command(args):
 
 def restore_command(args):
     info = platform_info()
-    require_platform(info, "44")
+    destination = require_platform(info)
     source_path = args.bundle.expanduser()
     manifest = bundle.verify_bundle(source_path)
     validate_manifest_metadata(manifest)
     source = manifest["source"]
-    if source["id"] != "fedora" or source["version_id"] != "43":
-        raise MigrationError("This workflow expects a backup made on Fedora 43.")
+    note = restore_release_note(source_release(source), destination)
+    if note:
+        print(f"Note: {note}")
     if source["architecture"] != info["architecture"]:
         if args.install_packages:
             raise MigrationError(
@@ -329,8 +382,9 @@ def restore_command(args):
     if args.install_packages:
         commands = packages.package_commands(
             manifest["packages"], skip_rpm=args.skip_rpm, skip_flatpak=args.skip_flatpak,
+            schema_version=manifest["schema_version"],
         )
-        print("Package commands (repositories must already be configured for Fedora 44):")
+        print(f"Package commands (repositories must already be configured for Fedora {destination}):")
         for command in commands:
             print("  " + shlex.join(command))
         if not commands:
@@ -349,6 +403,7 @@ def restore_command(args):
         print("Installing requested packages with their normal confirmation prompts...", flush=True)
         packages.install_packages(
             manifest["packages"], skip_rpm=args.skip_rpm, skip_flatpak=args.skip_flatpak,
+            schema_version=manifest["schema_version"],
         )
     def recheck_before_writing():
         # Package installs and re-verifying a large bundle take time: recheck
@@ -432,7 +487,7 @@ def print_rollback_plan(plan, *, apply):
 
 def rollback_command(args):
     info = platform_info()
-    require_platform(info, "44")
+    require_platform(info)
     home = Path(info["home"])
     rollback_dir = args.rollback_dir.expanduser()
     source = args.bundle.expanduser() if args.bundle else None
@@ -481,11 +536,11 @@ def rollback_command(args):
 
 def parser():
     result = argparse.ArgumentParser(
-        description="Portable Fedora XFCE 43 → 44 backup, restore and rollback. Restore and rollback preview by default.",
+        description="Portable Fedora XFCE backup, restore and rollback, built and tested for 43 → 44. Restore and rollback preview by default.",
     )
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subcommands = result.add_subparsers(dest="command", required=True)
-    backup = subcommands.add_parser("backup", help="Create a new portable bundle on Fedora 43")
+    backup = subcommands.add_parser("backup", help="Create a new portable bundle on the source Fedora system")
     backup.add_argument("--output", type=Path, required=True, help="New directory outside HOME, ideally on external storage")
     backup.add_argument("--include", action="append", default=[], metavar="RELATIVE_PATH", help="Additional home-relative file/directory (repeatable)")
     backup.add_argument("--exclude", action="append", default=[], metavar="PATTERN", help="Home-relative path or glob to leave out, e.g. 'Downloads/*.iso' (repeatable; * matches one path segment)")
@@ -498,7 +553,7 @@ def parser():
     verify = subcommands.add_parser("verify", help="Check a complete bundle without changing the system")
     verify.add_argument("--bundle", type=Path, required=True)
     verify.set_defaults(handler=verify_command)
-    restore = subcommands.add_parser("restore", help="Preview or apply a backup on Fedora 44")
+    restore = subcommands.add_parser("restore", help="Preview or apply a backup on the destination Fedora system")
     restore.add_argument("--bundle", type=Path, required=True)
     restore.add_argument("--apply", action="store_true", help="Perform the restore; otherwise show a read-only preview")
     restore.add_argument("--install-packages", action="store_true", help="Also reinstall recorded RPMs and Flatpaks, retaining manager confirmations")

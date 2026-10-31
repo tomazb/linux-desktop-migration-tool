@@ -34,6 +34,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Preserved this fork's previous shell fixes instead of replacing its script
   wholesale. Legacy live Fedora XFCE 43/44 migration remains unverified.
 
+### Changed (schema 2 and releases)
+
+- Backups now use manifest schema 2 and record the writing tool's version
+  (`__version__`, now 1.1.0) instead of a hard-coded `"1.0"`. Schema 1 bundles
+  made by earlier versions still verify, preview and restore; `tool_version` is
+  informational for both schemas (a non-empty string without control characters).
+  A bundle with a higher schema is refused with a message to update the tool. A
+  frozen schema 1 bundle under `tests/fixtures/bundle-v1` guards compatibility.
+- Package manifest validation is per schema version (`PACKAGE_KEYS`); each
+  version keeps its exact-key checks, so a later schema can add keys safely.
+- Backup runs on any Fedora release 43 or newer. Restore and rollback require a
+  destination release 43 or newer; restore also requires a Fedora bundle whose
+  release is the same as, or up to two releases older than, the destination.
+  Downgrades, larger jumps and non-numeric releases are refused. Pairs other than
+  the CI-tested 43 → 44 print an "untested pair" note.
+- Help text and the package-command preview name the actual release instead of
+  assuming Fedora 43 and 44.
+
 ### Added (rollback)
 
 - `rollback --rollback-dir DIR` previews, and with `--apply` performs, an undo of a

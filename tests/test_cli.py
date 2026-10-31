@@ -690,11 +690,11 @@ class CLITests(unittest.TestCase):
         self.assertNotIn("cannot verify", out.lower())
         self.assertIn("PUT_BACK: 1", out)
 
-    def test_rollback_requires_fedora_44_and_a_journal(self):
+    def test_rollback_requires_a_supported_fedora_and_a_journal(self):
         bundle, target, rollback, info = self.rollback_fixture()
-        code, _, err = self.rollback(dict(info, version_id="43"), "--rollback-dir", str(rollback))
+        code, _, err = self.rollback(dict(info, version_id="42"), "--rollback-dir", str(rollback))
         self.assertEqual(code, 1)
-        self.assertIn("Fedora 44", err)
+        self.assertIn("Fedora 43 or newer", err)
         code, _, err = self.rollback(info, "--rollback-dir", str(self.root / "missing"))
         self.assertEqual(code, 1)
 
