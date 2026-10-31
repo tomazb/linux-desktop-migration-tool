@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -378,6 +379,125 @@ class ReviewFindingTests(BundleFixture):
                 ("Documents/notes.desktop", False)):
             with self.subTest(relative=relative):
                 self.assertEqual(report.is_rewrite_candidate(relative), expected)
+
+
+class AutostartOverlayTests(BundleFixture):
+    def setUp(self):
+        super().setUp()
+        self.bin = self.target / ".local/bin"
+        environment = patch.dict(os.environ, {"PATH": str(self.bin)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def check(self, program):
+        self.write(self.home / ".config/autostart/tool.desktop",
+                   f"[Desktop Entry]\nExec={program}\n".encode())
+        self.backup(settings_only=True)
+        return report.check_autostart(self.bundle, verify_bundle(self.bundle), self.target)
+
+    def test_replaced_executable_uses_the_bundled_nonexecutable_mode(self):
+        self.write(self.bin / "tool", b"#!/bin/sh\n", 0o755)
+        self.write(self.home / ".local/bin/tool", b"data", 0o600)
+        self.assertEqual(self.check(str(self.bin / "tool"))["missing"],
+                         [(".config/autostart/tool.desktop", str(self.bin / "tool"))])
+
+    def test_path_command_uses_bundled_executable_before_it_exists(self):
+        self.write(self.home / ".local/bin/tool", b"#!/bin/sh\n", 0o755)
+        self.assertEqual(self.check("tool"), {"missing": [], "warnings": []})
+
+    def test_path_command_does_not_use_an_executable_that_will_be_replaced(self):
+        self.write(self.bin / "tool", b"#!/bin/sh\n", 0o755)
+        self.write(self.home / ".local/bin/tool", b"data", 0o600)
+        self.assertEqual(self.check("tool")["missing"],
+                         [(".config/autostart/tool.desktop", "tool")])
+
+    def test_bundled_symlink_resolves_to_the_bundled_executable(self):
+        self.write(self.home / ".local/bin/tool", b"#!/bin/sh\n", 0o755)
+        (self.home / ".local/bin/alias").symlink_to("tool")
+        self.assertEqual(self.check(str(self.bin / "alias")),
+                         {"missing": [], "warnings": []})
+
+    def test_path_command_resolves_a_bundled_symlink(self):
+        self.write(self.home / ".local/bin/tool", b"#!/bin/sh\n", 0o755)
+        (self.home / ".local/bin/alias").symlink_to("tool")
+        self.assertEqual(self.check("alias"), {"missing": [], "warnings": []})
+
+    def test_existing_executable_replaced_by_a_dangling_symlink_is_missing(self):
+        self.write(self.bin / "tool", b"#!/bin/sh\n", 0o755)
+        source_bin = self.home / ".local/bin"
+        source_bin.mkdir(parents=True)
+        (source_bin / "tool").symlink_to("missing")
+        self.assertEqual(self.check(str(self.bin / "tool"))["missing"],
+                         [(".config/autostart/tool.desktop", str(self.bin / "tool"))])
+
+    def test_existing_symlink_uses_the_overwritten_targets_final_mode(self):
+        self.write(self.bin / "tool", b"#!/bin/sh\n", 0o755)
+        (self.bin / "alias").symlink_to("tool")
+        self.write(self.home / ".local/bin/tool", b"data", 0o600)
+        self.assertEqual(self.check(str(self.bin / "alias"))["missing"],
+                         [(".config/autostart/tool.desktop", str(self.bin / "alias"))])
+
+    def test_restored_program_requires_owner_execute_permission(self):
+        self.write(self.home / ".local/bin/tool", b"#!/bin/sh\n", 0o610)
+        self.assertEqual(self.check(str(self.bin / "tool"))["missing"],
+                         [(".config/autostart/tool.desktop", str(self.bin / "tool"))])
+
+    def test_symlink_loop_is_reported_without_following_forever(self):
+        source_bin = self.home / ".local/bin"
+        source_bin.mkdir(parents=True)
+        (source_bin / "tool").symlink_to("alias")
+        (source_bin / "alias").symlink_to("tool")
+        self.assertEqual(self.check("tool")["missing"],
+                         [(".config/autostart/tool.desktop", "tool")])
+
+    def test_path_search_keeps_a_later_existing_executable(self):
+        fallback = self.root / "fallback"
+        self.write(fallback / "tool", b"#!/bin/sh\n", 0o755)
+        self.write(self.home / ".local/bin/tool", b"data", 0o600)
+        with patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + str(fallback)}):
+            self.assertEqual(self.check("tool"), {"missing": [], "warnings": []})
+
+    def test_embedded_null_command_is_diagnostic_instead_of_aborting_preview(self):
+        try:
+            result = self.check("/invalid\0program")
+        except ValueError as error:
+            self.fail(f"Malformed desktop command aborted the preview: {error}")
+        self.assertEqual(result["missing"], [])
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("unparseable Exec", result["warnings"][0])
+
+
+class EnvWrapperDiagnosticTests(BundleFixture):
+    def test_split_string_wrappers_report_that_they_cannot_be_checked(self):
+        for command in ('env -S "ghost-program --flag"',
+                        'env --split-string "ghost-program --flag"',
+                        'env --split-string="ghost-program --flag"',
+                        'env -Sghost-program', 'env -iSghost-program'):
+            with self.subTest(command=command):
+                self.write(self.home / ".config/autostart/tool.desktop",
+                           f"[Desktop Entry]\nExec={command}\n".encode())
+                if self.bundle.exists():
+                    shutil.rmtree(self.bundle)
+                self.backup(settings_only=True)
+                result = report.check_autostart(self.bundle, verify_bundle(self.bundle), self.target)
+                self.assertEqual(result["missing"], [])
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertIn("unparseable Exec", result["warnings"][0])
+
+    def test_missing_env_option_arguments_and_unknown_options_are_diagnostic(self):
+        for command in ("env -u", "env --unset", "env -C", "env --chdir", "env -S",
+                        "env -u ''", "env --unset=", "env -C ''", "env --chdir=",
+                        "env --review-unknown ghost-program"):
+            with self.subTest(command=command):
+                self.write(self.home / ".config/autostart/tool.desktop",
+                           f"[Desktop Entry]\nExec={command}\n".encode())
+                if self.bundle.exists():
+                    shutil.rmtree(self.bundle)
+                self.backup(settings_only=True)
+                result = report.check_autostart(self.bundle, verify_bundle(self.bundle), self.target)
+                self.assertEqual(result["missing"], [])
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertIn("unparseable Exec", result["warnings"][0])
 
 
 if __name__ == "__main__":
