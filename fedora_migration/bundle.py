@@ -467,8 +467,13 @@ def create_bundle(home, output, source, packages, *, include=(),
         for pattern in excludes:
             paths_left_out = excluded[pattern]
             # Count each excluded tree once, not also its separately listed members.
-            count = sum(not any(path.startswith(other + "/") for other in paths_left_out)
-                        for path in paths_left_out)
+            count = 0
+            for path in paths_left_out:
+                parent = path.rpartition("/")[0]
+                while parent and parent not in paths_left_out:
+                    parent = parent.rpartition("/")[0]
+                if not parent:
+                    count += 1
             if count:
                 note = (" (default; use --no-default-excludes to include)"
                         if pattern in defaults and pattern not in user_excludes else "")
