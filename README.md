@@ -127,6 +127,12 @@ touched. Each file is rewritten only after its checksum has been validated, and 
 overwritten originals still go to the rollback directory. Without the option nothing
 is rewritten.
 
+Because rewriting uses the same literal bytes in XML, launchers, shell-style
+settings and URIs, differing source and destination home paths must contain only
+ASCII letters, digits, `/`, `.`, `_` and `-`. Other home names require restoring
+without `--rewrite-home` and editing the paths manually. This check runs before
+package installation or file changes; a same-home rewrite remains a no-op.
+
 Log in to XFCE and inspect the panel, shortcuts, display layout and key apps.
 Keep both the source backup and rollback files until the desktop is checked.
 

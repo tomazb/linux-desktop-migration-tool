@@ -1,3 +1,4 @@
+import cProfile
 import errno
 import json
 import os
@@ -754,6 +755,22 @@ class ExcludeReportingTests(BundleFixture):
         self.write(self.home / ".bashrc")
         self.assertNotIn("matched nothing", self.warnings(self.backup()))
 
+    def test_many_sibling_exclusions_have_bounded_prefix_work(self):
+        count = 300
+        for index in range(count):
+            self.write(self.home / f"Downloads/{index}.iso", b"")
+        # Measure prefix operations instead of elapsed time so slow CI hosts
+        # do not change the result. An all-pairs scan exceeds this budget.
+        profiler = cProfile.Profile()
+        with profiler:
+            manifest = self.backup(include=["Downloads"], settings_only=True,
+                                   exclude=["Downloads/*.iso"])
+        prefix_calls = sum(entry.callcount for entry in profiler.getstats()
+                           if isinstance(entry.code, str) and "'startswith'" in entry.code)
+        self.assertIn("Excluded 300 paths matching 'Downloads/*.iso'", self.warnings(manifest))
+        self.assertEqual({entry["path"] for entry in manifest["entries"]}, {"Downloads"})
+        self.assertLess(prefix_calls, count * 50)
+
 
 class RestoreWriteHookTests(BundleFixture):
     def test_before_write_runs_after_verification_and_before_any_change(self):
@@ -961,6 +978,55 @@ class RewriteHomeRestoreTests(BundleFixture):
             restore_bundle(self.bundle, self.target, dry_run=False,
                            rewrite_home=("home/alice", NEW_HOME))
         self.assertEqual(list(self.target.iterdir()), [])
+
+
+class RewriteHomeSafetyTests(BundleFixture):
+    XML_PATH = ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+    XML = b'<channel><property value="/home/alice/Pictures/a.png"/></channel>'
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.home / self.XML_PATH, self.XML)
+        self.backup(settings_only=True)
+
+    def test_unsafe_destination_home_refuses_before_replacing_valid_xml(self):
+        for character in ('&', '"', "'", ' ', '\t', '\n', '\\', '$', '`', '%',
+                          ';', '<', '>', '\u00e9'):
+            with self.subTest(character=character):
+                target = self.root / f"target{character}home"
+                target.mkdir()
+                original = self.write(target / self.XML_PATH, b"destination original")
+                rollback = target / "recovery"
+                with self.assertRaisesRegex(BundleError, "rewrite-home.*ASCII"):
+                    restore_bundle(self.bundle, target, dry_run=False,
+                                   backup_dir=rollback,
+                                   rewrite_home=(OLD_HOME, str(target)))
+                self.assertEqual(original.read_bytes(), b"destination original")
+                self.assertFalse(rollback.exists())
+
+    def test_unsafe_source_home_is_also_refused(self):
+        with self.assertRaisesRegex(BundleError, "rewrite-home.*ASCII"):
+            restore_bundle(self.bundle, self.target, dry_run=False,
+                           rewrite_home=("/home/alice&bob", str(self.target)))
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_preview_refuses_unsafe_rewriting_without_creating_anything(self):
+        with self.assertRaisesRegex(BundleError, "rewrite-home.*ASCII"):
+            restore_bundle(self.bundle, self.target,
+                           rewrite_home=(OLD_HOME, "/home/bob name"))
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_unsafe_home_still_allows_restore_without_rewriting(self):
+        target = self.root / "target&home"
+        target.mkdir()
+        restore_bundle(self.bundle, target, dry_run=False)
+        self.assertEqual((target / self.XML_PATH).read_bytes(), self.XML)
+
+    def test_same_unsafe_home_is_a_noop(self):
+        summary = restore_bundle(self.bundle, self.target, dry_run=False,
+                                 rewrite_home=("/home/alice&bob", "/home/alice&bob"))
+        self.assertEqual(summary["rewritten_count"], 0)
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), self.XML)
 
 
 if __name__ == "__main__":

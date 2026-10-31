@@ -304,6 +304,36 @@ class CLITests(unittest.TestCase):
         self.assertEqual((target / ".bashrc").read_text(), f"export P={self.home}/bin\n")
         self.assertIn("Rewrote the old home path in 1 file", out)
 
+    def test_unsafe_rewrite_home_refuses_before_package_installation_or_restore(self):
+        cli = cli_module()
+        bundle, target, info = self.references_fixture()
+        unsafe_target = self.root / "target&home"
+        target.rename(unsafe_target)
+        info["home"] = str(unsafe_target)
+        installed = self.root / "packages-were-installed"
+
+        def install(*_args, **_kwargs):
+            installed.write_text("package side effect")
+
+        with patch.object(cli.packages, "install_packages", side_effect=install):
+            code, _, err = self.restore(info, "--bundle", str(bundle), "--apply",
+                                        "--install-packages", "--rewrite-home")
+        self.assertEqual(code, 1)
+        self.assertIn("rewrite-home", err)
+        self.assertIn("ASCII", err)
+        self.assertFalse(installed.exists())
+        self.assertEqual(list(unsafe_target.iterdir()), [])
+
+    def test_preview_rejects_unsafe_rewrite_home_without_writes(self):
+        bundle, target, info = self.references_fixture()
+        unsafe_target = self.root / "target home"
+        target.rename(unsafe_target)
+        info["home"] = str(unsafe_target)
+        code, _, err = self.restore(info, "--bundle", str(bundle), "--rewrite-home")
+        self.assertEqual(code, 1)
+        self.assertIn("rewrite-home", err)
+        self.assertEqual(list(unsafe_target.iterdir()), [])
+
     def test_old_source_home_note_is_not_duplicated(self):
         cli = cli_module()
         bundle = self.backup_fixture()
