@@ -973,6 +973,62 @@ class ExecuteFlowTests(unittest.TestCase):
         self.assertFalse(data["passed"])
         self.assertIn("**FAILED**", markdown)
 
+    def test_interruption_while_writing_markdown_republishes_failed_reports(self):
+        original_write = Path.write_text
+        interrupted = False
+
+        def write(path, *args, **kwargs):
+            nonlocal interrupted
+            if path.suffix == ".md" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_write(path, *args, **kwargs)
+
+        self.check_interrupted_report(patch.object(Path, "write_text", write))
+
+    def test_interruption_while_rendering_republishes_failed_reports(self):
+        original_render = rehearsal.render_report_json
+        interrupted = False
+
+        def render(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_render(*args, **kwargs)
+
+        self.check_interrupted_report(patch.object(rehearsal, "render_report_json", render))
+
+    def test_interruption_while_publishing_json_republishes_failed_reports(self):
+        original_replace = rehearsal.os.replace
+        interrupted = False
+
+        def replace(source, destination, *args, **kwargs):
+            nonlocal interrupted
+            if Path(destination).name == "report.json" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_replace(source, destination, *args, **kwargs)
+
+        self.check_interrupted_report(patch.object(rehearsal.os, "replace", replace))
+
+    def check_interrupted_report(self, interrupt_patch):
+        def prepared(steps, runner):
+            runner.execute(steps[0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                code, _, _ = self.run_main(tmp, patches=(
+                    patch.object(rehearsal, "run_plan", prepared), interrupt_patch))
+            except KeyboardInterrupt:
+                self.fail("Report interruption escaped without returning exit 130")
+            data = json.loads((self.run_dir(tmp) / "report.json").read_text())
+            markdown = (self.run_dir(tmp) / "report.md").read_text()
+            self.assertFalse(list(self.run_dir(tmp).glob(".report-*")))
+        self.assertEqual(code, 130)
+        self.assertFalse(data["passed"])
+        self.assertIn("**FAILED**", markdown)
+
 
 class DomainOwnershipPlanTests(unittest.TestCase):
     def test_uuid_is_passed_to_virt_install(self):

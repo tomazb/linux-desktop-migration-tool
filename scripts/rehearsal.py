@@ -14,6 +14,7 @@ checked against SHA-256 values fetched over HTTPS only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
@@ -1227,8 +1228,19 @@ def write_reports(config, runner, state):
         print(markdown_text)
         return None, json.loads(json_text)["passed"]
     json_path, markdown_path = config.run_dir / "report.json", config.run_dir / "report.md"
-    json_path.write_text(json_text)
-    markdown_path.write_text(markdown_text)
+    token = uuid.uuid4().hex
+    json_temporary = config.run_dir / f".report-{token}.json"
+    markdown_temporary = config.run_dir / f".report-{token}.md"
+    try:
+        json_temporary.write_text(json_text)
+        markdown_temporary.write_text(markdown_text)
+        # Publish the machine-readable result last, after both files are ready.
+        os.replace(markdown_temporary, markdown_path)
+        os.replace(json_temporary, json_path)
+    finally:
+        for temporary in (json_temporary, markdown_temporary):
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
     print(f"Report: {markdown_path}\n        {json_path}")
     return markdown_path, json.loads(json_text)["passed"]
 
@@ -1246,6 +1258,15 @@ def execute(config, runner):
     state = RunState()
     interrupted = False
     passed = False
+
+    def record_interruption():
+        if not any(result.id == "interrupted" for result in runner.results):
+            runner.results.append(StepResult(
+                id="interrupted", description="Rehearsal interrupted before completion", kind="setup",
+                vm=None, command="", status="failed", returncode=130,
+                detail="Interrupted by user; a complete rehearsal was not recorded.",
+                output_tail="", duration=0.0))
+
     try:
         try:
             run_plan(build_plan(config, state), runner)
@@ -1267,12 +1288,14 @@ def execute(config, runner):
                 print("Cleanup interrupted; remaining run files were kept.", file=sys.stderr)
     finally:
         if interrupted:
-            runner.results.append(StepResult(
-                id="interrupted", description="Rehearsal interrupted before completion", kind="setup",
-                vm=None, command="", status="failed", returncode=130,
-                detail="Interrupted by user; a complete rehearsal was not recorded.",
-                output_tail="", duration=0.0))
-        _, passed = write_reports(config, runner, state)
+            record_interruption()
+        try:
+            _, passed = write_reports(config, runner, state)
+        except KeyboardInterrupt:
+            interrupted = True
+            record_interruption()
+            print("Report publication interrupted; writing unsuccessful reports.", file=sys.stderr)
+            _, passed = write_reports(config, runner, state)
         counts = _summary(runner.results)
         print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped.")
         if state.unconfirmed_domains:
