@@ -766,6 +766,14 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
         planned_replaced = _replaced_paths(home, entries)
         created = {e["path"] for e in directories
                    if not os.path.lexists(home / e["path"])}
+        selected = set(manifest["selected_paths"])
+        original_directories = []
+        for entry in directories:
+            if entry["path"] in selected and entry["path"] not in created:
+                info = (home / entry["path"]).lstat()
+                original_directories.append({"path": entry["path"],
+                                             "mode": stat.S_IMODE(info.st_mode),
+                                             "mtime_ns": info.st_mtime_ns})
         # Persist the full intent plan once before any selected path changes.
         # The plan identifies potentially changed paths after interruption;
         # previous/ contains the actual saved originals. Avoid rewriting growing
@@ -777,6 +785,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
             "new": sorted(e["path"] for e in entries
                           if e["type"] != "directory" and e["path"] not in planned_replaced),
             "created_directories": sorted(created),
+            "original_directories": original_directories,
             # What the restore may have changed in eligible files after their
             # checksum check, so a rollback can tell them from user edits.
             "rewrite_home": list(rewrite_home) if rewrite_home else None,
@@ -831,7 +840,6 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
                 with contextlib.suppress(OSError):
                     if os.path.lexists(temporary):
                         temporary.unlink()
-        selected = set(manifest["selected_paths"])
         # Preserve selected directory roots and new directories. Existing
         # structural HOME parents and unrelated contents keep their metadata.
         for entry in reversed(directories):

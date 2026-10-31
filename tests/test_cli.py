@@ -1,6 +1,7 @@
 """CLI policy tests; external system changes are mocked, file fixtures are real."""
 
 import contextlib
+import errno
 import importlib
 import io
 import json
@@ -523,6 +524,35 @@ class CLITests(unittest.TestCase):
         self.assertIn(str(undone[0]), out)
         self.assertEqual(json.loads((rollback / "rollback-journal.json").read_text())["status"],
                          "complete")
+
+    def test_rollback_warns_when_older_journal_cannot_restore_directory_metadata(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        journal = json.loads((rollback / "journal.json").read_text())
+        journal.pop("original_directories", None)
+        (rollback / "journal.json").write_text(json.dumps(journal))
+        code, out, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 0, err)
+        self.assertIn("directory metadata", out)
+        self.assertIn("cannot be restored", out)
+
+    def test_cross_device_rollback_reports_retained_original_locations(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        real = os.rename
+
+        def cross_device(source, destination, **kwargs):
+            if kwargs.get("src_dir_fd") is not None and kwargs.get("dst_dir_fd") is None:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real(source, destination, **kwargs)
+
+        with patch.object(cli_module(), "assert_xfce_stopped"), \
+             patch("fedora_migration.rollback.os.rename", side_effect=cross_device):
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        records = json.loads((rollback / "rollback-journal.json").read_text())["retained_quarantines"]
+        self.assertTrue(records)
+        for item in records:
+            self.assertIn(str(target / item["quarantine"]), out)
+        self.assertIn("all writers are stopped", out)
 
     def test_rollback_apply_runs_guards_before_the_first_write(self):
         cli = cli_module()

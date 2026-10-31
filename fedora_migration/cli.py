@@ -378,6 +378,8 @@ def print_rollback_plan(plan, *, apply):
     print("Validated rollback plan:" if apply else "Rollback preview:")
     print(f"Rollback directory: {plan['rollback_dir']} (restore status: {plan['status']})")
     print(f"Destination: {plan['home']}")
+    for warning in plan["warnings"]:
+        print(f"WARNING: {warning}")
     if plan["verified"]:
         print(f"Bundle: {plan['bundle']} (checksums verified)")
     else:
@@ -413,6 +415,13 @@ def print_rollback_plan(plan, *, apply):
     print(f"Directories the restore created that would be removed if empty: "
           f"{len(plan['remove_directories'])}")
     print_limited([f"    {report.clip(path)}" for path in plan["remove_directories"]])
+    print(f"Existing selected directories whose original mode and timestamp will be restored: "
+          f"{len(plan['restore_directory_metadata'])}")
+    print_limited([f"    {report.clip(item['path'])}" for item in plan["restore_directory_metadata"]])
+    if plan["retained_quarantines"]:
+        print("Previously captured cross-filesystem originals remain at:")
+        print_limited([f"    {Path(plan['home']) / item['quarantine']}"
+                       for item in plan["retained_quarantines"]])
     if plan["kept_directories"]:
         print_limited([f"    kept {report.clip(item['path'])}: {item['reason']}"
                        for item in plan["kept_directories"]])
@@ -451,6 +460,12 @@ def rollback_command(args):
           f"{len(plan['unchanged'])} needed nothing.")
     if result["undone_dir"]:
         print(f"Versions replaced or removed were saved in: {result['undone_dir']}", flush=True)
+    if result["retained_quarantines"]:
+        print("Captured cross-filesystem originals are also retained at:")
+        print_limited([f"    {home / item['quarantine']}"
+                       for item in result["retained_quarantines"]])
+        print("Keep these private quarantine directories until all writers are stopped and you "
+              "have checked the result; rollback-journal.json lists every recovery location.")
     for item in result["kept_directories"]:
         print(f"  Kept directory {report.clip(item['path'])}: {item['reason']}")
     if result["skipped"]:

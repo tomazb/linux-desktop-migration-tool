@@ -145,7 +145,8 @@ the journal, or `--bundle PATH` if it moved) and compares each current file with
 bundle payload; files changed by `--rewrite-home` count as restored. Anything
 else is a CONFLICT: it is listed with the reason and left alone. If the bundle is
 missing or invalid, no path can be verified and every existing path is a conflict.
-`--include-changed` processes conflicts too, except directories and special files.
+`--include-changed` processes conflicts too, except file paths now holding
+directories or special files.
 Directories the restore created are removed only if they are empty. Before every
 overwrite or removal the current version is saved under `undone-<UTC time>/` in the
 rollback directory, so a rollback loses nothing. Progress is recorded in
@@ -153,6 +154,25 @@ rollback directory, so a rollback loses nothing. Progress is recorded in
 `interrupted`); a finished (`complete`) rollback is refused a second time. It works
 on a restore that failed or was interrupted, and it does not undo package installs.
 Like a restore it needs Fedora 44, a stopped XFCE session and closed browsers.
+
+New restore journals also retain the original mode and timestamp of existing
+selected directory roots; rollback puts those back after changing files. Older
+journals remain usable, with a warning that this metadata must be recovered by
+hand. Directory modes and timestamps changed since restore are conflicts too;
+`--include-changed` opts into restoring them. After an interrupted attempt, its own
+directory-entry changes can also require that explicit choice. Read-only
+directories are temporarily made accessible to their owner and
+their modes are reset on failure; a directory the owner cannot read or traverse
+requires a manual access repair before rollback can proceed safely.
+
+When the rollback directory is on another filesystem, captured originals also
+remain under private `.fedora-migration-quarantine-*/entry` directories beside
+their former paths. Keeping the inode preserves late writes through already-open
+file descriptors. The output and `rollback-journal.json` list these recovery
+locations, including across retries. These directories can keep otherwise empty
+restore-created parents from being removed. Stop all writers, inspect both the
+retained original and the `undone-*` copy, and keep any newer data before manually
+removing a quarantine directory.
 
 ## What is included
 
