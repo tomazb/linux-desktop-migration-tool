@@ -23,7 +23,8 @@ def cli_module():
 
 def package_fixture():
     return {
-        "rpm": {"status": "captured", "requests": [], "inventory": []},
+        "rpm": {"status": "captured", "requests": [], "inventory": [],
+                "repos": [], "groups": [], "environments": []},
         "flatpak": {"status": "not-installed", "apps": [], "remotes": []},
         "warnings": [],
     }
@@ -795,6 +796,243 @@ class ApplicationGuardTests(unittest.TestCase):
         self.assertIn("Could not check running applications", error)
         _, error = self.run_guard(pgrep=(1, "", ""), flatpak=(1, "", "no session bus"))
         self.assertIn("Could not check running Flatpak applications", error)
+
+
+def triage_package_data():
+    """A schema 2 package inventory covering every triage class."""
+    def entry(spec, repo, nevra):
+        return {"spec": spec, "reason": "User", "from_repo": repo, "full_nevra": nevra}
+    return {
+        "rpm": {
+            "status": "captured",
+            "requests": ["bash.x86_64", "htop.x86_64", "zsh.x86_64", "hello.x86_64",
+                         "ghost.x86_64", "local-tool.x86_64", "mystery.noarch"],
+            "inventory": [
+                entry("bash.x86_64", "fedora", "bash-0:5.2-1.fc43.x86_64"),
+                entry("htop.x86_64", "fedora", "htop-0:3.4-1.fc43.x86_64"),
+                entry("zsh.x86_64", "updates", "zsh-0:5.9-1.fc43.x86_64"),
+                entry("hello.x86_64", "copr:u:p", "hello-0:1.0-1.fc43.x86_64"),
+                entry("ghost.x86_64", "rpmfusion-free", "ghost-0:2.0-1.fc43.x86_64"),
+                entry("local-tool.x86_64", "@commandline", "local-tool-0:9.1-1.x86_64"),
+                entry("mystery.noarch", "<unknown>", "mystery-0:3-1.noarch")],
+            "repos": [{"id": "rpmfusion-free", "name": "RPM Fusion", "base_urls": [],
+                       "metalink": "https://mirrors.rpmfusion.example/metalink?repo=free",
+                       "mirrorlist": "",
+                       "gpg_keys": ["file:///etc/pki/rpm-gpg/RPM-GPG-KEY-rpmfusion-free"],
+                       "repo_file_path": "/etc/yum.repos.d/rpmfusion-free.repo"}],
+            "groups": [{"id": "core", "userinstalled": True}],
+            "environments": [{"id": "xfce-desktop-environment", "groups": ["xfce-desktop"]}],
+        },
+        "flatpak": {"status": "not-installed", "apps": [], "remotes": []},
+        "warnings": [],
+    }
+
+
+INSTALLED = {"bash.x86_64"}
+AVAILABLE = {"bash.x86_64", "htop.x86_64", "zsh.x86_64"}
+
+
+class RestoreTriageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.home = self.root / "source-home"
+        self.home.mkdir()
+        self.target = self.root / "target-home"
+        self.target.mkdir()
+        self.info = {"id": "fedora", "version_id": "43", "pretty_name": "Fedora Linux 43",
+                     "home": str(self.home), "uid": 1000, "username": "alice",
+                     "architecture": "x86_64"}
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+            os.environ.pop(variable, None)
+        guard = patch.object(cli_module(), "assert_applications_closed")
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.installed, self.available = set(INSTALLED), set(AVAILABLE)
+        self.bundle = self.make_bundle(triage_package_data())
+
+    def make_bundle(self, package_data, name="backup"):
+        from fedora_migration.bundle import create_bundle
+        (self.home / ".config/xfce4").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config/xfce4/settings.xml").write_text("<channel name='xfce4-panel'/>\n")
+        bundle = self.root / name
+        create_bundle(self.home, bundle, self.info, package_data, settings_only=True)
+        return bundle
+
+    def invoke(self, *argv, bundle=None, run=None, xfce=None):
+        """Run restore on a Fedora 44 destination with the destination queries mocked."""
+        cli = cli_module()
+        info = dict(self.info, version_id="44", home=str(self.target))
+        out, err = io.StringIO(), io.StringIO()
+        self.collector = patch.object(
+            cli.packages, "collect_destination_rpms",
+            side_effect=lambda: (set(self.installed), set(self.available)))
+        with patch.object(cli, "platform_info", return_value=info), \
+             patch.object(cli, "assert_xfce_stopped", side_effect=xfce), \
+             patch.object(cli, "check_selinux_tools", return_value=False), \
+             self.collector as collector, \
+             patch.object(cli.packages, "_run", side_effect=run or (lambda *a, **k: "")) as runner, \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["restore", "--bundle", str(bundle or self.bundle), *argv])
+        self.collector_calls = collector.call_count
+        self.runner = runner
+        return code, out.getvalue(), err.getvalue()
+
+    def rpm_argv(self):
+        return [call.args[0] for call in self.runner.call_args_list if call.args[0][0] == "sudo"]
+
+    def test_preview_shows_the_triage_and_changes_nothing(self):
+        code, out, err = self.invoke("--install-packages")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.collector_calls, 1)
+        self.assertIn("RPM triage", out)
+        self.assertIn("Already installed: 1", out)
+        self.assertIn("To install: 2", out)
+        self.assertIn("htop.x86_64", out)
+        self.assertIn("Unavailable: 2", out)
+        self.assertIn("copr:u:p", out)
+        self.assertIn("repository copr:u:p from the source system is not recorded", out)
+        self.assertIn("enable repository rpmfusion-free", out)
+        self.assertIn("https://mirrors.rpmfusion.example/metalink?repo=free", out)
+        self.assertNotIn("RPM-GPG-KEY", out)
+        self.assertIn("Manual handling: 2", out)
+        self.assertIn("local-tool-0:9.1-1.x86_64", out)
+        self.assertIn("mystery-0:3-1.noarch", out)
+        self.assertIn("xfce-desktop-environment", out)
+        self.assertIn("only explicit packages are requested", out)
+        self.assertIn("sudo dnf5 install htop.x86_64 zsh.x86_64", out)
+        self.assertIn("--skip-unavailable", out)
+        self.assertIn("Preview only", out)
+        self.assertEqual(self.runner.call_count, 0)
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_triage_summary_lists_are_capped(self):
+        data = triage_package_data()
+        many = [f"pkg{i:03}.x86_64" for i in range(60)]
+        data["rpm"]["requests"] = many
+        data["rpm"]["inventory"] = [
+            {"spec": spec, "reason": "User", "from_repo": "fedora",
+             "full_nevra": f"{spec[:-7]}-0:1-1.x86_64"} for spec in many]
+        self.available = set(many)
+        code, out, err = self.invoke("--install-packages", bundle=self.make_bundle(data, "many"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("To install: 60", out)
+        self.assertIn("... and 35 more", out)
+
+    def test_apply_refuses_unavailable_packages_before_any_change(self):
+        stopped = []
+        code, out, err = self.invoke("--apply", "--install-packages",
+                                     xfce=lambda: stopped.append(1))
+        self.assertEqual(code, 1)
+        self.assertIn("--skip-unavailable", err)
+        self.assertIn("copr:u:p", err + out)
+        self.assertIn("rpmfusion-free", err + out)
+        self.assertEqual(self.runner.call_count, 0)
+        self.assertEqual(stopped, [])
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_apply_refusal_never_reaches_install_or_restore(self):
+        cli = cli_module()
+        with patch.object(cli.packages, "install_packages") as install, \
+             patch.object(cli.bundle, "restore_bundle") as restore:
+            code, _, _ = self.invoke("--apply", "--install-packages")
+        self.assertEqual(code, 1)
+        install.assert_not_called()
+        restore.assert_not_called()
+
+    def test_skip_unavailable_installs_only_installable_packages(self):
+        code, out, err = self.invoke("--apply", "--install-packages", "--skip-unavailable")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.rpm_argv(),
+                         [["sudo", "dnf5", "install", "--skip-unavailable", "htop.x86_64", "zsh.x86_64"]])
+        flat = " ".join(self.rpm_argv()[0])
+        for left_out in ("bash.x86_64", "hello.x86_64", "ghost.x86_64", "local-tool", "mystery"):
+            self.assertNotIn(left_out, flat)
+        self.assertIn("Skipped", out)
+        self.assertIn("hello.x86_64", out)
+        self.assertTrue((self.target / ".config/xfce4/settings.xml").is_file())
+
+    def test_manual_packages_never_block_and_are_never_installed(self):
+        data = triage_package_data()
+        keep = {"bash.x86_64", "htop.x86_64", "local-tool.x86_64", "mystery.noarch"}
+        data["rpm"]["requests"] = [r for r in data["rpm"]["requests"] if r in keep]
+        data["rpm"]["inventory"] = [i for i in data["rpm"]["inventory"] if i["spec"] in keep]
+        code, out, err = self.invoke("--apply", "--install-packages",
+                                     bundle=self.make_bundle(data, "manual-only"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.rpm_argv(), [["sudo", "dnf5", "install", "htop.x86_64"]])
+        self.assertNotIn("--skip-unavailable", self.rpm_argv()[0])
+        self.assertIn("local-tool-0:9.1-1.x86_64", out)
+
+    def test_nothing_to_install_runs_no_rpm_command(self):
+        self.installed = set(AVAILABLE)
+        data = triage_package_data()
+        data["rpm"]["requests"] = ["bash.x86_64", "htop.x86_64"]
+        data["rpm"]["inventory"] = data["rpm"]["inventory"][:2]
+        code, out, err = self.invoke("--apply", "--install-packages",
+                                     bundle=self.make_bundle(data, "installed"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.rpm_argv(), [])
+        self.assertIn("Already installed: 2", out)
+
+    def test_skip_unavailable_is_not_passed_to_dnf_unless_given(self):
+        self.available |= {"hello.x86_64", "ghost.x86_64"}
+        code, _, err = self.invoke("--apply", "--install-packages")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.rpm_argv(), [["sudo", "dnf5", "install", "ghost.x86_64",
+                                            "hello.x86_64", "htop.x86_64", "zsh.x86_64"]])
+
+    def test_destination_is_not_queried_when_it_is_not_needed(self):
+        for argv in (["--install-packages", "--skip-rpm"], [], ["--skip-unavailable"]):
+            with self.subTest(argv=argv):
+                code, _, err = self.invoke(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.collector_calls, 0)
+        data = triage_package_data()
+        data["rpm"].update(requests=[], inventory=[])
+        code, _, err = self.invoke("--install-packages", bundle=self.make_bundle(data, "empty"))
+        self.assertEqual((code, self.collector_calls), (0, 0), err)
+
+    def test_query_failure_stops_before_any_change(self):
+        cli = cli_module()
+        info = dict(self.info, version_id="44", home=str(self.target))
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(cli, "platform_info", return_value=info), \
+             patch.object(cli.packages, "collect_destination_rpms",
+                          side_effect=cli.packages.PackageError("cannot download metadata")), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["restore", "--bundle", str(self.bundle), "--apply", "--install-packages"])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot download metadata", err.getvalue())
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_skip_unavailable_without_install_packages_is_reported_as_unused(self):
+        code, out, err = self.invoke("--skip-unavailable")
+        self.assertEqual(code, 0, err)
+        self.assertIn("--skip-unavailable has no effect without --install-packages", out)
+
+    def test_help_documents_skip_unavailable(self):
+        text = " ".join(action.format_help() for action in
+                        cli_module().parser()._subparsers._group_actions[0].choices.values())
+        self.assertIn("--skip-unavailable", text)
+
+    def test_flatpak_batches_follow_the_rpm_command(self):
+        data = triage_package_data()
+        data["rpm"].update(requests=["htop.x86_64"], inventory=data["rpm"]["inventory"][1:2])
+        data["flatpak"] = {
+            "status": "captured",
+            "apps": [{"scope": "user", "origin": "flathub", "ref": "org.b.B/x86_64/stable"},
+                     {"scope": "user", "origin": "flathub", "ref": "org.a.A/x86_64/stable"}],
+            "remotes": [{"scope": "user", "name": "flathub", "url": "https://dl.flathub.org/repo/"}]}
+        code, out, err = self.invoke("--install-packages",
+                                     bundle=self.make_bundle(data, "flatpak"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("flatpak install --user flathub org.a.A/x86_64/stable org.b.B/x86_64/stable", out)
+        self.assertLess(out.index("sudo dnf5 install"), out.index("flatpak install"))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 """Portable RPM requests and scoped Flatpak app inventory.
 
 Inventory is descriptive; restore never installs old RPM NEVRAs, copies repository
-configuration, or adds a Flatpak remote. All package manager calls use argv lists.
+configuration, installs groups or environments, or adds a Flatpak remote. All
+package manager calls use argv lists.
 """
 
+import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -15,6 +18,16 @@ class PackageError(RuntimeError):
 
 
 INSTALLATIONS_DIR = Path("/etc/flatpak/installations.d")
+# DNF5 keeps installed group/environment state here (version "1.0"), readable by
+# every user. Group names are descriptive only: restore never requests groups.
+GROUPS_STATE = Path("/usr/lib/sysimage/libdnf5/groups.toml")
+ENVIRONMENTS_STATE = Path("/usr/lib/sysimage/libdnf5/environments.toml")
+_STATE_VERSION = "1.0"
+_MAX_STATE_BYTES = 16 * 1024 * 1024
+_ID = re.compile(r"[A-Za-z0-9._:+@-]+\Z")
+# Bounds keep a hostile manifest from producing unbounded output or memory use.
+_MAX_ID, _MAX_NAME, _MAX_URL, _MAX_PATH = 256, 512, 2048, 4096
+_MAX_REPOS, _MAX_URLS, _MAX_GROUPS, _MAX_ENVIRONMENT_GROUPS = 1000, 64, 10000, 1000
 _RPM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9+_.-]*\Z")
 _RPM_ARCHES = frozenset((
     "noarch", "x86_64", "i386", "i486", "i586", "i686", "aarch64",
@@ -30,10 +43,19 @@ _REF_PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 _ASCII_SPACE = frozenset(" \t\n\r\v\f")
 
 
+def _command_environment(argv):
+    """DNF5 and Flatpak output is parsed, so they always run in a fixed locale."""
+    program = argv[1] if argv[0] == "sudo" and len(argv) > 1 else argv[0]
+    if program in ("dnf5", "flatpak"):
+        return {**os.environ, "LC_ALL": "C.UTF-8"}
+    return None
+
+
 def _run(argv, *, capture=True):
     """Run an external command, retaining the terminal for confirmations."""
     try:
-        result = subprocess.run(argv, check=True, text=True, capture_output=capture)
+        result = subprocess.run(argv, check=True, text=True, capture_output=capture,
+                                env=_command_environment(argv))
     except FileNotFoundError:
         # Backup distinguishes an absent optional Flatpak binary from a failure.
         raise
@@ -129,13 +151,75 @@ _KEYS_V1 = {
     "remote": ("scope", "name", "url"),
     "app": ("scope", "origin", "ref"),
 }
-PACKAGE_KEYS = {1: _KEYS_V1, 2: dict(_KEYS_V1)}
+_KEYS_V2 = {
+    **_KEYS_V1,
+    "rpm": ("status", "requests", "inventory", "repos", "groups", "environments"),
+    "repo": ("id", "name", "base_urls", "metalink", "mirrorlist", "gpg_keys", "repo_file_path"),
+    "group": ("id", "userinstalled"),
+    "environment": ("id", "groups"),
+}
+PACKAGE_KEYS = {1: _KEYS_V1, 2: _KEYS_V2}
 CURRENT_SCHEMA = 2
 
 
-def _list(value, label):
+def _list(value, label, limit=None):
     if not isinstance(value, list):
         raise PackageError(f"{label} must be a list")
+    if limit is not None and len(value) > limit:
+        raise PackageError(f"{label} has more than {limit} entries")
+
+
+def _bounded(value, label, limit, *, allow_empty=True):
+    _text(value, label, allow_empty=allow_empty)
+    if len(value) > limit:
+        raise PackageError(f"{label} is longer than {limit} characters")
+
+
+def _identifier(value, label):
+    _bounded(value, label, _MAX_ID, allow_empty=False)
+    if not _ID.fullmatch(value):
+        raise PackageError(f"Invalid {label}: {value!r}")
+
+
+def _validate_repo(repo, keys):
+    _mapping(repo, "RPM repository", keys["repo"])
+    _identifier(repo["id"], "RPM repository id")
+    _bounded(repo["name"], "RPM repository name", _MAX_NAME)
+    for key in ("base_urls", "gpg_keys"):
+        _list(repo[key], f"RPM repository {key}", _MAX_URLS)
+        for url in repo[key]:
+            _bounded(url, f"RPM repository {key} entry", _MAX_URL, allow_empty=False)
+    for key in ("metalink", "mirrorlist"):
+        _bounded(repo[key], f"RPM repository {key}", _MAX_URL)
+    _bounded(repo["repo_file_path"], "RPM repository file path", _MAX_PATH)
+
+
+def _validate_unique(items, label):
+    ids = [item["id"] for item in items]
+    if len(set(ids)) != len(ids):
+        raise PackageError(f"Duplicate {label} id")
+
+
+def _validate_group_state(rpm, keys):
+    _list(rpm["repos"], "RPM repos", _MAX_REPOS)
+    for repo in rpm["repos"]:
+        _validate_repo(repo, keys)
+    _validate_unique(rpm["repos"], "RPM repository")
+    _list(rpm["groups"], "RPM groups", _MAX_GROUPS)
+    for group in rpm["groups"]:
+        _mapping(group, "RPM group", keys["group"])
+        _identifier(group["id"], "RPM group id")
+        if type(group["userinstalled"]) is not bool:
+            raise PackageError("RPM group userinstalled must be true or false")
+    _validate_unique(rpm["groups"], "RPM group")
+    _list(rpm["environments"], "RPM environments", _MAX_GROUPS)
+    for environment in rpm["environments"]:
+        _mapping(environment, "RPM environment", keys["environment"])
+        _identifier(environment["id"], "RPM environment id")
+        _list(environment["groups"], "RPM environment groups", _MAX_ENVIRONMENT_GROUPS)
+        for group in environment["groups"]:
+            _identifier(group, "RPM environment group id")
+    _validate_unique(rpm["environments"], "RPM environment")
 
 
 def validate_package_manifest(data, schema_version=CURRENT_SCHEMA):
@@ -156,10 +240,12 @@ def validate_package_manifest(data, schema_version=CURRENT_SCHEMA):
         raise PackageError("RPM status must be captured or skipped")
     if flatpak["status"] not in ("captured", "skipped", "not-installed"):
         raise PackageError("Flatpak status must be captured, skipped or not-installed")
-    for key in ("requests", "inventory"):
+    for key in keys["rpm"][1:]:
         _list(rpm[key], f"RPM {key}")
         if rpm["status"] != "captured" and rpm[key]:
             raise PackageError("Skipped RPM inventory must be empty")
+    if "repos" in keys["rpm"]:
+        _validate_group_state(rpm, keys)
     for request in rpm["requests"]:
         _rpm_spec(request)
     if len(set(rpm["requests"])) != len(rpm["requests"]):
@@ -231,10 +317,158 @@ def _remote_inventory(scope, *, include_disabled=True):
     return remotes
 
 
+def _oneline(text, limit=300):
+    """A command's error text as one printable line, safe to store as a warning."""
+    text = " ".join("".join(" " if ord(char) < 32 or ord(char) == 127 else char
+                            for char in str(text)).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _strip_credentials(url):
+    """Drop user:password@ from a URL's authority, leaving everything else as is."""
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        return url
+    end = min((rest.find(char) for char in "/?#" if char in rest), default=len(rest))
+    authority = rest[:end]
+    if "@" not in authority:
+        return url
+    return f"{scheme}://{authority.rpartition('@')[2]}{rest[end:]}"
+
+
+def _url_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value] if value else []
+    if not isinstance(value, list):
+        raise PackageError("expected a URL or a list of URLs")
+    return [_strip_credentials(url) if isinstance(url, str) else url for url in value]
+
+
+def _repo_record(item):
+    """One `dnf5 repo info --json` object as a stored record, credentials removed."""
+    if not isinstance(item, dict):
+        raise PackageError("repository entry is not an object")
+
+    def optional(key, default=""):
+        value = item.get(key)
+        return default if value is None else value
+
+    def url(key):
+        value = optional(key)
+        return _strip_credentials(value) if isinstance(value, str) else value
+
+    record = {
+        "id": item.get("id"), "name": optional("name"),
+        "base_urls": _url_list(item.get("base_url")),
+        "metalink": url("metalink"), "mirrorlist": url("mirrorlist"),
+        "gpg_keys": _url_list(item.get("gpg_key")),
+        "repo_file_path": optional("repo_file_path"),
+    }
+    _validate_repo(record, _KEYS_V2)
+    return record
+
+
+def _collect_repos(warnings):
+    """Enabled repositories as descriptive records; failures only produce warnings."""
+    try:
+        output = _run(["dnf5", "repo", "info", "--enabled", "--json"])
+    except (PackageError, FileNotFoundError):
+        # Package-manager diagnostics can contain authenticated URLs or tokens.
+        # Keep them out of the portable manifest and its later summaries.
+        warnings.append("Could not read enabled DNF repositories, so none were recorded. "
+                        "Review repository configuration separately.")
+        return []
+    try:
+        items = json.loads(output)
+        if not isinstance(items, list):
+            raise ValueError("expected a JSON list of repositories")
+    except ValueError as exc:
+        warnings.append(f"Could not parse 'dnf5 repo info --enabled --json', so no repositories were recorded: {_oneline(exc)}")
+        return []
+    repos, skipped = {}, 0
+    for item in items:
+        try:
+            record = _repo_record(item)
+        except PackageError:
+            skipped += 1
+            continue
+        if record["id"] in repos:
+            skipped += 1
+            continue
+        repos[record["id"]] = record
+    if skipped:
+        warnings.append(f"{skipped} enabled DNF repositor{'y' if skipped == 1 else 'ies'} could not be recorded "
+                        "(unusable, duplicate or oversized details).")
+    if len(repos) > _MAX_REPOS:
+        warnings.append(f"More than {_MAX_REPOS} DNF repositories are enabled; none were recorded.")
+        return []
+    return list(repos.values())
+
+
+def _state_table(path, table):
+    """The `table` mapping of a DNF5 state file, or raise ImportError/ValueError/OSError."""
+    # Python 3.11 added tomllib. Offline verification and the rest of the tool
+    # also work without it; this optional backup inventory is its only consumer.
+    import tomllib
+
+    if path.stat().st_size > _MAX_STATE_BYTES:
+        raise ValueError("file is unexpectedly large")
+    with open(path, "rb") as stream:
+        data = tomllib.load(stream)
+    if data.get("version") != _STATE_VERSION:
+        raise ValueError(f"unexpected state version {_oneline(data.get('version'), 40)!r}")
+    section = data.get(table, {})
+    if not isinstance(section, dict) or len(section) > _MAX_GROUPS:
+        raise ValueError(f"unexpected [{table}] section")
+    for identifier, body in section.items():
+        if not isinstance(body, dict) or not _ID.fullmatch(identifier) or len(identifier) > _MAX_ID:
+            raise ValueError(f"unexpected {table[:-1]} entry {_oneline(identifier, 40)!r}")
+    return section
+
+
+def _group_records(section):
+    records = []
+    for identifier, body in section.items():
+        flag = body.get("userinstalled", False)
+        if type(flag) is not bool:
+            raise ValueError(f"userinstalled of group {identifier!r} is not true or false")
+        records.append({"id": identifier, "userinstalled": flag})
+    return sorted(records, key=lambda record: record["id"])
+
+
+def _environment_records(section):
+    records = []
+    for identifier, body in section.items():
+        members = body.get("groups", [])
+        if (not isinstance(members, list) or len(members) > _MAX_ENVIRONMENT_GROUPS
+                or not all(isinstance(member, str) and len(member) <= _MAX_ID and _ID.fullmatch(member)
+                           for member in members)):
+            raise ValueError(f"groups of environment {identifier!r} are not a list of group ids")
+        records.append({"id": identifier, "groups": list(members)})
+    return sorted(records, key=lambda record: record["id"])
+
+
+def _collect_state(path, table, build, warnings):
+    try:
+        return build(_state_table(path, table))
+    except ModuleNotFoundError:
+        warnings.append(f"Could not read DNF {table}: Python TOML support is unavailable, "
+                        "so none were recorded.")
+        return []
+    # TOMLDecodeError and UnicodeDecodeError are ValueErrors; deeply nested
+    # input exhausts the parser's recursion.
+    except (OSError, ValueError, RecursionError) as exc:
+        warnings.append(f"Could not read DNF {table} from {path}, so none were recorded: {_oneline(exc)}")
+        return []
+
+
 def collect_packages(*, skip_rpm=False, skip_flatpak=False):
     """Capture RPM requests and both supported Flatpak installation scopes."""
     data = {
-        "rpm": {"status": "skipped" if skip_rpm else "captured", "requests": [], "inventory": []},
+        "rpm": {"status": "skipped" if skip_rpm else "captured", "requests": [], "inventory": [],
+                "repos": [], "groups": [], "environments": []},
         "flatpak": {"status": "skipped" if skip_flatpak else "captured", "apps": [], "remotes": []},
         "warnings": [],
     }
@@ -251,6 +485,10 @@ def collect_packages(*, skip_rpm=False, skip_flatpak=False):
         data["rpm"]["requests"] = list(dict.fromkeys(row[0] for row in _rows(requests, 1, "DNF5 requests")))
         data["rpm"]["inventory"] = [dict(zip(("spec", "reason", "from_repo", "full_nevra"), row))
                                     for row in _rows(inventory, 4, "DNF5 inventory")]
+        data["rpm"]["repos"] = _collect_repos(data["warnings"])
+        data["rpm"]["groups"] = _collect_state(GROUPS_STATE, "groups", _group_records, data["warnings"])
+        data["rpm"]["environments"] = _collect_state(
+            ENVIRONMENTS_STATE, "environments", _environment_records, data["warnings"])
         data["warnings"].append(
             "DNF5 --userinstalled also includes group/module/unknown installation reasons; "
             "configured excludes can hide packages from both queries. Review RPM requests before "
@@ -276,15 +514,106 @@ def collect_packages(*, skip_rpm=False, skip_flatpak=False):
     return data
 
 
-def package_commands(data, *, skip_rpm=False, skip_flatpak=False, schema_version=CURRENT_SCHEMA):
-    """Build a reviewable command preview without running external commands."""
+def collect_destination_rpms():
+    """Installed and available name.arch sets on this system (read-only queries).
+
+    Querying available packages can download repository metadata.
+    """
+    try:
+        # Configured excludes must not hide what is already installed; they still
+        # limit what can be installed below and in the transaction.
+        installed = _run(["dnf5", "repoquery", "--installed", "--setopt=disable_excludes=*",
+                          "--queryformat", "%{name}.%{arch}\n"])
+        available = _run(["dnf5", "repoquery", "--available", "--queryformat", "%{name}.%{arch}\n"])
+    except FileNotFoundError as exc:
+        raise PackageError("dnf5 is required to check RPM availability; install it or use --skip-rpm") from exc
+    return ({row[0] for row in _rows(installed, 1, "DNF5 installed packages")},
+            {row[0] for row in _rows(available, 1, "DNF5 available packages")})
+
+
+# Packages whose source repository cannot be enabled by name: installed from a
+# local file, or with no recorded origin. They are listed, never installed.
+_MANUAL_REPOS = frozenset(("@commandline", "<unknown>", ""))
+
+
+def triage_rpm(data, installed, available):
+    """Classify every RPM request against the destination's installed/available sets.
+
+    Returns sorted lists `installed` and `installable`; `manual` entries (dicts
+    with spec, from_repo and full_nevra) that need manual handling; and
+    `unavailable`, a dict of source repository id -> sorted specs. Groups and
+    environments are never requested: DNF5 would reinstall their default members.
+    """
+    # Installonly packages (kernels) can have several inventory rows per spec.
+    origins = {}
+    for item in data["rpm"]["inventory"]:
+        origins.setdefault(item["spec"], []).append(item)
+    result = {"installed": [], "installable": [], "installable_from_local": [],
+              "manual": [], "unavailable": {}}
+    for spec in sorted(data["rpm"]["requests"]):
+        records = origins.get(spec, [])
+        repos = sorted({record["from_repo"] for record in records} - _MANUAL_REPOS)
+        if spec in installed:
+            result["installed"].append(spec)
+        elif spec in available:
+            result["installable"].append(spec)
+            if not repos:
+                # Installed from a local file or an unknown source on the old
+                # system; a repository here provides the same name now.
+                result["installable_from_local"].append(spec)
+        elif repos:
+            # Any record from a real repository makes it unavailable (strict),
+            # whatever order the rows came in.
+            result["unavailable"].setdefault(repos[0], []).append(spec)
+        else:
+            origin = sorted(record["from_repo"] for record in records)
+            result["manual"].append({
+                "spec": spec, "from_repo": origin[0] if origin else "",
+                "full_nevra": ", ".join(sorted(r["full_nevra"] for r in records)) or spec})
+    result["unavailable"] = dict(sorted(result["unavailable"].items()))
+    return result
+
+
+def unavailable_hint(data, repo):
+    """What to do about requests whose source repository is not usable here."""
+    recorded = next((item for item in data["rpm"].get("repos", []) if item["id"] == repo), None)
+    if recorded is None:
+        return (f"repository {repo} from the source system is not recorded; "
+                "configure it or drop these packages")
+    details = []
+    if recorded["base_urls"]:
+        details.append("base URL " + ", ".join(recorded["base_urls"]))
+    if recorded["metalink"]:
+        details.append(f"metalink {recorded['metalink']}")
+    if recorded["mirrorlist"]:
+        details.append(f"mirrorlist {recorded['mirrorlist']}")
+    shown = "; ".join(details) if details else "no URL"
+    return f"enable repository {repo} (recorded {shown}) and retry"
+
+
+def package_commands(data, *, skip_rpm=False, skip_flatpak=False, schema_version=CURRENT_SCHEMA,
+                     triage=None, skip_unavailable=False):
+    """Build a reviewable command preview without running external commands.
+
+    With a triage result only its installable RPMs are requested; without one,
+    every recorded request is. --skip-unavailable is only passed when given.
+    """
     validate_package_manifest(data, schema_version)
     commands = []
-    if not skip_rpm and data["rpm"]["requests"]:
-        commands.append(["sudo", "dnf5", "install", *data["rpm"]["requests"]])
+    if not skip_rpm:
+        requests = data["rpm"]["requests"] if triage is None else sorted(triage["installable"])
+        for request in requests:
+            _rpm_spec(request)
+        if requests:
+            commands.append(["sudo", "dnf5", "install",
+                             *(["--skip-unavailable"] if skip_unavailable else []), *requests])
     if not skip_flatpak:
+        batches = {}
         for app in data["flatpak"]["apps"]:
-            commands.append(["flatpak", "install", f"--{app['scope']}", app["origin"], app["ref"]])
+            batches.setdefault((app["scope"], app["origin"]), []).append(app["ref"])
+        # User installations first, as they are inventoried; one transaction each.
+        for scope, origin in sorted(batches, key=lambda key: (key[0] != "user", key[1])):
+            commands.append(["flatpak", "install", f"--{scope}", origin, *sorted(batches[(scope, origin)])])
     return commands
 
 
@@ -311,10 +640,17 @@ def _preflight_remotes(data):
             raise PackageError(f"Disabled {scope} Flatpak remote {name!r}. Review and enable it manually before retrying or use --skip-flatpak.")
 
 
-def install_packages(data, *, skip_rpm=False, skip_flatpak=False, schema_version=CURRENT_SCHEMA):
+def install_packages(data, *, skip_rpm=False, skip_flatpak=False, schema_version=CURRENT_SCHEMA,
+                     triage=None, skip_unavailable=False):
     """Preflight remotes, then run native package managers with confirmation."""
+    if triage is not None and triage["unavailable"] and not skip_unavailable and not skip_rpm:
+        count = sum(len(specs) for specs in triage["unavailable"].values())
+        raise PackageError(f"{count} requested RPM packages are not available on this system; "
+                           "nothing was installed. Fix the repositories, or use --skip-unavailable "
+                           "to install only the available packages.")
     commands = package_commands(data, skip_rpm=skip_rpm, skip_flatpak=skip_flatpak,
-                                schema_version=schema_version)
+                                schema_version=schema_version, triage=triage,
+                                skip_unavailable=skip_unavailable)
     if not skip_flatpak and data["flatpak"]["status"] == "captured":
         _check_standard_installations()
         try:

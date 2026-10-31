@@ -255,6 +255,65 @@ def print_limited(lines):
         print(f"    ... and {len(lines) - MAX_LISTED} more")
 
 
+def _names(items):
+    """A sorted, capped, comma-separated list of identifiers from bundle data."""
+    shown = [report.clip(item, 60) for item in items[:MAX_LISTED]]
+    more = f", ... and {len(items) - MAX_LISTED} more" if len(items) > MAX_LISTED else ""
+    return ", ".join(shown) + more
+
+
+def print_rpm_triage(data, triage, *, skip_unavailable):
+    """Report how the recorded RPM requests map onto this system's repositories."""
+    unavailable = triage["unavailable"]
+    skipped = sum(len(specs) for specs in unavailable.values())
+    print("RPM triage against this system's repositories (read-only queries):")
+    print(f"  Already installed: {len(triage['installed'])} (not requested again)")
+    print(f"  To install: {len(triage['installable'])}")
+    print_limited([f"    {report.clip(spec)}" for spec in triage["installable"]])
+    if triage["installable_from_local"]:
+        print(f"  Note: {len(triage['installable_from_local'])} of these were installed from a "
+              "local file or an unknown source on the old system; this system's repositories "
+              "provide the same name now. Check that it is the same software:")
+        print_limited([f"    {report.clip(spec)}" for spec in triage["installable_from_local"]])
+    print(f"  Unavailable: {skipped}" + (f" in {len(unavailable)} source repositories" if unavailable else ""))
+    for repo, specs in list(unavailable.items())[:MAX_LISTED]:
+        print(f"    From repository {report.clip(repo)} ({len(specs)} package{'s' if len(specs) != 1 else ''}): "
+              + report.clip(packages.unavailable_hint(data, repo), 400))
+        print_limited([f"      {report.clip(spec)}" for spec in specs])
+    if len(unavailable) > MAX_LISTED:
+        print(f"    ... and {len(unavailable) - MAX_LISTED} more repositories")
+    if skipped and skip_unavailable:
+        print(f"  Skipped: these {skipped} unavailable packages are left out because "
+              "--skip-unavailable was given.")
+    elif skipped:
+        print("  Apply will refuse to start while packages are unavailable; fix the repositories "
+              "and retry, or add --skip-unavailable to install only what is available.")
+    print(f"  Manual handling: {len(triage['manual'])} (installed from a local file or an unknown "
+          "source; this tool never installs them)")
+    print_limited([f"    {report.clip(item['full_nevra'])} (from {report.clip(item['from_repo'] or 'unknown')})"
+                   for item in triage["manual"]])
+    environments = [item["id"] for item in data["rpm"].get("environments", [])]
+    groups = [item["id"] for item in data["rpm"].get("groups", [])]
+    if environments or groups:
+        print(f"  The source had environment(s): {_names(environments) or 'none'}; "
+              f"groups: {_names(groups) or 'none'}. These are not installed as groups "
+              "\u2014 only explicit packages are requested.")
+
+
+def unavailable_refusal(data, triage):
+    """The error shown when apply would start with unavailable RPM packages."""
+    lines = ["Some recorded RPM packages are not available on this system, so nothing was "
+             "installed or restored:"]
+    for repo, specs in list(triage["unavailable"].items())[:MAX_LISTED]:
+        lines.append(f"  repository {report.clip(repo)}: {len(specs)} package"
+                     f"{'s' if len(specs) != 1 else ''}; {report.clip(packages.unavailable_hint(data, repo), 400)}")
+    if len(triage["unavailable"]) > MAX_LISTED:
+        lines.append(f"  ... and {len(triage['unavailable']) - MAX_LISTED} more repositories")
+    lines.append("Fix the repositories and retry, or add --skip-unavailable to install only the "
+                 "available packages and skip these.")
+    return "\n".join(lines)
+
+
 def print_destination_checks(source_path, manifest, home, plan, *, rewrite, apply):
     """Report, read-only, what a restore will replace and what may need repair.
 
@@ -379,10 +438,17 @@ def restore_command(args):
     print_destination_checks(source_path, manifest, home, plan,
                              rewrite=args.rewrite_home, apply=args.apply)
     commands = []
+    triage = None
     if args.install_packages:
+        if not args.skip_rpm and manifest["packages"]["rpm"]["requests"]:
+            triage = packages.triage_rpm(manifest["packages"], *packages.collect_destination_rpms())
+            print_rpm_triage(manifest["packages"], triage, skip_unavailable=args.skip_unavailable)
+            if args.apply and triage["unavailable"] and not args.skip_unavailable:
+                raise MigrationError(unavailable_refusal(manifest["packages"], triage))
         commands = packages.package_commands(
             manifest["packages"], skip_rpm=args.skip_rpm, skip_flatpak=args.skip_flatpak,
-            schema_version=manifest["schema_version"],
+            schema_version=manifest["schema_version"], triage=triage,
+            skip_unavailable=args.skip_unavailable,
         )
         print(f"Package commands (repositories must already be configured for Fedora {destination}):")
         for command in commands:
@@ -391,6 +457,8 @@ def restore_command(args):
             print("  No package requests selected.")
     else:
         print("Package installation is not selected; use --install-packages to include it.")
+        if args.skip_unavailable:
+            print("Note: --skip-unavailable has no effect without --install-packages.")
     if not args.apply:
         print("Preview only: no files, packages, logs, or rollback directories were changed.")
         print("Review the plan, then add --apply to perform this restore.")
@@ -403,7 +471,8 @@ def restore_command(args):
         print("Installing requested packages with their normal confirmation prompts...", flush=True)
         packages.install_packages(
             manifest["packages"], skip_rpm=args.skip_rpm, skip_flatpak=args.skip_flatpak,
-            schema_version=manifest["schema_version"],
+            schema_version=manifest["schema_version"], triage=triage,
+            skip_unavailable=args.skip_unavailable,
         )
     def recheck_before_writing():
         # Package installs and re-verifying a large bundle take time: recheck
@@ -559,6 +628,7 @@ def parser():
     restore.add_argument("--install-packages", action="store_true", help="Also reinstall recorded RPMs and Flatpaks, retaining manager confirmations")
     restore.add_argument("--skip-rpm", action="store_true", help="Omit RPMs when installing packages")
     restore.add_argument("--skip-flatpak", action="store_true", help="Omit Flatpaks when installing packages")
+    restore.add_argument("--skip-unavailable", action="store_true", help="With --install-packages, continue when some recorded RPMs are unavailable here and install only the available ones (default: refuse before changing anything)")
     restore.add_argument("--rewrite-home", action="store_true", help="With --apply, replace the old home path with this home in the settings files listed by the preview (never browser or Flatpak data); the preview shows what would change")
     restore.add_argument("--rollback-dir", type=Path, help="New directory for overwritten files and restore journal")
     restore.set_defaults(handler=restore_command)

@@ -30,16 +30,35 @@ jobs:
         run: |
           python3 fedora-migration.py --help
           bash -n migration.sh
-      - name: Exercise real DNF5 and empty Flatpak inventories
+      - name: Exercise real DNF5 inventory, triage and empty Flatpak inventories
         run: |
           python3 - <<'PY'
-          from fedora_migration.packages import collect_packages, validate_package_manifest
+          from fedora_migration.packages import (
+              collect_destination_rpms, collect_packages, triage_rpm, validate_package_manifest)
           inventory = collect_packages()
-          validate_package_manifest(inventory)
+          validate_package_manifest(inventory, 2)
           assert inventory['rpm']['status'] == 'captured'
           assert inventory['rpm']['requests'], 'Expected installed RPM requests in the Fedora container'
           assert inventory['rpm']['inventory'], 'Expected an RPM inventory'
+          assert inventory['rpm']['repos'], 'Expected enabled repositories from dnf5 repo info --json'
           assert inventory['flatpak']['status'] == 'captured'
-          print('Captured', len(inventory['rpm']['requests']), 'RPM requests and',
+          print('Captured', len(inventory['rpm']['requests']), 'RPM requests,',
+                len(inventory['rpm']['repos']), 'repositories,',
+                len(inventory['rpm']['groups']), 'groups,',
+                len(inventory['rpm']['environments']), 'environments and',
                 len(inventory['flatpak']['apps']), 'Flatpak apps')
+          for warning in inventory['warnings']:
+              print('Warning:', warning)
+          installed, available = collect_destination_rpms()
+          assert installed, 'Expected installed packages on the destination query'
+          assert available, 'Expected available packages from the enabled repositories'
+          triage = triage_rpm(inventory, installed, available)
+          requests = inventory['rpm']['requests']
+          classified = (triage['installed'] + triage['installable']
+                        + [item['spec'] for item in triage['manual']]
+                        + [spec for specs in triage['unavailable'].values() for spec in specs])
+          assert sorted(classified) == sorted(requests), 'Every request must be classified exactly once'
+          assert len(triage['installed']) * 2 > len(requests), (
+              'Most requests should already be installed', {k: len(v) for k, v in triage.items()})
+          print('Triage:', {key: len(value) for key, value in triage.items()})
           PY

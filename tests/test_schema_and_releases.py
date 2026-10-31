@@ -40,7 +40,8 @@ def cli_module():
 
 def package_fixture():
     return {
-        "rpm": {"status": "captured", "requests": [], "inventory": []},
+        "rpm": {"status": "captured", "requests": [], "inventory": [],
+                "repos": [], "groups": [], "environments": []},
         "flatpak": {"status": "not-installed", "apps": [], "remotes": []},
         "warnings": [],
     }
@@ -134,6 +135,12 @@ class FrozenV1Fixture(unittest.TestCase):
         guard = patch.object(cli_module(), "assert_applications_closed")
         guard.start()
         self.addCleanup(guard.stop)
+        # Package triage queries the real destination; the frozen bundle tests must not.
+        self.installed, self.available = set(), {"gcc.x86_64", "htop.x86_64"}
+        collector = patch.object(cli_module().packages, "collect_destination_rpms",
+                                 side_effect=lambda: (set(self.installed), set(self.available)))
+        collector.start()
+        self.addCleanup(collector.stop)
         self.info = {
             "id": "fedora", "version_id": "44", "pretty_name": "Fedora Linux 44",
             "home": str(self.target), "uid": 1000, "username": "bob",
@@ -218,6 +225,23 @@ class FrozenV1CLITests(FrozenV1Fixture):
         self.assertIn("flatpak install --user flathub org.gimp.GIMP/x86_64/stable", out)
         self.assertEqual(list(self.target.iterdir()), [])
         self.assertNotIn("has not been tested", out)
+
+    def test_frozen_bundle_package_preview_is_triaged_without_recorded_repositories(self):
+        self.installed, self.available = {"gcc.x86_64"}, set()
+        code, out, err = self.invoke("restore", "--bundle", str(self.bundle),
+                                     "--install-packages")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Already installed: 1", out)
+        self.assertIn("Unavailable: 1", out)
+        self.assertIn("repository fedora from the source system is not recorded", out)
+        self.assertNotIn("sudo dnf5 install", out)
+        self.assertIn("flatpak install --user flathub org.gimp.GIMP/x86_64/stable", out)
+        self.assertEqual(list(self.target.iterdir()), [])
+        code, _, err = self.invoke("restore", "--bundle", str(self.bundle),
+                                   "--install-packages", "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("--skip-unavailable", err)
+        self.assertEqual(list(self.target.iterdir()), [])
 
     def test_restore_apply_restores_the_frozen_bundle_exactly(self):
         code, out, err = self.invoke("restore", "--bundle", str(self.bundle), "--apply")
