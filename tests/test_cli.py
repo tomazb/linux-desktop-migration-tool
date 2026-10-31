@@ -1,6 +1,7 @@
 """CLI policy tests; external system changes are mocked, file fixtures are real."""
 
 import contextlib
+import errno
 import importlib
 import io
 import json
@@ -304,6 +305,36 @@ class CLITests(unittest.TestCase):
         self.assertEqual((target / ".bashrc").read_text(), f"export P={self.home}/bin\n")
         self.assertIn("Rewrote the old home path in 1 file", out)
 
+    def test_unsafe_rewrite_home_refuses_before_package_installation_or_restore(self):
+        cli = cli_module()
+        bundle, target, info = self.references_fixture()
+        unsafe_target = self.root / "target&home"
+        target.rename(unsafe_target)
+        info["home"] = str(unsafe_target)
+        installed = self.root / "packages-were-installed"
+
+        def install(*_args, **_kwargs):
+            installed.write_text("package side effect")
+
+        with patch.object(cli.packages, "install_packages", side_effect=install):
+            code, _, err = self.restore(info, "--bundle", str(bundle), "--apply",
+                                        "--install-packages", "--rewrite-home")
+        self.assertEqual(code, 1)
+        self.assertIn("rewrite-home", err)
+        self.assertIn("ASCII", err)
+        self.assertFalse(installed.exists())
+        self.assertEqual(list(unsafe_target.iterdir()), [])
+
+    def test_preview_rejects_unsafe_rewrite_home_without_writes(self):
+        bundle, target, info = self.references_fixture()
+        unsafe_target = self.root / "target home"
+        target.rename(unsafe_target)
+        info["home"] = str(unsafe_target)
+        code, _, err = self.restore(info, "--bundle", str(bundle), "--rewrite-home")
+        self.assertEqual(code, 1)
+        self.assertIn("rewrite-home", err)
+        self.assertEqual(list(unsafe_target.iterdir()), [])
+
     def test_old_source_home_note_is_not_duplicated(self):
         cli = cli_module()
         bundle = self.backup_fixture()
@@ -524,6 +555,35 @@ class CLITests(unittest.TestCase):
         self.assertIn(str(undone[0]), out)
         self.assertEqual(json.loads((rollback / "rollback-journal.json").read_text())["status"],
                          "complete")
+
+    def test_rollback_warns_when_older_journal_cannot_restore_directory_metadata(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        journal = json.loads((rollback / "journal.json").read_text())
+        journal.pop("original_directories", None)
+        (rollback / "journal.json").write_text(json.dumps(journal))
+        code, out, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 0, err)
+        self.assertIn("directory metadata", out)
+        self.assertIn("cannot be restored", out)
+
+    def test_cross_device_rollback_reports_retained_original_locations(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        real = os.rename
+
+        def cross_device(source, destination, **kwargs):
+            if kwargs.get("src_dir_fd") is not None and kwargs.get("dst_dir_fd") is None:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real(source, destination, **kwargs)
+
+        with patch.object(cli_module(), "assert_xfce_stopped"), \
+             patch("fedora_migration.rollback.os.rename", side_effect=cross_device):
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        records = json.loads((rollback / "rollback-journal.json").read_text())["retained_quarantines"]
+        self.assertTrue(records)
+        for item in records:
+            self.assertIn(str(target / item["quarantine"]), out)
+        self.assertIn("all writers are stopped", out)
 
     def test_rollback_apply_runs_guards_before_the_first_write(self):
         cli = cli_module()

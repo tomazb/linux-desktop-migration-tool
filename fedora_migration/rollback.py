@@ -15,7 +15,8 @@ Threat model: rollback assumes the home is quiescent, which the CLI checks (no
 XFCE session, no browser, mail or Flatpak applications). It never overwrites or
 deletes an entry it has not captured: a destination's parent is pinned by file
 descriptor, walked from "/" without following symlinks; the current entry is
-moved (renamed) into undone-<time>/ before anything is published; and the
+    captured by rename before anything is published (and retained beside the
+    destination as well as copied out when undone-<time>/ is across filesystems); the
 original is published with a hard link, which fails instead of replacing. A
 concurrent writer can therefore at most make one path fail, with both versions
 kept. Writes inside the rollback directory itself use ordinary paths: it is the
@@ -34,7 +35,8 @@ import stat
 import uuid
 
 from .bundle import (
-    BundleError, BundleInterrupted, _absolute, _assert_no_symlink_ancestors,
+    BundleError, BundleInterrupted, MIN_MTIME_NS, MAX_MTIME_NS,
+    _absolute, _assert_no_symlink_ancestors,
     _digest, _fingerprint, _fsync_directory, _kind, _owner_accessible,
     _private_parents, _safe_path, _update_journal, _validated_rewrite, _within,
     _within_secret, verify_bundle,
@@ -95,6 +97,22 @@ def _load_journal(rollback):
     directories = _path_list(journal, "created_directories")
     if set(replaced) & set(new) or set(directories) & (set(replaced) | set(new)):
         raise BundleError("Invalid journal: a path is listed in more than one group.")
+    if "original_directories" in journal:
+        metadata = journal["original_directories"]
+        if not isinstance(metadata, list):
+            raise BundleError("Invalid journal: original_directories must be a list.")
+        seen = set(replaced) | set(new) | set(directories)
+        for item in metadata:
+            if not isinstance(item, dict):
+                raise BundleError("Invalid journal: original directory metadata must be an object.")
+            path = _safe_path(item.get("path"))
+            if path in seen:
+                raise BundleError(f"Invalid journal: duplicate original directory path: {path}")
+            seen.add(path)
+            if (type(item.get("mode")) is not int or not 0 <= item["mode"] <= 0o7777
+                    or type(item.get("mtime_ns")) is not int
+                    or not MIN_MTIME_NS <= item["mtime_ns"] <= MAX_MTIME_NS):
+                raise BundleError(f"Invalid journal: original directory metadata for {path}")
     rewrite = journal.get("rewrite_home")
     if rewrite is not None:
         if (not isinstance(rewrite, list) or len(rewrite) != 2
@@ -107,13 +125,38 @@ def _load_journal(rollback):
 def _refuse_if_rolled_back(rollback):
     path = rollback / ROLLBACK_JOURNAL
     if not os.path.lexists(path):
-        return
+        return {}
     previous = _read_json_file(path, "rollback journal")
     status = previous.get("status") if isinstance(previous, dict) else None
     if status == "complete":
         raise BundleError(f"This restore was already rolled back (see {path}).")
     if not isinstance(status, str):
         raise BundleError(f"The rollback journal is unreadable: {path}")
+    return previous
+
+
+def _retained_quarantines(previous, home):
+    """Validate recovery references before carrying them into a retry's journal."""
+    records = previous.get("retained_quarantines", [])
+    if not isinstance(records, list):
+        raise BundleError("Invalid rollback journal: retained_quarantines must be a list.")
+    if records and previous.get("home") != str(home):
+        raise BundleError("Invalid rollback journal: quarantines belong to another home.")
+    seen = set()
+    for item in records:
+        if not isinstance(item, dict):
+            raise BundleError("Invalid rollback journal: quarantine reference must be an object.")
+        source = PurePosixPath(_safe_path(item.get("path")))
+        path = PurePosixPath(_safe_path(item.get("quarantine")))
+        name = path.parent.name
+        suffix = name.removeprefix(".fedora-migration-quarantine-")
+        if (path.name != "entry" or path.parent.parent != source.parent
+                or not name.startswith(".fedora-migration-quarantine-")
+                or len(suffix) != 32 or any(c not in "0123456789abcdef" for c in suffix)
+                or str(path) in seen):
+            raise BundleError(f"Invalid rollback journal quarantine: {path}")
+        seen.add(str(path))
+    return records
 
 
 def _verified_manifest(bundle):
@@ -191,11 +234,16 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
     if not rollback.is_dir():
         raise BundleError(f"Rollback directory does not exist: {rollback}")
     journal, rewrite = _load_journal(rollback)
+    original_directories = journal.get("original_directories", [])
+    warnings = ([] if "original_directories" in journal else [
+        "This older restore journal has no original directory metadata; existing selected "
+        "directory permissions and timestamps cannot be restored. Check them by hand."])
     if _absolute(journal["home"]) != home:
         raise BundleError(
             f"This rollback directory belongs to home {journal['home']}, not {home}. "
             "Refusing to change another home.")
-    _refuse_if_rolled_back(rollback)
+    previous_rollback = _refuse_if_rolled_back(rollback)
+    retained_quarantines = _retained_quarantines(previous_rollback, home)
     bundle_path = _absolute(bundle if bundle is not None else journal["bundle"])
     entries, problem = _verified_manifest(bundle_path)
     previous = rollback / "previous"
@@ -217,7 +265,8 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
                 raise BundleError(
                     f"Journal path {relative} lies inside the rollback directory or the bundle.")
         _assert_no_symlink_ancestors(destination)
-    for relative in journal["created_directories"]:
+    original_paths = {item["path"] for item in original_directories}
+    for relative in journal["created_directories"] + sorted(original_paths):
         # A created directory may legitimately contain the rollback directory
         # (the restore made it first), so only the other overlaps are refused.
         directory = home / relative
@@ -226,6 +275,10 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
                     _within(protected, candidate) for protected in bundles):
                 raise BundleError(
                     f"Journal directory {relative} overlaps the rollback directory or the bundle.")
+        if relative in original_paths:
+            _assert_no_symlink_ancestors(directory, include_leaf=True)
+            if os.path.lexists(directory) and not directory.is_dir():
+                raise BundleError(f"Original directory is no longer a directory: {directory}")
 
     for relative in journal["replaced"]:
         saved = previous / relative
@@ -261,6 +314,29 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
     put_back.sort()
     remove.sort()
     existing, removable, kept = _directory_forecast(home, journal["created_directories"], remove)
+    restore_metadata = []
+    for original in original_directories:
+        relative = original["path"]
+        reason = None
+        try:
+            info = (home / relative).lstat()
+        except FileNotFoundError:
+            pass  # recreate an original empty directory, like a missing saved file
+        else:
+            current = (stat.S_IMODE(info.st_mode), info.st_mtime_ns)
+            if current != (original["mode"], original["mtime_ns"]):
+                if entries is None:
+                    reason = f"cannot verify directory metadata: the bundle is unavailable ({problem})"
+                else:
+                    entry = entries.get(relative)
+                    if (entry is None or entry["type"] != "directory"
+                            or current != (entry["mode"], entry["mtime_ns"])):
+                        reason = ("directory metadata differs from what the restore wrote "
+                                  "(changed since the restore)")
+        if reason:
+            conflicts.append(_conflict(relative, "restore_directory_metadata", reason))
+        if reason is None or include_changed:
+            restore_metadata.append(original)
     return {
         "rollback_dir": str(rollback), "home": str(home), "status": journal["status"],
         "bundle": str(bundle_path), "verified": problem is None, "bundle_problem": problem,
@@ -268,7 +344,11 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
         "put_back": put_back, "remove": remove, "unchanged": sorted(unchanged),
         "absent": sorted(absent), "conflicts": conflicts,
         "directories": existing, "remove_directories": removable, "kept_directories": kept,
-        "secrets": any(_within_secret(path) for path in everything + journal["created_directories"]),
+        "original_directories": original_directories, "warnings": warnings,
+        "restore_directory_metadata": restore_metadata,
+        "retained_quarantines": retained_quarantines,
+        "secrets": any(_within_secret(path) for path in
+                       everything + journal["created_directories"] + sorted(original_paths)),
     }
 
 
@@ -465,46 +545,46 @@ def _restore_by_link(source, leaf, where, *, src_dir_fd, dst_dir_fd):
     os.unlink(source, dir_fd=src_dir_fd)
 
 
-def _capture_across_devices(descriptor, leaf, destination, staging):
+def _capture_across_devices(descriptor, leaf, destination, staging, on_quarantine=None):
     """Capture by quarantine when undone/ is on another filesystem.
 
     The entry is renamed (atomically, same filesystem) into a private directory
-    next to it, then copied out. Returns (restore, finish): restore links it back
-    to leaf without replacing, finish discards the quarantine once the caller is done.
+    next to it, then copied out. Keep the captured inode: a writer with an open
+    descriptor can still edit it after the copy, even after rollback returns.
+    on_quarantine journals its location before the rename. Only returning that
+    same inode to leaf permits removing its recovery reference.
     """
     name = ".fedora-migration-quarantine-" + uuid.uuid4().hex
     os.mkdir(name, 0o700, dir_fd=descriptor)
-    quarantine = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
     where = f"{name}/entry beside {leaf}"
-
-    def discard():
-        with contextlib.suppress(OSError):
-            os.unlink("entry", dir_fd=quarantine)
-        os.close(quarantine)
-        os.rmdir(name, dir_fd=descriptor)
-        os.fsync(descriptor)
-
-    copied = []
+    quarantine = None
+    release = None
+    moved = False
 
     def restore():
         try:
-            _restore_by_link("entry", leaf, where, src_dir_fd=quarantine, dst_dir_fd=descriptor)
-        except BundleError:
-            if not copied:
-                raise
-            # Something new occupies leaf. The complete copy is in undone/, so the
-            # quarantined original is redundant.
-            discard()
-            raise BundleError(
-                f"{leaf} was created by someone else while rolling back and was left "
-                f"untouched; the entry that was there before is kept in {destination}.") from None
-        discard()
+            recovery = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            try:
+                _restore_by_link("entry", leaf, where, src_dir_fd=recovery, dst_dir_fd=descriptor)
+            finally:
+                os.close(recovery)
+            os.rmdir(name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        except (BundleError, OSError) as exc:
+            raise BundleError(f"{exc}; the captured original is retained at {where}.") from exc
+        if release is not None:
+            release()
 
     try:
+        quarantine = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+        if on_quarantine is not None:
+            where, release = on_quarantine(name)
         os.rename(leaf, "entry", src_dir_fd=descriptor, dst_dir_fd=quarantine)
+        moved = True
+        os.fsync(quarantine)
+        os.fsync(descriptor)
         try:
             _copy_entry_out(quarantine, "entry", destination, staging)
-            copied.append(True)
         except BaseException as exc:
             try:
                 restore()
@@ -513,15 +593,19 @@ def _capture_across_devices(descriptor, leaf, destination, staging):
                     raise BundleError(f"{exc}; {problem}") from exc
             raise
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(quarantine)
-        with contextlib.suppress(OSError):
-            os.rmdir(name, dir_fd=descriptor)
+        if not moved:
+            with contextlib.suppress(OSError):
+                os.rmdir(name, dir_fd=descriptor)
+            if release is not None:
+                release()
         raise
-    return restore, discard
+    finally:
+        if quarantine is not None:
+            os.close(quarantine)
+    return restore, lambda: None
 
 
-def _capture(descriptor, leaf, destination, staging):
+def _capture(descriptor, leaf, destination, staging, on_quarantine=None):
     """Move the current entry into the undone directory; return (restore, finish).
 
     A rename moves the exact entry, so no edit can fall between saving and
@@ -536,7 +620,7 @@ def _capture(descriptor, leaf, destination, staging):
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-        return _capture_across_devices(descriptor, leaf, destination, staging)
+        return _capture_across_devices(descriptor, leaf, destination, staging, on_quarantine)
     _fsync_directory(destination.parent)
     os.fsync(descriptor)
     return (lambda: _restore_by_link(os.fspath(destination), leaf, destination,
@@ -551,7 +635,7 @@ def _check_hard_links(descriptor, staged, destination):
     os.unlink(probe, dir_fd=descriptor)
 
 
-def _apply_action(home, relative, action, rollback, undone, staging):
+def _apply_action(home, relative, action, rollback, undone, staging, retain_quarantine=None):
     """Put back or remove one path, saving the current entry under undone/ first."""
     destination = home / relative
     leaf = destination.name
@@ -575,7 +659,9 @@ def _apply_action(home, relative, action, rollback, undone, staging):
             _check_hard_links(descriptor, staged, destination)
         finish = None
         if info is not None:
-            restore, finish = _capture(descriptor, leaf, undone / relative, staging)
+            callback = ((lambda name: retain_quarantine(relative, name))
+                        if retain_quarantine is not None else None)
+            restore, finish = _capture(descriptor, leaf, undone / relative, staging, callback)
         if action == "put_back":
             try:
                 _link_no_replace(staged, leaf, src_dir_fd=descriptor, dst_dir_fd=descriptor)
@@ -612,6 +698,87 @@ def _holds_copies(directory):
         if names or any(os.path.islink(os.path.join(root, name)) for name in folders):
             return True
     return False
+
+
+def _open_directory(home, relative, *, create=False, identity=None):
+    """Open a managed directory itself without following a replaced parent or leaf."""
+    parent = _pin(home, relative, create=create)
+    if parent is None:
+        return None
+    try:
+        leaf = PurePosixPath(relative).name
+        try:
+            descriptor = os.open(leaf, _DIRECTORY_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            if not create:
+                return None
+            os.mkdir(leaf, 0o700, dir_fd=parent)
+            os.fsync(parent)
+            descriptor = os.open(leaf, _DIRECTORY_FLAGS, dir_fd=parent)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise BundleError(f"Refusing symlink or non-directory: {home / relative}") from exc
+            if exc.errno in (errno.EACCES, errno.EPERM):
+                raise BundleError(
+                    f"Cannot open managed directory {home / relative}; grant owner read and "
+                    "execute access by hand before retrying rollback.") from exc
+            raise
+        try:
+            info = os.fstat(descriptor)
+            if identity is not None and (info.st_dev, info.st_ino) != identity:
+                raise BundleError(f"Managed directory changed during rollback: {home / relative}")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    finally:
+        os.close(parent)
+
+
+def _prepare_directory_access(home, paths, changes):
+    """Temporarily grant owner access so restored read-only directories can be undone."""
+    for relative in sorted(set(paths), key=lambda value: (value.count("/"), value)):
+        descriptor = _open_directory(home, relative)
+        if descriptor is None:
+            continue
+        try:
+            info = os.fstat(descriptor)
+            mode = stat.S_IMODE(info.st_mode)
+            if mode & 0o700 != 0o700:
+                changes.append((relative, mode, (info.st_dev, info.st_ino)))
+                os.fchmod(descriptor, mode | 0o700)
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _restore_directory_access(home, changes, preserve=()):
+    """Reset temporary modes, refusing to chmod an entry substituted in the meantime."""
+    for item in list(reversed(changes)):
+        relative, mode, identity = item
+        if relative in preserve:
+            continue
+        descriptor = _open_directory(home, relative, identity=identity)
+        if descriptor is not None:
+            try:
+                os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        changes.remove(item)
+
+
+def _restore_directory_metadata(home, metadata):
+    """Restore original selected-root metadata after all directory-entry changes."""
+    for item in sorted(metadata, key=lambda value: (-value["path"].count("/"), value["path"])):
+        descriptor = _open_directory(home, item["path"], create=True)
+        try:
+            info = os.fstat(descriptor)
+            os.fchmod(descriptor, item["mode"])
+            os.utime(descriptor, ns=(info.st_atime_ns, item["mtime_ns"]))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _remove_empty_directory(home, relative):
@@ -671,17 +838,40 @@ def apply_rollback(rollback_dir, home, *, bundle=None, include_changed=False,
         "skipped_conflicts": [{"path": item["path"], "reason": item["reason"]}
                               for item in skipped],
         "directories": list(plan["directories"]),
+        "original_directories": plan["original_directories"], "warnings": plan["warnings"],
+        "restore_directory_metadata": plan["restore_directory_metadata"],
+        "retained_quarantines": list(plan["retained_quarantines"]),
     }
+
+    def retain_quarantine(relative, name):
+        path = (PurePosixPath(relative).parent / name / "entry").as_posix()
+        record = {"path": relative, "quarantine": path}
+        journal["retained_quarantines"].append(record)
+        try:
+            _update_journal(rollback, journal, ROLLBACK_JOURNAL)
+        except BaseException:
+            journal["retained_quarantines"].remove(record)
+            raise
+
+        def release():
+            journal["retained_quarantines"].remove(record)
+            _update_journal(rollback, journal, ROLLBACK_JOURNAL)
+
+        return str(home / path), release
+
     started = False
+    access_changes = []
     try:
         _update_journal(rollback, journal, ROLLBACK_JOURNAL)
         started = True
         undone.mkdir(mode=0o700)
         staging.mkdir(mode=0o700)
         _fsync_directory(rollback)
+        _prepare_directory_access(home, plan["directories"] + [
+            item["path"] for item in plan["original_directories"]], access_changes)
         for relative, action in actions:
             _assert_no_symlink_ancestors(home / relative)
-            _apply_action(home, relative, action, rollback, undone, staging)
+            _apply_action(home, relative, action, rollback, undone, staging, retain_quarantine)
         # Directories that were not removable at plan time because they are no
         # longer directories; the loop below reports the rest as it finds them.
         removed_directories = []
@@ -696,6 +886,10 @@ def apply_rollback(rollback_dir, home, *, bundle=None, include_changed=False,
                 kept.append({"path": relative, "reason": reason})
             elif not os.path.lexists(path):
                 removed_directories.append(relative)
+        original_paths = {item["path"] for item in plan["restore_directory_metadata"]}
+        _restore_directory_access(home, access_changes, preserve=original_paths)
+        _restore_directory_metadata(home, plan["restore_directory_metadata"])
+        access_changes.clear()  # remaining original-root grants now have their final modes
         staging.rmdir()
         used = any(undone.iterdir())
         if not used:
@@ -709,10 +903,17 @@ def apply_rollback(rollback_dir, home, *, bundle=None, include_changed=False,
             "removed": [path for path, action in actions if action == "remove"],
             "unchanged": plan["unchanged"], "conflicts": plan["conflicts"],
             "skipped": skipped, "removed_directories": removed_directories, "kept_directories": kept,
+            "restored_directories": [item["path"] for item in plan["restore_directory_metadata"]],
+            "warnings": plan["warnings"],
+            "retained_quarantines": journal["retained_quarantines"],
         }
     except (BundleError, OSError, ValueError, TypeError, OverflowError,
             KeyboardInterrupt) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
+        try:
+            _restore_directory_access(home, access_changes)
+        except (BundleError, OSError) as problem:
+            exc = BundleError(f"{exc}. Could not reset temporary directory access: {problem}")
         try:
             staging.rmdir()
         except OSError:
@@ -726,6 +927,11 @@ def apply_rollback(rollback_dir, home, *, bundle=None, include_changed=False,
                 pass
         saved = (f"Current versions saved before replacement are in {undone}."
                  if _holds_copies(undone) else "No current versions had been saved.")
+        if journal["retained_quarantines"]:
+            locations = ", ".join(str(home / item["quarantine"])
+                                  for item in journal["retained_quarantines"][:3])
+            saved += (f" Captured cross-filesystem originals remain at {locations}; "
+                      f"all recovery locations are listed in {rollback / ROLLBACK_JOURNAL}.")
         if interrupted:
             raise BundleInterrupted(
                 f"Rollback interrupted. {saved} Retained rollback directory: {rollback}. "

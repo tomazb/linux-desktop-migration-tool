@@ -1,11 +1,15 @@
 """Schema 2 repository/group records, destination triage and Flatpak batching."""
 
+import contextlib
 import copy
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -116,6 +120,40 @@ class RepositoryCollectionTests(CollectionFixture):
         self.assertEqual(data["rpm"]["repos"], [])
         self.assertIn("repo", self.warnings_text(data).lower())
         self.assertEqual(data["rpm"]["requests"], ["gcc.x86_64"])
+
+    def test_command_failure_credentials_are_not_saved_or_printed(self):
+        from fedora_migration import bundle, cli
+
+        credential = "SENTINEL_REPOSITORY_CREDENTIAL"
+        diagnostic = (f'Could not load https://alice:{credential}@repo.example/f43/; '
+                      f'authorization: Bearer {credential}')
+
+        def command_result(argv, **kwargs):
+            if argv[:3] == ["dnf5", "repo", "info"]:
+                raise subprocess.CalledProcessError(1, argv, stderr=diagnostic)
+            return subprocess.CompletedProcess(argv, 0, stdout=self.run_output(argv))
+
+        with patch.object(packages.subprocess, "run", side_effect=command_result):
+            data = packages.collect_packages(skip_flatpak=True)
+        root = self.groups_file.parent
+        home = root / "home"
+        home.mkdir()
+        output = root / "bundle"
+        source = {"id": "fedora", "version_id": "43", "home": str(home),
+                  "username": "alice", "uid": 1000, "architecture": "x86_64"}
+        with patch.dict(os.environ):
+            for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+                os.environ.pop(variable, None)
+            bundle.create_bundle(home, output, source, data, settings_only=True)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["verify", "--bundle", str(output)])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(data["rpm"]["repos"], [])
+        self.assertIn("repositories", self.warnings_text(data))
+        self.assertNotIn(credential, (output / "manifest.json").read_text())
+        self.assertNotIn(credential, out.getvalue() + err.getvalue())
+        self.assertNotIn("dnf5 repo info", self.warnings_text(data))
 
     def test_unusable_json_is_a_warning_with_no_repos(self):
         for output in ("not json", "", "{}", '{"id": "x"}', "[1]", '[{"name": "no id"}]', "null"):
@@ -244,6 +282,76 @@ class GroupStateCollectionTests(CollectionFixture):
         data = self.collect()
         self.assertEqual(data["rpm"]["requests"], ["gcc.x86_64"])
         self.assertEqual(data["rpm"]["inventory"][0]["spec"], "gcc.x86_64")
+
+
+class MissingTomlTests(CollectionFixture):
+    def run_without_tomllib(self, script, *args):
+        # A fresh interpreter models Python 3.10 without altering this test
+        # process's imports. The sentinel also detects leaked import errors.
+        bootstrap = """\
+import importlib.abc
+import sys
+class MissingToml(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "tomllib":
+            raise ModuleNotFoundError("TOML_IMPORT_ERROR_SENTINEL", name=fullname)
+sys.meta_path.insert(0, MissingToml())
+"""
+        return subprocess.run(
+            [sys.executable, "-c", bootstrap + textwrap.dedent(script), *map(str, args)],
+            cwd=Path(__file__).resolve().parents[1], text=True, capture_output=True,
+            check=False,
+        )
+
+    def test_help_works_without_tomllib(self):
+        result = self.run_without_tomllib("""
+            import runpy
+            sys.argv = ["fedora-migration.py", "--help"]
+            runpy.run_path("fedora-migration.py", run_name="__main__")
+        """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backup", result.stdout)
+        self.assertIn("restore", result.stdout)
+
+    def test_frozen_v1_verify_works_without_tomllib(self):
+        result = self.run_without_tomllib("""
+            import runpy
+            sys.argv = ["fedora-migration.py", "verify", "--bundle", "tests/fixtures/bundle-v1"]
+            runpy.run_path("fedora-migration.py", run_name="__main__")
+        """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checksums verified", result.stdout)
+
+    def test_missing_tomllib_omits_only_optional_state_with_a_generic_warning(self):
+        result = self.run_without_tomllib("""
+            import json
+            from pathlib import Path
+            from unittest.mock import patch
+            from fedora_migration import packages
+
+            def command_output(argv, **kwargs):
+                if argv[:3] == ["dnf5", "repo", "info"]:
+                    return "[]"
+                if "--userinstalled" in argv:
+                    return "gcc.x86_64\\n"
+                return "gcc.x86_64\\tUser\\tfedora\\tgcc-0:15.2-1.fc43.x86_64\\n"
+
+            with patch.object(packages, "_run", side_effect=command_output), \\
+                 patch.object(packages, "GROUPS_STATE", Path(sys.argv[1])), \\
+                 patch.object(packages, "ENVIRONMENTS_STATE", Path(sys.argv[2])):
+                print(json.dumps(packages.collect_packages(skip_flatpak=True)))
+        """, self.groups_file, self.environments_file)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["rpm"]["requests"], ["gcc.x86_64"])
+        self.assertEqual(data["rpm"]["inventory"][0]["spec"], "gcc.x86_64")
+        self.assertEqual((data["rpm"]["groups"], data["rpm"]["environments"]), ([], []))
+        warnings = self.warnings_text(data)
+        self.assertIn("TOML", warnings)
+        self.assertIn("groups", warnings)
+        self.assertIn("environments", warnings)
+        self.assertNotIn("TOML_IMPORT_ERROR_SENTINEL", warnings)
+        packages.validate_package_manifest(data)
 
 
 class LocaleTests(unittest.TestCase):

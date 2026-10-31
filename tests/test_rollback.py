@@ -73,6 +73,15 @@ class RollbackFixture(BundleFixture):
     def undone_dirs(self):
         return sorted(self.rollback_dir.glob("undone-*"))
 
+    def assert_only_recorded_quarantines_remain(self):
+        journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+        records = journal["retained_quarantines"]
+        self.assertEqual(set(self.target.rglob(".fedora-migration-*")),
+                         {self.target / Path(item["quarantine"]).parent for item in records})
+        for item in records:
+            self.assertTrue(os.path.lexists(self.target / item["quarantine"]))
+        return records
+
     def standard_setup(self):
         """Replace a file and a symlink, create new files in a new directory."""
         self.write(self.home / ".bashrc", b"restored bashrc", 0o644)
@@ -661,6 +670,207 @@ class ValidationTests(RollbackFixture):
 
 
 class MetadataTests(RollbackFixture):
+    def directory_setup(self, original_mode=0o700):
+        self.write(self.home / ".config/xfce4/a.xml", b"restored")
+        self.write(self.target / ".config/xfce4/a.xml", b"original")
+        self.write(self.target / ".config/unrelated", b"private unrelated data")
+        (self.home / ".config").chmod(0o755)
+        (self.target / ".config").chmod(original_mode)
+        os.utime(self.home / ".config", ns=(1700000000000000000,) * 2)
+        os.utime(self.target / ".config", ns=(1600000000000000000,) * 2)
+        self.backup(include=(".config",))
+        self.restore()
+
+    def assert_original_directory(self):
+        info = (self.target / ".config").stat()
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+        self.assertEqual(info.st_mtime_ns, 1600000000000000000)
+        self.assertEqual((self.target / ".config/unrelated").read_bytes(), b"private unrelated data")
+
+    def test_existing_selected_directory_mode_and_mtime_are_restored(self):
+        self.directory_setup()
+        self.assertEqual(self.journal().get("original_directories"), [
+            {"path": ".config", "mode": 0o700, "mtime_ns": 1600000000000000000}])
+        self.apply()
+        self.assert_original_directory()
+
+    def test_metadata_only_secret_directory_requires_agent_checks(self):
+        (self.home / ".ssh").mkdir(mode=0o755)
+        (self.target / ".ssh").mkdir(mode=0o700)
+        self.backup(include_secrets=True)
+        self.restore()
+        self.assertTrue(self.plan()["secrets"])
+
+    def test_user_restricted_directory_permissions_are_a_conflict(self):
+        self.directory_setup(original_mode=0o770)
+        (self.target / ".config").chmod(0o700)
+        result = self.apply()
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o700)
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(any(item["path"] == ".config" for item in result["skipped"]))
+        self.assertEqual(self.apply(include_changed=True)["status"], "complete")
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o770)
+
+    def test_user_changed_directory_timestamp_is_a_conflict(self):
+        self.directory_setup()
+        os.utime(self.target / ".config", ns=(1800000000000000000,) * 2)
+        result = self.apply()
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual((self.target / ".config").stat().st_mtime_ns, 1800000000000000000)
+        self.apply(include_changed=True)
+        self.assert_original_directory()
+
+    def test_missing_bundle_cannot_authorize_changed_directory_metadata(self):
+        self.directory_setup()
+        self.bundle.rename(self.root / "moved-bundle")
+        result = self.apply()
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(any(item["path"] == ".config" and "cannot verify" in item["reason"]
+                            for item in result["skipped"]))
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o755)
+
+    def test_partial_rollback_restores_metadata_again_when_continued(self):
+        self.directory_setup()
+        (self.target / ".config/xfce4/a.xml").write_bytes(b"user edit")
+        self.assertEqual(self.apply()["status"], "partial")
+        self.assert_original_directory()
+        self.assertEqual(self.apply(include_changed=True)["status"], "complete")
+        self.assert_original_directory()
+        self.assertEqual((self.target / ".config/xfce4/a.xml").read_bytes(), b"original")
+
+    def test_older_journal_warns_that_original_directory_metadata_is_unavailable(self):
+        self.directory_setup()
+        journal = self.journal()
+        journal.pop("original_directories", None)
+        (self.rollback_dir / "journal.json").write_text(json.dumps(journal))
+        plan = self.plan()
+        self.assertTrue(any("directory metadata" in warning for warning in plan.get("warnings", [])))
+        result = self.apply()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["warnings"], plan["warnings"])
+        recorded = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+        self.assertEqual(recorded["warnings"], plan["warnings"])
+
+    def test_invalid_original_directory_metadata_is_refused_before_writes(self):
+        self.directory_setup()
+        original = self.journal()
+        invalid = [
+            None, {}, [".config"],
+            [{"path": "../outside", "mode": 0o700, "mtime_ns": 0}],
+            [{"path": ".config", "mode": True, "mtime_ns": 0}],
+            [{"path": ".config", "mode": 0o10000, "mtime_ns": 0}],
+            [{"path": ".config", "mode": 0o700, "mtime_ns": 2**63}],
+            [{"path": ".config", "mode": 0o700, "mtime_ns": False}],
+            [{"path": ".config", "mode": 0o700, "mtime_ns": 0}] * 2,
+            [{"path": ".config/xfce4/a.xml", "mode": 0o700, "mtime_ns": 0}],
+        ]
+        for metadata in invalid:
+            with self.subTest(metadata=metadata):
+                journal = dict(original, original_directories=metadata)
+                (self.rollback_dir / "journal.json").write_text(json.dumps(journal))
+                before = snapshot(self.target)
+                with self.assertRaises(BundleError):
+                    self.plan()
+                with self.assertRaises(BundleError):
+                    self.apply()
+                self.assertEqual(snapshot(self.target), before)
+                self.assertFalse((self.rollback_dir / "rollback-journal.json").exists())
+
+    def test_original_directory_symlink_is_refused_before_writes(self):
+        self.directory_setup()
+        outside = self.root / "outside"
+        (self.target / ".config").rename(outside)
+        (self.target / ".config").symlink_to(outside, target_is_directory=True)
+        before = (outside.stat().st_mode, outside.stat().st_mtime_ns, snapshot(outside))
+        with self.assertRaises(BundleError):
+            self.apply()
+        self.assertEqual((outside.stat().st_mode, outside.stat().st_mtime_ns, snapshot(outside)), before)
+
+    def test_interrupted_directory_metadata_restore_can_be_retried(self):
+        self.directory_setup()
+        real = os.fchmod
+
+        def interrupt_directory(descriptor, mode):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise KeyboardInterrupt()
+            return real(descriptor, mode)
+
+        with patch("fedora_migration.rollback.os.fchmod", side_effect=interrupt_directory):
+            with self.assertRaises(BundleInterrupted):
+                self.apply()
+        self.assertEqual(self.apply()["status"], "complete")
+        self.assert_original_directory()
+
+    def readonly_setup(self):
+        self.write(self.home / ".config/a.xml", b"restored")
+        self.write(self.target / ".config/a.xml", b"original")
+        (self.home / ".config").chmod(0o500)
+        (self.target / ".config").chmod(0o700)
+        self.backup(include=(".config",))
+        self.restore()
+
+    def test_readonly_selected_directory_allows_rollback_file_writes(self):
+        self.readonly_setup()
+        module = rollback_module()
+        real = module._stage_saved
+
+        def require_owner_write(saved, descriptor):
+            # Root bypasses permission checks in CI; enforce the normal user's
+            # prerequisite at the actual pinned directory used to create files.
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o700 != 0o700:
+                raise PermissionError("parent does not grant owner write access")
+            return real(saved, descriptor)
+
+        with patch.object(module, "_stage_saved", side_effect=require_owner_write):
+            self.apply()
+        self.assertEqual((self.target / ".config/a.xml").read_bytes(), b"original")
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o700)
+
+    def test_failed_rollback_reverts_temporary_directory_access(self):
+        self.readonly_setup()
+        fail = failing_publish("a.xml", OSError("injected failure"))
+        with patch("fedora_migration.rollback.os.link", side_effect=fail):
+            with self.assertRaises(BundleError):
+                self.apply()
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o500)
+        self.apply(include_changed=True)
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o700)
+
+    def test_deleted_original_empty_directory_is_recreated_with_original_metadata(self):
+        (self.home / ".config").mkdir()
+        (self.target / ".config").mkdir(mode=0o700)
+        os.utime(self.target / ".config", ns=(1600000000000000000,) * 2)
+        self.backup(include=(".config",))
+        self.restore()
+        (self.target / ".config").rmdir()
+        self.apply()
+        info = (self.target / ".config").stat()
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+        self.assertEqual(info.st_mtime_ns, 1600000000000000000)
+
+    def test_original_directory_access_stays_granted_until_final_metadata_is_applied(self):
+        self.readonly_setup()
+        module = rollback_module()
+        real_open = module._open_directory
+
+        def require_read_permission(home, relative, **kwargs):
+            path = home / relative
+            if path.exists() and not stat.S_IMODE(path.stat().st_mode) & 0o400:
+                raise PermissionError("normal user cannot reopen unreadable directory")
+            return real_open(home, relative, **kwargs)
+
+        def revoke_all_after_open(home, paths, changes):
+            # Model a mode000 restored root already pinned by the preparer;
+            # a later reopen must occur only after owner access is granted.
+            info = (home / ".config").stat()
+            changes.append((".config", 0, (info.st_dev, info.st_ino)))
+            (home / ".config").chmod(0o700)
+
+        with patch.object(module, "_prepare_directory_access", side_effect=revoke_all_after_open), \
+             patch.object(module, "_open_directory", side_effect=require_read_permission):
+            self.apply()
+        self.assertEqual(stat.S_IMODE((self.target / ".config").stat().st_mode), 0o700)
+
     def test_same_bytes_but_different_mode_and_mtime_is_put_back(self):
         self.write(self.home / ".bashrc", b"same bytes", 0o644)
         os.utime(self.home / ".bashrc", ns=(1700000000000000000, 1700000000000000000))
@@ -784,6 +994,139 @@ class PinnedWriteTests(RollbackFixture):
             raise OSError(errno.EXDEV, "Invalid cross-device link")
         return self.real_rename(source, destination, *args, **kwargs)
 
+    def assert_open_descriptor_edit_is_recoverable(self, relative):
+        self.standard_setup()
+        self.restore()
+        self.real_rename = os.rename
+        module = rollback_module()
+        real_copy = module._copy_entry_out
+        descriptor = os.open(self.target / relative, os.O_WRONLY)
+
+        def edit_through_descriptor(data):
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, data)
+            os.fsync(descriptor)
+
+        def copy_then_edit(source_fd, leaf, destination, staging):
+            real_copy(source_fd, leaf, destination, staging)
+            if destination.name == Path(relative).name:
+                edit_through_descriptor(b"LATE EDIT AFTER COPY")
+
+        try:
+            with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+                 patch.object(module, "_copy_entry_out", side_effect=copy_then_edit):
+                result = self.apply()
+            journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+            records = [item for item in journal.get("retained_quarantines", [])
+                       if item["path"] == relative]
+            self.assertEqual(len(records), 1, "the captured inode needs a journaled recovery location")
+            retained = self.target / records[0]["quarantine"]
+            self.assertEqual(retained.read_bytes(), b"LATE EDIT AFTER COPY")
+            self.assertEqual(retained.stat().st_ino, os.fstat(descriptor).st_ino)
+            # A final fingerprint check is insufficient: writes after rollback
+            # returns must also remain recoverable through the retained inode.
+            edit_through_descriptor(b"LATE EDIT AFTER COMPLETE")
+            self.assertEqual(retained.read_bytes(), b"LATE EDIT AFTER COMPLETE")
+            self.assertEqual(result["retained_quarantines"], journal["retained_quarantines"])
+        finally:
+            os.close(descriptor)
+
+    def test_cross_device_put_back_retains_open_descriptor_edits(self):
+        self.assert_open_descriptor_edit_is_recoverable(".bashrc")
+
+    def test_cross_device_remove_retains_open_descriptor_edits(self):
+        self.assert_open_descriptor_edit_is_recoverable(".config/xfce4/new.xml")
+
+    def test_cross_device_failed_rollback_retry_keeps_prior_recovery_locations(self):
+        self.standard_setup()
+        self.restore()
+        self.real_rename = os.rename
+        real_link = os.link
+
+        def fail_final(source, destination, **kwargs):
+            if destination == ".bashrc" and str(source).startswith(".fedora-migration-"):
+                raise OSError("injected failure")
+            return real_link(source, destination, **kwargs)
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+             patch("fedora_migration.rollback.os.link", side_effect=fail_final):
+            with self.assertRaises(BundleError):
+                self.apply()
+        previous = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+        records = previous.get("retained_quarantines", [])
+        self.assertTrue(records)
+        self.assertTrue(all(item["path"] != ".bashrc" for item in records))
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev):
+            result = self.apply()
+        for item in records:
+            self.assertIn(item, result["retained_quarantines"])
+            self.assertTrue(os.path.lexists(self.target / item["quarantine"]))
+
+    def test_cross_device_capture_refuses_to_move_data_if_recovery_journal_write_fails(self):
+        self.standard_setup()
+        self.restore()
+        self.real_rename = os.rename
+        module = rollback_module()
+        real_update = module._update_journal
+
+        def fail_quarantine_record(directory, journal, name):
+            if journal.get("retained_quarantines"):
+                raise OSError("injected journal write failure")
+            return real_update(directory, journal, name)
+
+        before = snapshot(self.target)
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+             patch.object(module, "_update_journal", side_effect=fail_quarantine_record):
+            with self.assertRaisesRegex(BundleError, "journal write failure"):
+                self.apply()
+        self.assertEqual(snapshot(self.target), before)
+
+    def test_cross_device_recovery_does_not_follow_a_substituted_quarantine_symlink(self):
+        self.standard_setup()
+        self.restore()
+        self.real_rename = os.rename
+        module = rollback_module()
+        real_capture, real_link = module._capture, os.link
+        outside = self.root / "outside"
+        self.write(outside / "entry", b"outside data")
+        retained = self.root / "moved-quarantine"
+
+        def capture_then_swap(descriptor, leaf, *args, **kwargs):
+            result = real_capture(descriptor, leaf, *args, **kwargs)
+            if leaf == ".bashrc":
+                journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
+                record = next(item for item in journal["retained_quarantines"]
+                              if item["path"] == ".bashrc")
+                directory = (self.target / record["quarantine"]).parent
+                directory.rename(retained)
+                directory.symlink_to(outside, target_is_directory=True)
+            return result
+
+        def fail_publication(source, destination, **kwargs):
+            if destination == ".bashrc" and str(source).startswith(".fedora-migration-"):
+                raise OSError("injected publication failure")
+            return real_link(source, destination, **kwargs)
+
+        with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev), \
+             patch.object(module, "_capture", side_effect=capture_then_swap), \
+             patch("fedora_migration.rollback.os.link", side_effect=fail_publication):
+            with self.assertRaises(BundleError):
+                self.apply()
+        self.assertEqual((outside / "entry").read_bytes(), b"outside data")
+        self.assertEqual((retained / "entry").read_bytes(), b"restored bashrc")
+
+    def test_unsafe_retained_quarantine_reference_is_refused_before_writes(self):
+        self.standard_setup()
+        self.restore()
+        path = self.rollback_dir / "rollback-journal.json"
+        path.write_text(json.dumps({"status": "partial", "home": str(self.target),
+                                   "retained_quarantines": [
+                                       {"path": ".bashrc", "quarantine": "../outside/entry"}]}))
+        before = snapshot(self.target)
+        with self.assertRaises(BundleError):
+            self.apply()
+        self.assertEqual(snapshot(self.target), before)
+
     def test_cross_device_capture_falls_back_to_a_verified_copy(self):
         self.standard_setup()
         before = snapshot(self.target)
@@ -792,7 +1135,12 @@ class PinnedWriteTests(RollbackFixture):
         with patch("fedora_migration.rollback.os.rename", side_effect=self.exdev) as renamed:
             result = self.apply()
         self.assertTrue(renamed.called)
-        self.assertEqual(snapshot(self.target), before)
+        after = snapshot(self.target)
+        for path, entry in before.items():
+            self.assertEqual(after[path], entry)
+        records = self.assert_only_recorded_quarantines_remain()
+        self.assertEqual({path for path, entry in after.items() if entry[0] != "dir"},
+                         set(before) | {item["quarantine"] for item in records})
         undone = Path(result["undone_dir"])
         self.assertEqual((undone / ".bashrc").read_bytes(), b"restored bashrc")
         self.assertEqual(os.readlink(undone / ".bash_profile"), "/restored/target")
@@ -819,7 +1167,7 @@ class PinnedWriteTests(RollbackFixture):
         self.assertEqual((self.target / ".bashrc").read_bytes(), b"WRITTEN RIGHT AFTER THE COPY")
         self.assertEqual(list(self.undone_dirs()[0].glob(".bashrc"))[0].read_bytes(),
                          b"restored bashrc")
-        self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
+        self.assert_only_recorded_quarantines_remain()
         journal = json.loads((self.rollback_dir / "rollback-journal.json").read_text())
         self.assertEqual(journal["status"], "failed")
 
@@ -842,7 +1190,7 @@ class PinnedWriteTests(RollbackFixture):
         self.assertEqual(new_xml.read_bytes(), b"WRITTEN RIGHT AFTER THE COPY")
         self.assertEqual((self.undone_dirs()[0] / ".config/xfce4/new.xml").read_bytes(),
                          b"restored new")
-        self.assertEqual(list(new_xml.parent.glob(".fedora-migration-*")), [])
+        self.assert_only_recorded_quarantines_remain()
 
     def test_cross_device_copy_failure_puts_the_entry_back(self):
         self.standard_setup()
@@ -861,7 +1209,7 @@ class PinnedWriteTests(RollbackFixture):
             with self.assertRaisesRegex(BundleError, "injected copy failure"):
                 self.apply()
         self.assertEqual((self.target / ".bashrc").read_bytes(), b"restored bashrc")
-        self.assertEqual(list(self.target.glob(".fedora-migration-*")), [])
+        self.assert_only_recorded_quarantines_remain()
 
     def test_failed_final_replace_puts_the_captured_entry_back(self):
         self.standard_setup()
@@ -1010,6 +1358,8 @@ class PinnedHomeTests(RollbackFixture):
         self.assertTrue(all(fd is not None for _, fd in opened[1:]))
 
     def test_interrupt_while_walking_leaks_no_descriptors(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("descriptor inventory requires /proc/self/fd")
         (self.target / ".config/xfce4").mkdir(parents=True)
         real_close = os.close
         state = {"calls": 0}

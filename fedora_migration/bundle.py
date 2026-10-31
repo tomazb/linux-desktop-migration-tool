@@ -477,8 +477,13 @@ def create_bundle(home, output, source, packages, *, include=(),
         for pattern in excludes:
             paths_left_out = excluded[pattern]
             # Count each excluded tree once, not also its separately listed members.
-            count = sum(not any(path.startswith(other + "/") for other in paths_left_out)
-                        for path in paths_left_out)
+            count = 0
+            for path in paths_left_out:
+                parent = path.rpartition("/")[0]
+                while parent and parent not in paths_left_out:
+                    parent = parent.rpartition("/")[0]
+                if not parent:
+                    count += 1
             if count:
                 note = (" (default; use --no-default-excludes to include)"
                         if pattern in defaults and pattern not in user_excludes else "")
@@ -699,7 +704,18 @@ def _validated_rewrite(rewrite_home):
     old, new = old.rstrip("/"), new.rstrip("/")
     if not old or not new:
         raise BundleError("Home rewrite refuses the filesystem root.")
-    return None if old == new else (old, new)
+    if old == new:
+        return None
+    # One byte substitution is shared by XML, desktop Exec fields, shell-style
+    # user-dirs assignments and URIs. Do not inject characters needing escaping
+    # in any of those formats; ordinary restores do not have this restriction.
+    if not all(re.fullmatch(r"/[A-Za-z0-9/._-]+", value) for value in (old, new)):
+        raise BundleError(
+            "--rewrite-home requires source and destination homes containing only "
+            "ASCII letters, digits, '/', '.', '_' and '-'. Restore without "
+            "--rewrite-home and edit paths manually for other home names."
+        )
+    return old, new
 
 
 def _plan(bundle, home, manifest, backup_dir):
@@ -738,14 +754,16 @@ def _plan(bundle, home, manifest, backup_dir):
     return summary, candidate
 
 
-def plan_restore(bundle, home, manifest, *, backup_dir=None):
+def plan_restore(bundle, home, manifest, *, backup_dir=None, rewrite_home=None):
     """Preview a restore using a manifest that verify_bundle() returned for bundle.
 
-    This avoids re-reading the payload for a preview. restore_bundle() with
-    dry_run=False always verifies the bundle again before changing anything.
+    This avoids re-reading the payload for a preview. Home rewriting, if selected,
+    is validated before either package transactions or destination writes.
+    restore_bundle() with dry_run=False verifies the bundle again before writes.
     """
     bundle, home = _absolute(bundle), _absolute(home)
     try:
+        _validated_rewrite(rewrite_home)
         return _plan(bundle, home, manifest, backup_dir)[0]
     except BundleError:
         raise
@@ -784,6 +802,14 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
         planned_replaced = _replaced_paths(home, entries)
         created = {e["path"] for e in directories
                    if not os.path.lexists(home / e["path"])}
+        selected = set(manifest["selected_paths"])
+        original_directories = []
+        for entry in directories:
+            if entry["path"] in selected and entry["path"] not in created:
+                info = (home / entry["path"]).lstat()
+                original_directories.append({"path": entry["path"],
+                                             "mode": stat.S_IMODE(info.st_mode),
+                                             "mtime_ns": info.st_mtime_ns})
         # Persist the full intent plan once before any selected path changes.
         # The plan identifies potentially changed paths after interruption;
         # previous/ contains the actual saved originals. Avoid rewriting growing
@@ -795,6 +821,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
             "new": sorted(e["path"] for e in entries
                           if e["type"] != "directory" and e["path"] not in planned_replaced),
             "created_directories": sorted(created),
+            "original_directories": original_directories,
             # What the restore may have changed in eligible files after their
             # checksum check, so a rollback can tell them from user edits.
             "rewrite_home": list(rewrite_home) if rewrite_home else None,
@@ -849,7 +876,6 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
                 with contextlib.suppress(OSError):
                     if os.path.lexists(temporary):
                         temporary.unlink()
-        selected = set(manifest["selected_paths"])
         # Preserve selected directory roots and new directories. Existing
         # structural HOME parents and unrelated contents keep their metadata.
         for entry in reversed(directories):

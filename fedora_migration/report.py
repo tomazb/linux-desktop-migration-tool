@@ -4,11 +4,11 @@ Everything here only reads bundle payload files as bytes and inspects the
 destination; nothing is written and no bundled program is ever executed.
 """
 
+from collections import deque
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
-import shutil
 import stat
 import xml.etree.ElementTree as ElementTree
 
@@ -214,43 +214,112 @@ def _desktop_entry(text):
 def _program(values):
     """The program an entry starts: TryExec, else the first real Exec token.
 
-    Raises ValueError for an Exec that cannot be split; returns None if there is none.
+    Raises ValueError if Exec cannot be checked conservatively; None if absent.
     """
+    command = values.get("TryExec") or values.get("Exec", "")
+    if "\0" in command:
+        raise ValueError("NUL byte in desktop command")
     if values.get("TryExec"):
-        return values["TryExec"]
-    tokens = shlex.split(values.get("Exec", ""))
-    if tokens and os.path.basename(tokens[0]) == "env":
+        return command
+    tokens = shlex.split(command)
+    while tokens and os.path.basename(tokens[0]) == "env":
         tokens.pop(0)
-        # Skip env's options; these take a separate argument.
-        while tokens and tokens[0].startswith("-") and tokens[0] != "-":
+        while tokens and tokens[0].startswith("-"):
             option = tokens.pop(0)
             if option == "--":
                 break
-            if option in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and tokens:
+            if option.startswith("-S") or option.split("=", 1)[0] == "--split-string":
+                # GNU env uses its own splitting and expansion grammar, not
+                # shlex's. Warn rather than silently discard the real command.
+                raise ValueError("env split strings require manual inspection")
+            if option in ("-u", "--unset", "-C", "--chdir"):
+                if not tokens or not tokens[0]:
+                    raise ValueError("env option needs an argument")
                 tokens.pop(0)
+            elif option.startswith(("--unset=", "--chdir=")):
+                if not option.partition("=")[2]:
+                    raise ValueError("env option needs an argument")
+            elif (option in ("-", "-i", "--ignore-environment", "-v", "--debug")
+                  or option.startswith(("-u", "-C"))):
+                continue
+            else:
+                raise ValueError("unsupported env option requires manual inspection")
+        while tokens and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            tokens.pop(0)
     while tokens and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
         tokens.pop(0)
     return tokens[0] if tokens else None
 
 
-def _program_available(program, provided):
-    if os.path.isabs(program):
-        return (os.path.isfile(program) and os.access(program, os.X_OK)) or program in provided
-    return shutil.which(program) is not None
+def _executable_after_restore(path, overlay):
+    """Resolve a command through the planned overlay, including symlink targets."""
+    if not os.path.isabs(path):
+        path = os.getcwd() + "/" + path
+    pending = deque(path.split("/"))
+    resolved = Path("/")
+    links = 0
+    while pending:
+        part = pending.popleft()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        entry = overlay.get(str(candidate))
+        if entry is None:
+            try:
+                info = candidate.lstat()
+            except OSError:
+                return False
+            kind = ("symlink" if stat.S_ISLNK(info.st_mode) else
+                    "directory" if stat.S_ISDIR(info.st_mode) else
+                    "file" if stat.S_ISREG(info.st_mode) else "special")
+        else:
+            kind = entry["type"]
+        if kind == "symlink":
+            links += 1
+            if links > 40:
+                return False
+            try:
+                target = entry["target"] if entry is not None else os.readlink(candidate)
+            except OSError:
+                return False
+            if os.path.isabs(target):
+                resolved = Path("/")
+            pending.extendleft(reversed(target.split("/")))
+            continue
+        executable = (bool(entry["mode"] & stat.S_IXUSR) if entry is not None
+                      else os.access(candidate, os.X_OK))
+        if not pending:
+            return kind == "file" and executable
+        if kind != "directory" or not executable:
+            return False
+        resolved = candidate
+    return False
+
+
+def _program_available(program, overlay):
+    if os.path.dirname(program):
+        return _executable_after_restore(program, overlay)
+    return any(_executable_after_restore(os.path.join(directory, program), overlay)
+               for directory in os.get_exec_path())
 
 
 def check_autostart(bundle, manifest, home, source_home=None, rewrite=False):
     """Find autostart entries whose program is not available; nothing is executed.
 
-    A program counts as available if it is executable now, or if the bundle
-    restores an executable file to that destination path. With rewrite=True a
-    path under the old home is checked where --rewrite-home will point it.
+    Bundle replacements take precedence over current files. Absolute commands,
+    PATH entries and symlink targets are checked against what restore will leave
+    behind. With rewrite=True, old-home commands use their rewritten location.
     """
     result = {"missing": [], "warnings": []}
     files = _file_entries(manifest)
     destination = str(home).rstrip("/") + "/"
-    provided = {destination + relative for relative, entry in files.items()
-                if entry["mode"] & 0o111}
+    selected = set(manifest["selected_paths"])
+    overlay = {destination + entry["path"]: entry for entry in manifest["entries"]
+               if (entry["type"] != "directory" or entry["path"] in selected
+                   or not os.path.lexists(destination + entry["path"]))}
     old_prefix = (str(source_home).rstrip("/") + "/"
                   if rewrite and source_home and str(source_home).rstrip("/") else None)
     for relative in sorted(files):
@@ -265,12 +334,12 @@ def check_autostart(bundle, manifest, home, source_home=None, rewrite=False):
             continue
         try:
             program = _program(values)
-        except ValueError:
-            result["warnings"].append(f"{relative}: unparseable Exec")
+        except ValueError as exc:
+            result["warnings"].append(f"{relative}: unparseable Exec ({clip(exc)})")
             continue
         effective = program
         if program and old_prefix and program.startswith(old_prefix):
             effective = destination + program[len(old_prefix):]
-        if program and not _program_available(effective, provided):
+        if program and not _program_available(effective, overlay):
             result["missing"].append((relative, clip(program)))
     return result
