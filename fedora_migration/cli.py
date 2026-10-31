@@ -311,10 +311,12 @@ def restore_command(args):
         print("Note: architectures differ. Review copied local executables and application data.")
     home = Path(info["home"])
     rollback = args.rollback_dir.expanduser() if args.rollback_dir else None
+    rewrite_home = (source["home"], str(home)) if args.rewrite_home else None
     # Validate the destination before either package transactions or file writes.
     # Plan from the manifest verified above; --apply verifies the bundle again
     # immediately before writing, after any package transactions.
-    plan = bundle.plan_restore(source_path, home, manifest, backup_dir=rollback)
+    plan = bundle.plan_restore(source_path, home, manifest, backup_dir=rollback,
+                               rewrite_home=rewrite_home)
     print("Restore preview:" if not args.apply else "Validated restore plan:")
     print_manifest_summary(manifest)
     print(f"Destination: {home}")
@@ -323,7 +325,6 @@ def restore_command(args):
         print(f"  {relative}")
     print_destination_checks(source_path, manifest, home, plan,
                              rewrite=args.rewrite_home, apply=args.apply)
-    rewrite_home = (source["home"], str(home)) if args.rewrite_home else None
     commands = []
     if args.install_packages:
         commands = packages.package_commands(

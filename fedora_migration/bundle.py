@@ -676,7 +676,18 @@ def _validated_rewrite(rewrite_home):
     old, new = old.rstrip("/"), new.rstrip("/")
     if not old or not new:
         raise BundleError("Home rewrite refuses the filesystem root.")
-    return None if old == new else (old, new)
+    if old == new:
+        return None
+    # One byte substitution is shared by XML, desktop Exec fields, shell-style
+    # user-dirs assignments and URIs. Do not inject characters needing escaping
+    # in any of those formats; ordinary restores do not have this restriction.
+    if not all(re.fullmatch(r"/[A-Za-z0-9/._-]+", value) for value in (old, new)):
+        raise BundleError(
+            "--rewrite-home requires source and destination homes containing only "
+            "ASCII letters, digits, '/', '.', '_' and '-'. Restore without "
+            "--rewrite-home and edit paths manually for other home names."
+        )
+    return old, new
 
 
 def _plan(bundle, home, manifest, backup_dir):
@@ -715,14 +726,16 @@ def _plan(bundle, home, manifest, backup_dir):
     return summary, candidate
 
 
-def plan_restore(bundle, home, manifest, *, backup_dir=None):
+def plan_restore(bundle, home, manifest, *, backup_dir=None, rewrite_home=None):
     """Preview a restore using a manifest that verify_bundle() returned for bundle.
 
-    This avoids re-reading the payload for a preview. restore_bundle() with
-    dry_run=False always verifies the bundle again before changing anything.
+    This avoids re-reading the payload for a preview. Home rewriting, if selected,
+    is validated before either package transactions or destination writes.
+    restore_bundle() with dry_run=False verifies the bundle again before writes.
     """
     bundle, home = _absolute(bundle), _absolute(home)
     try:
+        _validated_rewrite(rewrite_home)
         return _plan(bundle, home, manifest, backup_dir)[0]
     except BundleError:
         raise

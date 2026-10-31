@@ -117,6 +117,15 @@ private temporary file, synced, given the manifest mode and mtime and then moved
 into place. Replaced originals remain in the rollback directory. Without the flag
 no file content changes.
 
+Literal replacement is safe across these formats only for a conservative set of
+home names: when source and destination differ, both paths must contain only
+ASCII letters, digits, `/`, `.`, `_` and `-`. Whitespace, quotes, `&`, shell
+metacharacters, percent signs and non-ASCII characters require restoring without
+`--rewrite-home` and editing the paths manually with the appropriate escaping.
+Preview and apply reject unsupported rewrites before package installation or
+destination writes. A same-home rewrite is a no-op, and ordinary restore accepts
+these home names.
+
 Regular-file modes and mtime and symlinks are preserved. Ownership, ACLs, xattrs
 and source security labels are not. Symlinks remain links: their external targets
 are not backed up. Review links to old disks or paths after migration.
@@ -171,11 +180,15 @@ The restore preview automates part of this check without changing anything:
   is reported as a warning rather than parsed.
 - **Autostart programs.** For each `.config/autostart/*.desktop` entry that is not
   `Hidden=true`, the program is `TryExec` if present, otherwise the first word of
-  `Exec` after any leading `env` (with its options) and `NAME=value` words. It must
-  be an existing executable (an absolute path, or an executable file the bundle
-  restores to that path, following `--rewrite-home` when given) or be found on
-  `PATH`. Missing programs are listed per entry, and an `Exec` that cannot be split
-  is reported as unparseable. The entries are only read, never run.
+  `Exec` after any leading `env` (with its options) and `NAME=value` words. Absolute
+  paths, `PATH` candidates and symlink targets are checked against the final
+  restore overlay: a bundled replacement takes precedence over an existing file,
+  and a bundled executable can satisfy a command before it exists here. Restored
+  files require owner execute permission. `--rewrite-home` is taken into account
+  when selected. Missing programs are listed per entry. An `Exec` that cannot be
+  split or checked conservatively is reported as unparseable; this includes
+  `env -S` / `--split-string`, unsupported options and missing option arguments.
+  Those entries need manual inspection. The entries are only read, never run.
 - **Old home paths.** See `--rewrite-home` under
   [Restore into Fedora XFCE 44](#restore-into-fedora-xfce-44).
 

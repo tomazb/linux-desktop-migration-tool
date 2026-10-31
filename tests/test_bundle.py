@@ -963,5 +963,54 @@ class RewriteHomeRestoreTests(BundleFixture):
         self.assertEqual(list(self.target.iterdir()), [])
 
 
+class RewriteHomeSafetyTests(BundleFixture):
+    XML_PATH = ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+    XML = b'<channel><property value="/home/alice/Pictures/a.png"/></channel>'
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.home / self.XML_PATH, self.XML)
+        self.backup(settings_only=True)
+
+    def test_unsafe_destination_home_refuses_before_replacing_valid_xml(self):
+        for character in ('&', '"', "'", ' ', '\t', '\n', '\\', '$', '`', '%',
+                          ';', '<', '>', '\u00e9'):
+            with self.subTest(character=character):
+                target = self.root / f"target{character}home"
+                target.mkdir()
+                original = self.write(target / self.XML_PATH, b"destination original")
+                rollback = target / "recovery"
+                with self.assertRaisesRegex(BundleError, "rewrite-home.*ASCII"):
+                    restore_bundle(self.bundle, target, dry_run=False,
+                                   backup_dir=rollback,
+                                   rewrite_home=(OLD_HOME, str(target)))
+                self.assertEqual(original.read_bytes(), b"destination original")
+                self.assertFalse(rollback.exists())
+
+    def test_unsafe_source_home_is_also_refused(self):
+        with self.assertRaisesRegex(BundleError, "rewrite-home.*ASCII"):
+            restore_bundle(self.bundle, self.target, dry_run=False,
+                           rewrite_home=("/home/alice&bob", str(self.target)))
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_preview_refuses_unsafe_rewriting_without_creating_anything(self):
+        with self.assertRaisesRegex(BundleError, "rewrite-home.*ASCII"):
+            restore_bundle(self.bundle, self.target,
+                           rewrite_home=(OLD_HOME, "/home/bob name"))
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_unsafe_home_still_allows_restore_without_rewriting(self):
+        target = self.root / "target&home"
+        target.mkdir()
+        restore_bundle(self.bundle, target, dry_run=False)
+        self.assertEqual((target / self.XML_PATH).read_bytes(), self.XML)
+
+    def test_same_unsafe_home_is_a_noop(self):
+        summary = restore_bundle(self.bundle, self.target, dry_run=False,
+                                 rewrite_home=("/home/alice&bob", "/home/alice&bob"))
+        self.assertEqual(summary["rewritten_count"], 0)
+        self.assertEqual((self.target / self.XML_PATH).read_bytes(), self.XML)
+
+
 if __name__ == "__main__":
     unittest.main()
