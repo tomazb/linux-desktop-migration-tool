@@ -19,6 +19,8 @@ import stat
 import tempfile
 import uuid
 
+from .report import entry_is_rewritable, replace_home_references, rewritable
+
 
 class BundleError(RuntimeError):
     """An unsafe, inconsistent or unsuccessful filesystem operation."""
@@ -632,6 +634,67 @@ def _update_journal(rollback, journal):
     _fsync_directory(rollback)
 
 
+def _replaced_paths(home, entries):
+    """Non-directory entries whose destination already exists, even as a dangling link."""
+    return {e["path"] for e in entries
+            if e["type"] != "directory" and os.path.lexists(home / e["path"])}
+
+
+def _rewrite_home_in_temporary(temporary, entry, old, new):
+    """Replace old-home references in a checksum-validated private temporary.
+
+    Returns the number of references replaced. The changed content goes to a new
+    private file in the same directory that is synced and then renamed over the
+    temporary, so the caller applies mode and mtime afterwards as usual.
+    """
+    if not entry_is_rewritable(entry):
+        return 0
+    with open(temporary, "rb") as stream:
+        data = stream.read()
+    if not rewritable(entry, data):
+        return 0
+    changed, count = replace_home_references(data, old, new)
+    if not count:
+        return 0
+    replacement = temporary.parent / (".fedora-migration-" + uuid.uuid4().hex)
+    try:
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(os.open(replacement, flags, 0o600), "wb") as writer:
+            writer.write(changed)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(replacement, temporary)
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.lexists(replacement):
+                replacement.unlink()
+    return count
+
+
+def _validated_rewrite(rewrite_home):
+    if rewrite_home is None:
+        return None
+    old, new = (os.fspath(value) for value in rewrite_home)
+    if not all(isinstance(v, str) and os.path.isabs(v) and "\0" not in v for v in (old, new)):
+        raise BundleError("Home rewrite needs two absolute paths.")
+    old, new = old.rstrip("/"), new.rstrip("/")
+    if not old or not new:
+        raise BundleError("Home rewrite refuses the filesystem root.")
+    if old == new:
+        return None
+    # One byte substitution is shared by XML, desktop Exec fields, shell-style
+    # user-dirs assignments and URIs. Do not inject characters needing escaping
+    # in any of those formats; ordinary restores do not have this restriction.
+    if not all(re.fullmatch(r"/[A-Za-z0-9/._-]+", value) for value in (old, new)):
+        raise BundleError(
+            "--rewrite-home requires source and destination homes containing only "
+            "ASCII letters, digits, '/', '.', '_' and '-'. Restore without "
+            "--rewrite-home and edit paths manually for other home names."
+        )
+    return old, new
+
+
 def _plan(bundle, home, manifest, backup_dir):
     """Validate destination and rollback paths without changing anything."""
     entries = manifest["entries"]
@@ -642,7 +705,11 @@ def _plan(bundle, home, manifest, backup_dir):
         "symlinks": sum(e["type"] == "symlink" for e in entries),
         "selected_paths": list(manifest["selected_paths"]),
         "backup_dir": None, "warnings": list(manifest["warnings"]),
+        "rewritten_count": 0,
     }
+    replaced = len(_replaced_paths(home, entries))
+    summary["replace_count"] = replaced
+    summary["new_count"] = summary["files"] + summary["symlinks"] - replaced
     candidate = (_absolute(backup_dir) if backup_dir is not None else
                  home / ".local/state/fedora-xfce-migration" /
                  ("restore-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -664,14 +731,16 @@ def _plan(bundle, home, manifest, backup_dir):
     return summary, candidate
 
 
-def plan_restore(bundle, home, manifest, *, backup_dir=None):
+def plan_restore(bundle, home, manifest, *, backup_dir=None, rewrite_home=None):
     """Preview a restore using a manifest that verify_bundle() returned for bundle.
 
-    This avoids re-reading the payload for a preview. restore_bundle() with
-    dry_run=False always verifies the bundle again before changing anything.
+    This avoids re-reading the payload for a preview. Home rewriting, if selected,
+    is validated before either package transactions or destination writes.
+    restore_bundle() with dry_run=False verifies the bundle again before writes.
     """
     bundle, home = _absolute(bundle), _absolute(home)
     try:
+        _validated_rewrite(rewrite_home)
         return _plan(bundle, home, manifest, backup_dir)[0]
     except BundleError:
         raise
@@ -680,8 +749,14 @@ def plan_restore(bundle, home, manifest, *, backup_dir=None):
 
 
 @_owner_accessible
-def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=None):
+def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=None,
+                   rewrite_home=None):
     """Preview or overlay a validated bundle, retaining originals and a journal.
+
+    rewrite_home=(old, new) replaces old-home path references with new in the
+    small settings files report.entry_is_rewritable() selects. It happens only
+    after each restored file's checksum has been validated, and the summary's
+    rewritten_count says how many files changed. A preview never rewrites.
 
     before_write, if given, runs after verification and destination checks and
     immediately before the first change; an exception from it prevents all writes.
@@ -691,6 +766,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
     staging = None
     journal = None
     try:
+        rewrite_home = _validated_rewrite(rewrite_home)
         manifest = verify_bundle(bundle)
         entries = manifest["entries"]
         summary, candidate = _plan(bundle, home, manifest, backup_dir)
@@ -700,10 +776,7 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
             before_write()
         directories = sorted((e for e in entries if e["type"] == "directory"),
                              key=lambda e: (e["path"].count("/"), e["path"]))
-        planned_replaced = {
-            e["path"] for e in entries
-            if e["type"] != "directory" and os.path.lexists(home / e["path"])
-        }
+        planned_replaced = _replaced_paths(home, entries)
         created = {e["path"] for e in directories
                    if not os.path.lexists(home / e["path"])}
         # Persist the full intent plan once before any selected path changes.
@@ -755,6 +828,9 @@ def restore_bundle(bundle, home, *, dry_run=True, backup_dir=None, before_write=
                                   preserve_metadata=False)
                     if _digest(temporary) != entry["sha256"]:
                         raise BundleError(f"Payload changed during restore: {relative}")
+                    if rewrite_home and _rewrite_home_in_temporary(
+                            temporary, entry, *rewrite_home):
+                        summary["rewritten_count"] += 1
                     temporary.chmod(entry["mode"])
                 else:
                     temporary.symlink_to(entry["target"])

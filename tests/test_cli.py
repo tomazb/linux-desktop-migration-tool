@@ -233,6 +233,150 @@ class CLITests(unittest.TestCase):
         self.assertIn("restored", out.lower())
         install.assert_not_called()
 
+    def references_fixture(self):
+        """A bundle whose bookmarks name the source home, plus a destination home."""
+        from fedora_migration.bundle import create_bundle
+        gtk = self.home / ".config/gtk-3.0"
+        gtk.mkdir(parents=True)
+        (gtk / "bookmarks").write_text(f"file://{self.home}/Documents Docs\n"
+                                       f"file://{self.home}/Music Music\n")
+        (self.home / ".bashrc").write_text(f"export P={self.home}/bin\n")
+        bundle = self.root / "refs-backup"
+        create_bundle(self.home, bundle, self.info, package_fixture(), settings_only=True)
+        target = self.root / "target-home"
+        target.mkdir()
+        return bundle, target, dict(self.info, version_id="44", home=str(target))
+
+    def restore(self, info, *argv):
+        cli = cli_module()
+        with patch.object(cli, "platform_info", return_value=info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli, "check_selinux_tools", return_value=False):
+            return self.invoke(["restore", *argv])
+
+    def test_preview_prints_destination_checks_with_counts_and_references(self):
+        bundle, target, info = self.references_fixture()
+        (target / ".bashrc").write_text("old")
+        code, out, err = self.restore(info, "--bundle", str(bundle))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Destination checks", out)
+        self.assertIn("Will replace 1 existing files or symlinks (originals are kept in "
+                      "the rollback directory) and create 1 new ones.", out)
+        self.assertIn(f"{self.home}", out)
+        self.assertIn(".config/gtk-3.0/bookmarks: 2", out)
+        self.assertNotIn(".bashrc: ", out)
+        self.assertIn("--rewrite-home", out)
+        self.assertEqual((target / ".bashrc").read_text(), "old")
+        self.assertEqual(sorted(p.name for p in target.iterdir()), [".bashrc"])
+
+    def test_apply_also_prints_the_destination_checks_before_installing(self):
+        cli = cli_module()
+        bundle, target, info = self.references_fixture()
+        with patch.object(cli, "platform_info", return_value=info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli, "check_selinux_tools", return_value=False), \
+             patch.object(cli.packages, "install_packages"):
+            code, out, err = self.invoke(["restore", "--bundle", str(bundle), "--apply",
+                                          "--install-packages", "--skip-rpm", "--skip-flatpak"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Destination checks", out)
+        self.assertIn("create 2 new ones", out)
+        self.assertLess(out.index("Destination checks"),
+                        out.index("Installing requested packages"))
+        self.assertIn(f"file://{self.home}/Documents", (target / ".config/gtk-3.0/bookmarks").read_text())
+
+    def test_rewrite_home_without_apply_writes_nothing(self):
+        bundle, target, info = self.references_fixture()
+        code, out, err = self.restore(info, "--bundle", str(bundle), "--rewrite-home")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertIn("would be rewritten", out.lower())
+        self.assertIn("preview only", out.lower())
+
+    def test_rewrite_home_with_apply_rewrites_only_eligible_files(self):
+        bundle, target, info = self.references_fixture()
+        code, out, err = self.restore(info, "--bundle", str(bundle), "--apply",
+                                      "--rewrite-home")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((target / ".config/gtk-3.0/bookmarks").read_text(),
+                         f"file://{target}/Documents Docs\nfile://{target}/Music Music\n")
+        self.assertEqual((target / ".bashrc").read_text(), f"export P={self.home}/bin\n")
+        self.assertIn("Rewrote the old home path in 1 file", out)
+
+    def test_unsafe_rewrite_home_refuses_before_package_installation_or_restore(self):
+        cli = cli_module()
+        bundle, target, info = self.references_fixture()
+        unsafe_target = self.root / "target&home"
+        target.rename(unsafe_target)
+        info["home"] = str(unsafe_target)
+        installed = self.root / "packages-were-installed"
+
+        def install(*_args, **_kwargs):
+            installed.write_text("package side effect")
+
+        with patch.object(cli.packages, "install_packages", side_effect=install):
+            code, _, err = self.restore(info, "--bundle", str(bundle), "--apply",
+                                        "--install-packages", "--rewrite-home")
+        self.assertEqual(code, 1)
+        self.assertIn("rewrite-home", err)
+        self.assertIn("ASCII", err)
+        self.assertFalse(installed.exists())
+        self.assertEqual(list(unsafe_target.iterdir()), [])
+
+    def test_preview_rejects_unsafe_rewrite_home_without_writes(self):
+        bundle, target, info = self.references_fixture()
+        unsafe_target = self.root / "target home"
+        target.rename(unsafe_target)
+        info["home"] = str(unsafe_target)
+        code, _, err = self.restore(info, "--bundle", str(bundle), "--rewrite-home")
+        self.assertEqual(code, 1)
+        self.assertIn("rewrite-home", err)
+        self.assertEqual(list(unsafe_target.iterdir()), [])
+
+    def test_old_source_home_note_is_not_duplicated(self):
+        cli = cli_module()
+        bundle = self.backup_fixture()
+        target = self.root / "target-home"
+        target.mkdir()
+        info = dict(self.info, version_id="44", home=str(target))
+        with patch.object(cli, "platform_info", return_value=info):
+            code, out, err = self.invoke(["restore", "--bundle", str(bundle)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Note: source home was", out)
+
+    def test_same_home_has_no_reference_report(self):
+        bundle = self.backup_fixture()
+        info = dict(self.info, version_id="44")
+        code, out, err = self.restore(info, "--bundle", str(bundle), "--rewrite-home")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Destination checks", out)
+        self.assertNotIn("would be rewritten", out.lower())
+
+    def test_destination_checks_report_missing_plugins_and_autostart(self):
+        from fedora_migration import report
+        from fedora_migration.bundle import create_bundle
+        panel = self.home / ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+        panel.parent.mkdir(parents=True)
+        panel.write_text('<channel><property name="plugins" type="empty">'
+                         '<property name="plugin-1" type="string" value="weather"/>'
+                         '</property></channel>')
+        autostart = self.home / ".config/autostart"
+        autostart.mkdir(parents=True)
+        (autostart / "x.desktop").write_text("[Desktop Entry]\nExec=no-such-program-xyz\n")
+        bundle = self.root / "plugins-backup"
+        create_bundle(self.home, bundle, self.info, package_fixture(), settings_only=True)
+        target = self.root / "target-home"
+        target.mkdir()
+        empty = self.root / "no-plugins"
+        empty.mkdir()
+        with patch.object(report, "PANEL_PLUGIN_DIRS", (str(empty),)):
+            code, out, err = self.restore(dict(self.info, version_id="44", home=str(target)),
+                                          "--bundle", str(bundle))
+        self.assertEqual(code, 0, err)
+        self.assertIn("weather", out)
+        self.assertIn(".config/autostart/x.desktop: no-such-program-xyz", out)
+        self.assertEqual(list(target.iterdir()), [])
+
     def test_restore_verifies_once_for_preview_and_again_before_mutation(self):
         cli = cli_module()
         bundle = self.backup_fixture()
