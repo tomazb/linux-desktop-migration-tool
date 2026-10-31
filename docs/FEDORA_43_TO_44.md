@@ -140,6 +140,15 @@ private temporary file, synced, given the manifest mode and mtime and then moved
 into place. Replaced originals remain in the rollback directory. Without the flag
 no file content changes.
 
+Literal replacement is safe across these formats only for a conservative set of
+home names: when source and destination differ, both paths must contain only
+ASCII letters, digits, `/`, `.`, `_` and `-`. Whitespace, quotes, `&`, shell
+metacharacters, percent signs and non-ASCII characters require restoring without
+`--rewrite-home` and editing the paths manually with the appropriate escaping.
+Preview and apply reject unsupported rewrites before package installation or
+destination writes. A same-home rewrite is a no-op, and ordinary restore accepts
+these home names.
+
 Regular-file modes and mtime and symlinks are preserved. Ownership, ACLs, xattrs
 and source security labels are not. Symlinks remain links: their external targets
 are not backed up. Review links to old disks or paths after migration.
@@ -194,11 +203,15 @@ The restore preview automates part of this check without changing anything:
   is reported as a warning rather than parsed.
 - **Autostart programs.** For each `.config/autostart/*.desktop` entry that is not
   `Hidden=true`, the program is `TryExec` if present, otherwise the first word of
-  `Exec` after any leading `env` (with its options) and `NAME=value` words. It must
-  be an existing executable (an absolute path, or an executable file the bundle
-  restores to that path, following `--rewrite-home` when given) or be found on
-  `PATH`. Missing programs are listed per entry, and an `Exec` that cannot be split
-  is reported as unparseable. The entries are only read, never run.
+  `Exec` after any leading `env` (with its options) and `NAME=value` words. Absolute
+  paths, `PATH` candidates and symlink targets are checked against the final
+  restore overlay: a bundled replacement takes precedence over an existing file,
+  and a bundled executable can satisfy a command before it exists here. Restored
+  files require owner execute permission. `--rewrite-home` is taken into account
+  when selected. Missing programs are listed per entry. An `Exec` that cannot be
+  split or checked conservatively is reported as unparseable; this includes
+  `env -S` / `--split-string`, unsupported options and missing option arguments.
+  Those entries need manual inspection. The entries are only read, never run.
 - **Old home paths.** See `--rewrite-home` under
   [Restore into Fedora XFCE 44](#restore-into-fedora-xfce-44).
 
@@ -271,15 +284,47 @@ the restore wrote. The bundle is verified in full for that comparison (pass
 Changed files are a CONFLICT and are left alone; if the bundle cannot be verified,
 every existing path is a conflict. Review each reason, then add `--include-changed`
 to process them anyway. Directories the restore created are removed only when
-empty. Before any overwrite or removal the current version is copied to
+empty. New restore journals record the original mode and timestamp of existing
+selected directory roots before any changes, and rollback restores that metadata
+after its file actions. Partial or interrupted rollbacks can be continued without
+losing this information. Directory metadata is restored only when it still matches
+the verified bundle or the saved original; changes are conflicts left alone unless
+`--include-changed` is supplied. An unavailable bundle cannot authorize changed
+metadata. An interrupted attempt's own directory-entry changes may make a timestamp
+unverifiable too; inspect the conflict before opting in on retry. Older journals
+are still accepted, with a warning in the
+preview, result and rollback journal that the original directory metadata is
+unavailable and must be recovered by hand.
+
+Before any overwrite or removal the current version is moved to
 `ROLLBACK/undone-<UTC time>/`, so nothing is lost, and progress is written to
 `ROLLBACK/rollback-journal.json`. A finished rollback is refused a second time; one
 that left conflicts (`partial`) or failed can be run again. Package installs are not
 undone. With SELinux enabled the put-back paths are relabeled.
 
+Across filesystems, rollback moves the original inode into a private
+`.fedora-migration-quarantine-*/entry` directory beside the former path, then makes
+a durable copy under `undone-*`. It journals the recovery location before moving
+anything. The original inode remains there after success so that writes through
+an already-open descriptor remain recoverable, including writes after rollback
+finishes. The command prints the locations; `retained_quarantines` in
+`rollback-journal.json` lists every home-relative location and is carried forward
+on retries. A failed put-back removes a quarantine only after returning that same
+inode to its former path without replacing anything. Otherwise, keep these
+directories until all writers have stopped, compare the retained originals with
+the `undone-*` copies, and save any newer data before removing a quarantine by
+hand. Restore-created parent directories containing retained originals are kept.
+
+Rollback temporarily grants owner access to managed read-only directories through
+directory descriptors. On failure it resets temporary modes; on success existing
+selected roots receive their original metadata. If the owner cannot read or
+traverse a directory at all (for example mode `000`), rollback fails closed with
+an access diagnostic: repair owner access by hand before retrying. It does not
+follow a symlink to make that repair.
+
 Threat model: rollback assumes the home is quiescent, which the command checks
 (no XFCE session, no browser, mail or Flatpak applications). It never overwrites or
-deletes an entry it has not first captured under `undone-*`, and it publishes put-back
+deletes an entry it has not first captured, and it publishes put-back
 files with a hard link that fails rather than replaces, so a concurrent writer can at
 most make one path fail with both versions kept; the error names both locations. The
 home and its ancestors are walked from `/` without following symlinks, so swapping a
