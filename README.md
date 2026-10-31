@@ -109,9 +109,10 @@ replaces are retained under a private rollback directory with a journal. Record
 that directory. Its journal is an intent plan written before copying: listed paths
 may have been touched; `previous/` contains only complete saved originals, which are
 assembled under `staging/` and moved into place when finished. Ctrl+C
-returns exit code 130 and reports the retained recovery directory. There is no
-automatic rollback command; see the
-[recovery instructions](docs/FEDORA_43_TO_44.md#recover-overwritten-files).
+returns exit code 130 and reports the retained recovery directory. To undo a
+restore, use `rollback` (below); the
+[recovery instructions](docs/FEDORA_43_TO_44.md#recover-overwritten-files) keep the
+manual steps as a fallback.
 File/type conflicts and symlink ancestors are rejected instead of followed.
 When SELinux is enabled, target `restorecon` relabels restored paths.
 
@@ -134,6 +135,55 @@ package installation or file changes; a same-home rewrite remains a no-op.
 
 Log in to XFCE and inspect the panel, shortcuts, display layout and key apps.
 Keep both the source backup and rollback files until the desktop is checked.
+
+### 4. Undo a restore (optional)
+
+```bash
+python3 fedora-migration.py rollback --rollback-dir /path/to/rollback-dir
+python3 fedora-migration.py rollback --rollback-dir /path/to/rollback-dir --apply
+```
+
+`rollback` previews by default and changes nothing without `--apply`. It reads the
+restore's `journal.json` and `previous/`, then puts the saved originals back and
+removes the files and symlinks the restore added, but only where a path still
+holds what the restore wrote. That check re-verifies the bundle in full (the path in
+the journal, or `--bundle PATH` if it moved) and compares each current file with the
+bundle payload; files changed by `--rewrite-home` count as restored. Files
+written by an older restore remain comparable even if the old or new home has
+spaces, Unicode or punctuation that new `--rewrite-home` operations now refuse.
+Anything else is a CONFLICT: it is listed with the reason and left alone. If the bundle is
+missing or invalid, no path can be verified and every existing path is a conflict.
+`--include-changed` processes conflicts too, except file paths now holding
+directories or special files.
+Directories the restore created are removed only if they are empty. Before every
+overwrite or removal the current version is saved under `undone-<UTC time>/` in the
+rollback directory, so a rollback loses nothing. Progress is recorded in
+`rollback-journal.json` (`complete`, `partial` when conflicts were left, `failed` or
+`interrupted`); a finished (`complete`) rollback is refused a second time. It works
+on a restore that failed or was interrupted, and it does not undo package installs.
+Like a restore it needs Fedora 44, a stopped XFCE session and closed browsers.
+
+New restore journals also retain the original mode and timestamp of existing
+selected directory roots; rollback puts those back after changing files. Older
+journals remain usable, with a warning that this metadata must be recovered by
+hand. Directory modes and timestamps changed since restore are conflicts too;
+`--include-changed` opts into restoring them. After an interrupted attempt, its own
+directory-entry changes can also require that explicit choice. Read-only
+directories are temporarily made accessible to their owner and
+their modes are reset on failure; a directory the owner cannot read or traverse
+requires a manual access repair before rollback can proceed safely.
+
+When the rollback directory is on another filesystem, captured originals also
+remain under private `.fedora-migration-quarantine-*/entry` directories beside
+their former paths. Keeping the inode preserves late writes through already-open
+file descriptors. Each capture first writes a durable individual recovery record
+under `ROLLBACK/quarantine-records/`; these records remain usable if an abrupt
+interruption leaves `rollback-journal.json` behind. The output and summary journal
+also list recovery locations, and retries merge both sources. Keep the individual
+records with the rollback directory. Quarantine directories can keep otherwise empty
+restore-created parents from being removed. Stop all writers, inspect both the
+retained original and the `undone-*` copy, and keep any newer data before manually
+removing a quarantine directory.
 
 ## What is included
 
@@ -159,6 +209,10 @@ so the new installation keeps its own display configuration.
 | `restore --skip-rpm` / `--skip-flatpak` | Skip that package installation path |
 | `restore --apply --rewrite-home` | Replace the old home path with this home in the settings files the preview lists; without `--apply` the preview shows what would change |
 | `restore --apply --rollback-dir /path/new-recovery-dir` | Choose a new private rollback directory |
+| `rollback --rollback-dir DIR` | Preview undoing a restore: what is put back, removed, unchanged or in conflict |
+| `rollback --rollback-dir DIR --apply` | Undo it, saving every current version under `DIR/undone-*` first |
+| `rollback --bundle PATH` | Compare against this bundle if it moved since the restore |
+| `rollback --include-changed` | Also put back or remove files changed since the restore (current versions are saved first) |
 
 Known SSH/GPG/PKI/keyring/Online Accounts paths are excluded by default. `--include-secrets` may copy private keys
 and credentials; the bundle itself is not encrypted. App profiles may also contain

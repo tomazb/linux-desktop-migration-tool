@@ -34,6 +34,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Preserved this fork's previous shell fixes instead of replacing its script
   wholesale. Legacy live Fedora XFCE 43/44 migration remains unverified.
 
+### Added (rollback)
+
+- `rollback --rollback-dir DIR` previews, and with `--apply` performs, an undo of a
+  restore: saved originals are put back and files or symlinks the restore added are
+  removed, but only where the path still holds what the restore wrote (the bundle
+  is verified in full; `--bundle` points at it if it moved; `--rewrite-home`
+  changes count as restored). Changed paths are reported as conflicts and left
+  alone unless `--include-changed` is given. Created directories are removed only
+  when empty.
+- Rollback saves every current version under `undone-<time>/` before overwriting
+  or removing it, records its own `rollback-journal.json` (`complete`, `partial`,
+  `failed` or `interrupted`), refuses a second run after `complete`, and works on
+  failed or interrupted restores. It requires the same guards as `restore --apply`.
+- The restore journal now records the `rewrite_home` pair it used (or `null`).
+
 ### Added (restore preview report)
 
 - `restore` preview and apply print read-only "Destination checks": how many

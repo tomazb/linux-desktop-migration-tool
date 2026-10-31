@@ -245,25 +245,101 @@ are not one atomic transaction. Review output before retrying.
 
 ## Recover overwritten files
 
-Close applications and log out of XFCE again. Read the journal in the reported
-rollback directory and identify the exact paths to recover. Status is `complete`,
-`failed` or `interrupted` after an attempt (`in_progress` if abruptly terminated).
-The intent plan lists potentially touched paths, not proof every listed write
-finished; inspect `previous/` for actual saved originals. A recovery copy is
-assembled under `staging/` and moved into `previous/` only once complete, so
-`previous/` never holds a partial original; after an abrupt termination, ignore
-anything left in `staging/`. Ctrl+C returns 130 and
-reports the retained rollback directory. Keep a
-copy of the current target versions if you need to compare them. Copy only the
-chosen corresponding entries from `ROLLBACK/previous/` back beneath your home,
-as the destination desktop user, preserving symlinks/modes with `cp -a` or
-`rsync -a`. Inspect the directory layout before choosing source/destination paths;
-do not merge the whole rollback tree blindly and do not use `--delete`.
+Close applications and log out of XFCE again. The `rollback` command undoes a
+restore from the rollback directory it reported; it previews by default:
 
-No automatic rollback is supplied. Newly created files need separate review;
-restoring overwritten versions does not remove new files or undo package installs.
-Check ownership after any administrator-assisted recovery and relabel recovered
-paths with target `restorecon` when SELinux is enabled. Then log in and recheck apps.
+```bash
+python3 fedora-migration.py rollback --rollback-dir /mnt/backup/fedora44-before-restore
+python3 fedora-migration.py rollback --rollback-dir /mnt/backup/fedora44-before-restore --apply
+```
+
+It works for any journal status, including a restore that `failed` or was
+interrupted. Saved originals are put back over the restored files, and files or
+symlinks the restore added are removed, but only where the path still holds what
+the restore wrote. The bundle is verified in full for that comparison (pass
+`--bundle PATH` if it moved); files changed by `--rewrite-home` count as restored.
+Historical home-rewrite pairs containing spaces, Unicode or punctuation remain
+usable for comparing already-written files. The stricter home-name requirements
+for new `--rewrite-home` restores still apply to new writes.
+Changed files are a CONFLICT and are left alone; if the bundle cannot be verified,
+every existing path is a conflict. Review each reason, then add `--include-changed`
+to process them anyway. Directories the restore created are removed only when
+empty. New restore journals record the original mode and timestamp of existing
+selected directory roots before any changes, and rollback restores that metadata
+after its file actions. Partial or interrupted rollbacks can be continued without
+losing this information. Directory metadata is restored only when it still matches
+the verified bundle or the saved original; changes are conflicts left alone unless
+`--include-changed` is supplied. An unavailable bundle cannot authorize changed
+metadata. An interrupted attempt's own directory-entry changes may make a timestamp
+unverifiable too; inspect the conflict before opting in on retry. Older journals
+are still accepted, with a warning in the
+preview, result and rollback journal that the original directory metadata is
+unavailable and must be recovered by hand.
+
+Before any overwrite or removal the current version is moved to
+`ROLLBACK/undone-<UTC time>/`, so nothing is lost, and progress is written to
+`ROLLBACK/rollback-journal.json`. A finished rollback is refused a second time; one
+that left conflicts (`partial`) or failed can be run again. Package installs are not
+undone. With SELinux enabled the put-back paths are relabeled.
+
+Across filesystems, rollback moves the original inode into a private
+`.fedora-migration-quarantine-*/entry` directory beside the former path, then makes
+a durable copy under `undone-*`. Before moving anything, it atomically writes and
+syncs a small individual recovery record under
+`ROLLBACK/quarantine-records/<identifier>.json`. The original inode remains there
+after success so that writes through
+an already-open descriptor remain recoverable, including writes after rollback
+finishes. These individual records are durable recovery evidence after an abrupt
+interruption: the summary `rollback-journal.json` may not yet list the latest
+captures. Keep `quarantine-records/` with the rollback directory. Each record is an
+intent reference, so its entry may be absent if interruption happened before the
+move or just after a successful put-back. Retries validate and merge the records
+with older `retained_quarantines` references from the summary, and normal
+completion or failure consolidates the locations into the summary. The command
+prints the locations. A failed put-back removes a quarantine and its individual
+record only after returning that same
+inode to its former path without replacing anything. Otherwise, keep these
+directories until all writers have stopped, compare the retained originals with
+the `undone-*` copies, and save any newer data before removing a quarantine by
+hand. Restore-created parent directories containing retained originals are kept.
+
+Rollback temporarily grants owner access to managed read-only directories through
+directory descriptors. On failure it resets temporary modes; on success existing
+selected roots receive their original metadata. If the owner cannot read or
+traverse a directory at all (for example mode `000`), rollback fails closed with
+an access diagnostic: repair owner access by hand before retrying. It does not
+follow a symlink to make that repair.
+
+Threat model: rollback assumes the home is quiescent, which the command checks
+(no XFCE session, no browser, mail or Flatpak applications). It never overwrites or
+deletes an entry it has not first captured, and it publishes put-back
+files with a hard link that fails rather than replaces, so a concurrent writer can at
+most make one path fail with both versions kept; the error names both locations. The
+home and its ancestors are walked from `/` without following symlinks, so swapping a
+parent directory mid-run cannot redirect a write. Because of the hard-link step, a
+filesystem without hard links makes rollback stop with status `failed` at the first
+path it must put back; later paths are not processed. Restore the remaining put-back
+paths by hand from `previous/`, or retry only on a filesystem that supports hard links.
+
+### Manual recovery (fallback)
+
+Read the journal in the rollback directory and identify the exact paths to recover.
+Status is `complete`, `failed` or `interrupted` after an attempt (`in_progress` if
+abruptly terminated). The intent plan lists potentially touched paths, not proof
+every listed write finished; inspect `previous/` for actual saved originals. A
+recovery copy is assembled under `staging/` and moved into `previous/` only once
+complete, so `previous/` never holds a partial original; after an abrupt
+termination, ignore anything left in `staging/`. Ctrl+C returns 130 and reports the
+retained rollback directory. Keep a copy of the current target versions if you need
+to compare them. Copy only the chosen corresponding entries from `ROLLBACK/previous/`
+back beneath your home, as the destination desktop user, preserving symlinks/modes
+with `cp -a` or `rsync -a`. Inspect the directory layout before choosing
+source/destination paths; do not merge the whole rollback tree blindly and do not
+use `--delete`.
+
+Newly created files then need separate review. Check ownership after any
+administrator-assisted recovery and relabel recovered paths with target `restorecon`
+when SELinux is enabled. Then log in and recheck apps.
 
 ## In-place upgrade is a separate operation
 

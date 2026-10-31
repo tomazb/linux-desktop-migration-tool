@@ -1,6 +1,7 @@
 """CLI policy tests; external system changes are mocked, file fixtures are real."""
 
 import contextlib
+import errno
 import importlib
 import io
 import json
@@ -494,6 +495,245 @@ class CLITests(unittest.TestCase):
         self.assertIn(str(rollback), out + err)
         self.assertEqual((rollback / "previous/.config/xfce4/settings.xml").read_text(), "original")
         self.assertEqual(json.loads((rollback / "journal.json").read_text())["status"], "interrupted")
+
+    # --- rollback ---
+
+    def rollback_fixture(self):
+        """A target home with one replaced and one new restored file, plus its rollback dir."""
+        from fedora_migration.bundle import restore_bundle
+        (self.home / ".config/xfce4").mkdir(parents=True)
+        (self.home / ".config/xfce4/extra.xml").write_text("<extra/>\n")
+        bundle = self.backup_fixture()
+        target = self.root / "target-home"
+        config = target / ".config/xfce4"
+        config.mkdir(parents=True)
+        (config / "settings.xml").write_text("original")
+        rollback = self.root / "rollback"
+        restore_bundle(bundle, target, dry_run=False, backup_dir=rollback)
+        info = dict(self.info, version_id="44", home=str(target))
+        return bundle, target, rollback, info
+
+    def rollback(self, info, *argv, selinux=False):
+        cli = cli_module()
+        with patch.object(cli, "platform_info", return_value=info), \
+             patch.object(cli, "check_selinux_tools", return_value=selinux):
+            return self.invoke(["rollback", *argv])
+
+    def test_help_lists_rollback(self):
+        result = subprocess.run([sys.executable, str(ROOT / "fedora-migration.py"), "--help"],
+                                text=True, capture_output=True, check=False)
+        self.assertIn("rollback", result.stdout)
+
+    def test_rollback_is_preview_by_default_and_writes_nothing(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        with patch.object(cli, "assert_xfce_stopped",
+                          side_effect=AssertionError("preview may run in XFCE")), \
+             patch.object(cli, "relabel_paths") as relabel:
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 0, err)
+        self.assertIn("preview", out.lower())
+        self.assertIn("PUT_BACK: 1", out)
+        self.assertIn("REMOVE: 1", out)
+        self.assertIn("settings.xml", out)
+        self.assertIn("--apply", out)
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+        self.applications_guard.assert_not_called()
+        relabel.assert_not_called()
+
+    def test_rollback_apply_puts_back_and_reports_undone_dir(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        with patch.object(cli_module(), "assert_xfce_stopped"):
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((target / ".config/xfce4/settings.xml").read_text(), "original")
+        self.assertFalse((target / ".config/xfce4/extra.xml").exists())
+        undone = sorted(rollback.glob("undone-*"))
+        self.assertEqual(len(undone), 1)
+        self.assertIn(str(undone[0]), out)
+        self.assertEqual(json.loads((rollback / "rollback-journal.json").read_text())["status"],
+                         "complete")
+
+    def test_rollback_warns_when_older_journal_cannot_restore_directory_metadata(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        journal = json.loads((rollback / "journal.json").read_text())
+        journal.pop("original_directories", None)
+        (rollback / "journal.json").write_text(json.dumps(journal))
+        code, out, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 0, err)
+        self.assertIn("directory metadata", out)
+        self.assertIn("cannot be restored", out)
+
+    def test_cross_device_rollback_reports_retained_original_locations(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        real = os.rename
+
+        def cross_device(source, destination, **kwargs):
+            if kwargs.get("src_dir_fd") is not None and kwargs.get("dst_dir_fd") is None:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real(source, destination, **kwargs)
+
+        with patch.object(cli_module(), "assert_xfce_stopped"), \
+             patch("fedora_migration.rollback.os.rename", side_effect=cross_device):
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        records = json.loads((rollback / "rollback-journal.json").read_text())["retained_quarantines"]
+        self.assertTrue(records)
+        for item in records:
+            self.assertIn(str(target / item["quarantine"]), out)
+        self.assertIn("all writers are stopped", out)
+
+    def test_rollback_apply_runs_guards_before_the_first_write(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        with patch.object(cli, "assert_xfce_stopped",
+                          side_effect=cli.MigrationError("Log out of XFCE")):
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("Log out", err)
+        self.assertEqual((target / ".config/xfce4/settings.xml").read_text(),
+                         (bundle / "payload/.config/xfce4/settings.xml").read_text())
+        self.assertFalse((rollback / "rollback-journal.json").exists())
+        self.assertEqual(list(rollback.glob("undone-*")), [])
+
+    def test_rollback_apply_rechecks_guards_immediately_before_writing(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        calls = []
+
+        def record():
+            calls.append((rollback / "rollback-journal.json").exists())
+
+        with patch.object(cli, "assert_xfce_stopped", side_effect=record):
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[-1], False)  # the last check precedes the first write
+
+    def test_rollback_apply_blocked_by_running_applications(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        self.applications_guard.side_effect = cli.MigrationError("Close firefox")
+        with patch.object(cli, "assert_xfce_stopped"):
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("Close firefox", err)
+        self.assertFalse((rollback / "rollback-journal.json").exists())
+
+    def test_rollback_apply_checks_secret_agents_when_journal_touches_secret_trees(self):
+        from fedora_migration.bundle import create_bundle, restore_bundle
+        (self.home / ".ssh").mkdir()
+        (self.home / ".ssh/config").write_text("Host example\n")
+        bundle = self.root / "secret-backup"
+        create_bundle(self.home, bundle, self.info, package_fixture(),
+                      settings_only=True, include_secrets=True)
+        target = self.root / "target-home"
+        target.mkdir()
+        rollback = self.root / "rollback"
+        restore_bundle(bundle, target, dry_run=False, backup_dir=rollback)
+        info = dict(self.info, version_id="44", home=str(target))
+        with patch.object(cli_module(), "assert_xfce_stopped"):
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.applications_guard.call_args_list)
+        for call in self.applications_guard.call_args_list:
+            self.assertEqual(call.kwargs, {"secrets": True})
+
+    def test_rollback_relabels_put_back_paths_when_selinux_is_enabled(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        with patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli, "relabel_paths") as relabel:
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply",
+                                         selinux=True)
+        self.assertEqual(code, 0, err)
+        relabel.assert_called_once()
+        home, paths = relabel.call_args.args
+        self.assertEqual(Path(home), target)
+        self.assertEqual(list(paths), [".config/xfce4/settings.xml"])
+
+    def test_rollback_does_not_relabel_without_selinux(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        with patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli, "relabel_paths") as relabel:
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 0, err)
+        relabel.assert_not_called()
+
+    def test_rollback_conflicts_are_listed_with_hint_and_include_changed_applies_them(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        (target / ".config/xfce4/settings.xml").write_text("edited")
+        code, out, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 0, err)
+        self.assertIn("CONFLICT: 1", out)
+        self.assertIn("settings.xml", out)
+        self.assertIn("--include-changed", out)
+        with patch.object(cli, "assert_xfce_stopped"):
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply",
+                                           "--include-changed")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((target / ".config/xfce4/settings.xml").read_text(), "original")
+
+    def test_rollback_without_a_bundle_says_cannot_verify_prominently(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        bundle.rename(self.root / "moved")
+        code, out, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 0, err)
+        self.assertIn("cannot verify", out.lower())
+        self.assertIn("--bundle", out)
+        code, out, err = self.rollback(info, "--rollback-dir", str(rollback),
+                                       "--bundle", str(self.root / "moved"))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cannot verify", out.lower())
+        self.assertIn("PUT_BACK: 1", out)
+
+    def test_rollback_requires_fedora_44_and_a_journal(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        code, _, err = self.rollback(dict(info, version_id="43"), "--rollback-dir", str(rollback))
+        self.assertEqual(code, 1)
+        self.assertIn("Fedora 44", err)
+        code, _, err = self.rollback(info, "--rollback-dir", str(self.root / "missing"))
+        self.assertEqual(code, 1)
+
+    def test_rollback_refuses_a_journal_from_another_home(self):
+        bundle, target, rollback, info = self.rollback_fixture()
+        other = self.root / "other-home"
+        other.mkdir()
+        code, _, err = self.rollback(dict(info, home=str(other)), "--rollback-dir", str(rollback))
+        self.assertEqual(code, 1)
+        self.assertIn("home", err)
+
+    def test_second_rollback_is_refused(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        with patch.object(cli, "assert_xfce_stopped"):
+            code, _, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+            self.assertEqual(code, 0, err)
+        code, _, err = self.rollback(info, "--rollback-dir", str(rollback))
+        self.assertEqual(code, 1)
+        self.assertIn("already rolled back", err)
+
+    def test_interrupted_rollback_exits_130_and_reports_undone_dir(self):
+        cli = cli_module()
+        bundle, target, rollback, info = self.rollback_fixture()
+        original_link = os.link
+
+        def interrupt(src, dest, **kwargs):
+            if dest == "settings.xml" and kwargs.get("src_dir_fd") is not None:
+                raise KeyboardInterrupt()
+            return original_link(src, dest, **kwargs)
+
+        with patch.object(cli, "assert_xfce_stopped"), \
+             patch("fedora_migration.rollback.os.link", side_effect=interrupt):
+            code, out, err = self.rollback(info, "--rollback-dir", str(rollback), "--apply")
+        self.assertEqual(code, 130)
+        undone = sorted(rollback.glob("undone-*"))
+        self.assertIn(str(undone[0]), out + err)
+        self.assertEqual(json.loads((rollback / "rollback-journal.json").read_text())["status"],
+                         "interrupted")
 
 
 class ApplicationGuardTests(unittest.TestCase):

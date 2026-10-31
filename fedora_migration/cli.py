@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, bundle, packages, report
+from . import __version__, bundle, packages, report, rollback
 
 
 class MigrationError(RuntimeError):
@@ -374,9 +374,114 @@ def restore_command(args):
     return 0
 
 
+def print_rollback_plan(plan, *, apply):
+    """Describe, read-only, what a rollback does; paths are home-relative."""
+    print("Validated rollback plan:" if apply else "Rollback preview:")
+    print(f"Rollback directory: {plan['rollback_dir']} (restore status: {plan['status']})")
+    print(f"Destination: {plan['home']}")
+    for warning in plan["warnings"]:
+        print(f"WARNING: {warning}")
+    if plan["verified"]:
+        print(f"Bundle: {plan['bundle']} (checksums verified)")
+    else:
+        print(f"WARNING: the bundle could not be verified: {plan['bundle_problem']}")
+        print("  The tool cannot verify whether existing files are still as the restore")
+        print("  left them, so every existing path is a CONFLICT. If the bundle moved, pass")
+        print("  --bundle PATH (it is verified in full before it is used).")
+    if plan["rewrite_home"]:
+        print(f"The restore rewrote {plan['rewrite_home'][0]} to {plan['rewrite_home'][1]} in "
+              "eligible settings files; rewritten files count as restored.")
+    conflicting = {item["path"] for item in plan["conflicts"]}
+    put_back = [path for path in plan["put_back"] if path not in conflicting]
+    remove = [path for path in plan["remove"] if path not in conflicting]
+    print(f"PUT_BACK: {len(put_back)} (saved originals are copied back over the restored files)")
+    print_limited([f"    {report.clip(path)}" for path in put_back])
+    print(f"REMOVE: {len(remove)} (files and symlinks the restore added, unchanged since)")
+    print_limited([f"    {report.clip(path)}" for path in remove])
+    print(f"UNCHANGED: {len(plan['unchanged'])} (the restore never replaced the original, "
+          "or it is already back)")
+    print_limited([f"    {report.clip(path)}" for path in plan["unchanged"]])
+    print(f"CONFLICT: {len(plan['conflicts'])}")
+    for item in plan["conflicts"][:MAX_LISTED]:
+        outcome = ""
+        if plan["include_changed"] and not item["blocked"]:
+            outcome = " - processed because of --include-changed"
+        print(f"    {report.clip(item['path'])} (would {item['action'].replace('_', ' ')}): "
+              f"{item['reason']}{outcome}")
+    if len(plan["conflicts"]) > MAX_LISTED:
+        print(f"    ... and {len(plan['conflicts']) - MAX_LISTED} more")
+    if plan["conflicts"] and not plan["include_changed"]:
+        print("  Conflicts are left alone. Add --include-changed to process them anyway; "
+              "the current version is always saved under the undone directory first.")
+    print(f"Directories the restore created that would be removed if empty: "
+          f"{len(plan['remove_directories'])}")
+    print_limited([f"    {report.clip(path)}" for path in plan["remove_directories"]])
+    print(f"Existing selected directories whose original mode and timestamp will be restored: "
+          f"{len(plan['restore_directory_metadata'])}")
+    print_limited([f"    {report.clip(item['path'])}" for item in plan["restore_directory_metadata"]])
+    if plan["retained_quarantines"]:
+        print("Previously captured cross-filesystem originals remain at:")
+        print_limited([f"    {Path(plan['home']) / item['quarantine']}"
+                       for item in plan["retained_quarantines"]])
+        print(f"Durable recovery records: {Path(plan['rollback_dir']) / rollback.QUARANTINE_RECORDS}; "
+              "the summary journal may lag after an interruption.")
+    if plan["kept_directories"]:
+        print_limited([f"    kept {report.clip(item['path'])}: {item['reason']}"
+                       for item in plan["kept_directories"]])
+
+
+def rollback_command(args):
+    info = platform_info()
+    require_platform(info, "44")
+    home = Path(info["home"])
+    rollback_dir = args.rollback_dir.expanduser()
+    source = args.bundle.expanduser() if args.bundle else None
+    plan = rollback.plan_rollback(rollback_dir, home, bundle=source,
+                                  include_changed=args.include_changed)
+    print_rollback_plan(plan, apply=args.apply)
+    if not args.apply:
+        print("Preview only: no files or rollback directories were changed.")
+        print("Review the plan, then add --apply to roll the restore back.")
+        return 0
+    secrets = plan["secrets"]
+    assert_xfce_stopped()
+    assert_applications_closed(secrets=secrets)
+    selinux = check_selinux_tools()
+
+    def recheck_before_writing():
+        assert_xfce_stopped()
+        assert_applications_closed(secrets=secrets)
+
+    print("Rolling back and saving current versions first...", flush=True)
+    result = rollback.apply_rollback(rollback_dir, home, bundle=source,
+                                     include_changed=args.include_changed,
+                                     before_write=recheck_before_writing)
+    if selinux:
+        relabel_paths(home, result["put_back"])
+    print(f"Put back {len(result['put_back'])} files or symlinks, removed "
+          f"{len(result['removed'])} and {len(result['removed_directories'])} directories; "
+          f"{len(plan['unchanged'])} needed nothing.")
+    if result["undone_dir"]:
+        print(f"Versions replaced or removed were saved in: {result['undone_dir']}", flush=True)
+    if result["retained_quarantines"]:
+        print("Captured cross-filesystem originals are also retained at:")
+        print_limited([f"    {home / item['quarantine']}"
+                       for item in result["retained_quarantines"]])
+        print("Keep these private quarantine directories until all writers are stopped and you "
+              "have checked the result; rollback-journal.json and quarantine-records/ "
+              "record the recovery locations.")
+    for item in result["kept_directories"]:
+        print(f"  Kept directory {report.clip(item['path'])}: {item['reason']}")
+    if result["skipped"]:
+        print(f"Left alone: {len(result['skipped'])} conflicts (see the list above). Review them, "
+              "then run rollback again with --include-changed to undo them too.")
+    print("Keep the rollback directory until you have checked the result.")
+    return 0
+
+
 def parser():
     result = argparse.ArgumentParser(
-        description="Portable Fedora XFCE 43 → 44 backup and restore. Restore previews by default.",
+        description="Portable Fedora XFCE 43 → 44 backup, restore and rollback. Restore and rollback preview by default.",
     )
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subcommands = result.add_subparsers(dest="command", required=True)
@@ -402,6 +507,12 @@ def parser():
     restore.add_argument("--rewrite-home", action="store_true", help="With --apply, replace the old home path with this home in the settings files listed by the preview (never browser or Flatpak data); the preview shows what would change")
     restore.add_argument("--rollback-dir", type=Path, help="New directory for overwritten files and restore journal")
     restore.set_defaults(handler=restore_command)
+    undo = subcommands.add_parser("rollback", help="Preview or undo a restore from its rollback directory")
+    undo.add_argument("--rollback-dir", type=Path, required=True, help="Rollback directory a restore --apply wrote")
+    undo.add_argument("--bundle", type=Path, help="Bundle to compare against if it moved (default: the path in the journal)")
+    undo.add_argument("--apply", action="store_true", help="Perform the rollback; otherwise show a read-only preview")
+    undo.add_argument("--include-changed", action="store_true", help="Also process files changed since the restore; their current version is saved first")
+    undo.set_defaults(handler=rollback_command)
     return result
 
 
