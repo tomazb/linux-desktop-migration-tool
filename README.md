@@ -315,5 +315,8 @@ bash -n migration.sh
 ```
 
 Passing automated checks does not replace the [live rehearsal](docs/FEDORA_43_TO_44.md#two-vm-rehearsal).
+On a host with libvirt/KVM, `python3 scripts/rehearsal.py` prints the automated two-VM
+rehearsal plan (a dry run by default; `--execute` runs it). The script has so far been
+exercised only in dry-run mode and by unit tests; a successful live run is still pending.
 GitHub Actions runs this suite in Fedora 43 and 44 containers and exercises the
 real DNF5 inventory commands and an empty Flatpak installation in each container.
