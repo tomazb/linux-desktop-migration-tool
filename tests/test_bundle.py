@@ -727,6 +727,31 @@ class BackupHashingTests(BundleFixture):
 
 
 class ExcludeReportingTests(BundleFixture):
+    def test_overlapping_pattern_that_matched_is_not_reported_as_unmatched(self):
+        self.write(self.home / "Projects/build/out.o")
+        self.write(self.home / "Projects/main.c")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects/*", "Projects/build"])
+        text = "\n".join(manifest["warnings"])
+        self.assertNotIn("'Projects/build' matched nothing", text)
+        self.assertIn("Excluded 2 paths matching 'Projects/*'", text)
+
+    def test_pattern_inside_an_excluded_tree_is_explained_not_called_a_typo(self):
+        self.write(self.home / "Projects/build/out.o")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects/build", "Projects/build/out.o"])
+        text = "\n".join(manifest["warnings"])
+        self.assertNotIn("'Projects/build/out.o' matched nothing", text)
+        self.assertIn("'Projects/build/out.o' lies inside paths already excluded by "
+                      "'Projects/build'", text)
+
+    def test_genuine_typo_next_to_an_overlap_is_still_reported(self):
+        self.write(self.home / "Projects/build/out.o")
+        manifest = self.backup(include=["Projects"], settings_only=True,
+                               exclude=["Projects/*", "Projects/buid"])
+        self.assertIn("Exclusion 'Projects/buid' matched nothing",
+                      "\n".join(manifest["warnings"]))
+
     def warnings(self, manifest):
         return "\n".join(manifest["warnings"])
 
