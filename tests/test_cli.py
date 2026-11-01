@@ -422,6 +422,9 @@ class CLITests(unittest.TestCase):
         self.assertEqual(report.printable("plain /home/ålice"), "plain /home/ålice")
         self.assertEqual(report.clip("\x1b" * 200, 8), "\\x1b\\x1b...")
         self.assertEqual(report.printable_lines("first\x1b\nsecond"), "first\\x1b\nsecond")
+        # Non-UTF-8 file names arrive as lone surrogates; printing one raw fails.
+        self.assertEqual(report.printable("bad\udcff.txt"), "bad\\udcff.txt")
+        report.printable("\ud800").encode("utf-8")
 
     def test_restore_verifies_once_for_preview_and_again_before_mutation(self):
         cli = cli_module()

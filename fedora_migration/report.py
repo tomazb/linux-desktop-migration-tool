@@ -45,8 +45,9 @@ MAX_SHOWN = 120
 
 # Characters a terminal may act on or that change how text displays: controls
 # (escape sequences), format characters (such as right-to-left overrides) and
-# line/paragraph separators.
-_UNSAFE_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp"))
+# line/paragraph separators, and lone surrogates (non-UTF-8 file names), which
+# cannot be written to a UTF-8 terminal at all.
+_UNSAFE_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
 
 
 def printable(value):
