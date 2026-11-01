@@ -320,14 +320,16 @@ def _plan_rollback(rollback_dir, home, bundle, include_changed):
         _assert_no_symlink_ancestors(destination)
     original_paths = {item["path"] for item in original_directories}
     for relative in journal["created_directories"] + sorted(original_paths):
-        # A created directory may legitimately contain the rollback directory
-        # (the restore made it first), so only the other overlaps are refused.
+        # A journal directory may contain the rollback directory or the bundle
+        # (e.g. a bundle copied to ~/Downloads, which restore accepts): created
+        # directories are removed only when empty and original ones only get
+        # their metadata back, so neither can harm what is inside. Only a
+        # directory inside the rollback directory or the bundle is refused.
         directory = home / relative
         for candidate in (directory, canonical(directory)):
-            if any(_within(candidate, protected) for protected in rollbacks | bundles) or any(
-                    _within(protected, candidate) for protected in bundles):
+            if any(_within(candidate, protected) for protected in rollbacks | bundles):
                 raise BundleError(
-                    f"Journal directory {relative} overlaps the rollback directory or the bundle.")
+                    f"Journal directory {relative} lies inside the rollback directory or the bundle.")
         if relative in original_paths:
             _assert_no_symlink_ancestors(directory, include_leaf=True)
             if os.path.lexists(directory) and not directory.is_dir():

@@ -383,16 +383,17 @@ def print_rollback_plan(plan, *, apply):
     print(f"Rollback directory: {plan['rollback_dir']} (restore status: {plan['status']})")
     print(f"Destination: {plan['home']}")
     for warning in plan["warnings"]:
-        print(f"WARNING: {warning}")
+        print(f"WARNING: {report.printable(warning)}")
     if plan["verified"]:
         print(f"Bundle: {plan['bundle']} (checksums verified)")
     else:
-        print(f"WARNING: the bundle could not be verified: {plan['bundle_problem']}")
+        print(f"WARNING: the bundle could not be verified: {report.printable(plan['bundle_problem'])}")
         print("  The tool cannot verify whether existing files are still as the restore")
         print("  left them, so every existing path is a CONFLICT. If the bundle moved, pass")
         print("  --bundle PATH (it is verified in full before it is used).")
     if plan["rewrite_home"]:
-        print(f"The restore rewrote {plan['rewrite_home'][0]} to {plan['rewrite_home'][1]} in "
+        print(f"The restore rewrote {report.printable(plan['rewrite_home'][0])} to "
+              f"{report.printable(plan['rewrite_home'][1])} in "
               "eligible settings files; rewritten files count as restored.")
     conflicting = {item["path"] for item in plan["conflicts"]}
     put_back = [path for path in plan["put_back"] if path not in conflicting]
@@ -410,7 +411,7 @@ def print_rollback_plan(plan, *, apply):
         if plan["include_changed"] and not item["blocked"]:
             outcome = " - processed because of --include-changed"
         print(f"    {report.clip(item['path'])} (would {item['action'].replace('_', ' ')}): "
-              f"{item['reason']}{outcome}")
+              f"{report.printable(item['reason'])}{outcome}")
     if len(plan["conflicts"]) > MAX_LISTED:
         print(f"    ... and {len(plan['conflicts']) - MAX_LISTED} more")
     if plan["conflicts"] and not plan["include_changed"]:
@@ -424,12 +425,12 @@ def print_rollback_plan(plan, *, apply):
     print_limited([f"    {report.clip(item['path'])}" for item in plan["restore_directory_metadata"]])
     if plan["retained_quarantines"]:
         print("Previously captured cross-filesystem originals remain at:")
-        print_limited([f"    {Path(plan['home']) / item['quarantine']}"
+        print_limited([f"    {report.clip(Path(plan['home']) / item['quarantine'], 300)}"
                        for item in plan["retained_quarantines"]])
         print(f"Durable recovery records: {Path(plan['rollback_dir']) / rollback.QUARANTINE_RECORDS}; "
               "the summary journal may lag after an interruption.")
     if plan["kept_directories"]:
-        print_limited([f"    kept {report.clip(item['path'])}: {item['reason']}"
+        print_limited([f"    kept {report.clip(item['path'])}: {report.printable(item['reason'])}"
                        for item in plan["kept_directories"]])
 
 
