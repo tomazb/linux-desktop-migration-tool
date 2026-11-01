@@ -112,6 +112,59 @@ class PackageTests(unittest.TestCase):
     def test_validate_valid_manifest(self):
         packages.validate_package_manifest(manifest())
 
+    def test_every_schema_version_has_a_key_table(self):
+        self.assertEqual(set(packages.PACKAGE_KEYS), {1, 2})
+        for version in (1, 2):
+            with self.subTest(schema_version=version):
+                packages.validate_package_manifest(manifest(), schema_version=version)
+
+    def test_default_schema_is_the_current_one(self):
+        extra = manifest()
+        extra["added"] = []
+        with patch.dict(packages.PACKAGE_KEYS, {2: {**packages.PACKAGE_KEYS[2],
+                                                    "package": ("rpm", "flatpak", "warnings", "added")}}):
+            packages.validate_package_manifest(extra)
+            with self.assertRaises(packages.PackageError):
+                packages.validate_package_manifest(manifest(), schema_version=2)
+
+    def test_unexpected_extra_keys_are_rejected_for_every_schema_version(self):
+        for version in (1, 2):
+            for path in ((), ("rpm",), ("flatpak",), ("rpm", "inventory", 0),
+                         ("flatpak", "apps", 0), ("flatpak", "remotes", 0)):
+                data = manifest()
+                node = data
+                for step in path:
+                    node = node[step]
+                node["unexpected"] = "x"
+                with self.subTest(schema_version=version, path=path), \
+                        self.assertRaises(packages.PackageError):
+                    packages.validate_package_manifest(data, schema_version=version)
+
+    def test_key_tables_are_selected_by_schema_version(self):
+        wider = {**packages.PACKAGE_KEYS[2], "package": ("rpm", "flatpak", "warnings", "extra")}
+        data = manifest()
+        data["extra"] = {}
+        with patch.dict(packages.PACKAGE_KEYS, {2: wider}):
+            packages.validate_package_manifest(data, schema_version=2)
+            with self.assertRaises(packages.PackageError):
+                packages.validate_package_manifest(data, schema_version=1)
+            packages.validate_package_manifest(manifest(), schema_version=1)
+
+    def test_unknown_schema_version_is_rejected(self):
+        for version in (0, 3, "2", None, True):
+            with self.subTest(schema_version=version), self.assertRaises(packages.PackageError):
+                packages.validate_package_manifest(manifest(), schema_version=version)
+
+    def test_command_preview_and_install_validate_with_the_given_schema(self):
+        data = manifest()
+        data["extra"] = {}
+        with self.assertRaises(packages.PackageError):
+            packages.package_commands(data, schema_version=1)
+        with patch.object(packages, "_run") as run, self.assertRaises(packages.PackageError):
+            packages.install_packages(data, schema_version=1)
+        run.assert_not_called()
+        self.assertEqual(len(packages.package_commands(manifest(), schema_version=1)), 3)
+
     def test_invalid_rpm_specs_rejected(self):
         for spec in ["-y", "--allowerasing.x86_64", "bash", "bash.*", "pkg.x86_64;id", "pkg.x86_64\n", "./file.rpm", "https://host/pkg.x86_64", "a b.x86_64", "a.x86_64=1"]:
             with self.subTest(spec=spec):
