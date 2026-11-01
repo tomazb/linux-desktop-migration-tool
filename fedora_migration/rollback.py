@@ -440,6 +440,12 @@ def plan_rollback(rollback_dir, home, *, bundle=None, include_changed=False):
 
 _DIRECTORY_FLAGS = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
                     | getattr(os, "O_CLOEXEC", 0))
+# Directories above home may grant only search permission (a hardened /home is
+# often 0711). O_PATH needs no read permission and still serves as the dir_fd
+# for the next no-follow open; descriptors that are fsynced (home and below)
+# keep O_RDONLY.
+_TRAVERSE_FLAGS = (getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
+                   | getattr(os, "O_CLOEXEC", 0))
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
 
 
@@ -457,11 +463,12 @@ def _open_parent(home, relative, *, create=False):
             f"The home directory must be an absolute path without symlinks: {home}")
     names = home.parts[1:] + PurePosixPath(relative).parent.parts
     below_home = len(home.parts) - 1
-    owned = [os.open("/", _DIRECTORY_FLAGS)]
+    owned = [os.open("/", _TRAVERSE_FLAGS if below_home else _DIRECTORY_FLAGS)]
     try:
         for index, name in enumerate(names):
+            flags = _TRAVERSE_FLAGS if index < below_home - 1 else _DIRECTORY_FLAGS
             try:
-                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=owned[0])
+                child = os.open(name, flags, dir_fd=owned[0])
             except FileNotFoundError:
                 if index < below_home:
                     raise BundleError(f"The home directory does not exist: {home}") from None
