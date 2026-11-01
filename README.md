@@ -85,6 +85,18 @@ python3 fedora-migration.py restore --bundle /mnt/backup/fedora43-backup
 `restore` previews by default. It verifies the complete bundle and reports planned
 changes; it does not copy files until `--apply` is supplied.
 
+The preview and the apply run both end with read-only "Destination checks":
+
+- how many existing files or symlinks will be replaced (originals are kept in the
+  rollback directory) and how many new ones are created;
+- when the source home differs from this one, which bundle settings files still
+  name the old home path, with a count per file (see `--rewrite-home` below);
+- panel plugins the bundled panel configuration uses that are not installed here,
+  and autostart entries whose program cannot be found.
+
+These findings are informational and never block the restore. Nothing in the bundle
+is executed to produce them.
+
 ### 3. Apply and check
 
 ```bash
@@ -102,6 +114,23 @@ automatic rollback command; see the
 [recovery instructions](docs/FEDORA_43_TO_44.md#recover-overwritten-files).
 File/type conflicts and symlink ancestors are rejected instead of followed.
 When SELinux is enabled, target `restorecon` relabels restored paths.
+
+If the destination home path differs from the source's, `--rewrite-home` (with
+`--apply`) replaces the old home path with the new one in the files the preview
+listed. Only the old path is replaced, byte for byte, and only where it is followed
+by `/`, the end of the file or a character that cannot continue a name (so
+`/home/alice` never changes `/home/alice2`). Only small XFCE `*.xml` settings, `*.desktop`
+launchers under `.config/`, `.local/share/applications/` or directly in `Desktop/`, `.gtkrc-2.0`, GTK bookmarks, `user-dirs.dirs`, `mimeapps.list` and
+Thunar text files are considered; browser, mail and Flatpak data are never
+touched. Each file is rewritten only after its checksum has been validated, and the
+overwritten originals still go to the rollback directory. Without the option nothing
+is rewritten.
+
+Because rewriting uses the same literal bytes in XML, launchers, shell-style
+settings and URIs, differing source and destination home paths must contain only
+ASCII letters, digits, `/`, `.`, `_` and `-`. Other home names require restoring
+without `--rewrite-home` and editing the paths manually. This check runs before
+package installation or file changes; a same-home rewrite remains a no-op.
 
 Log in to XFCE and inspect the panel, shortcuts, display layout and key apps.
 Keep both the source backup and rollback files until the desktop is checked.
@@ -128,6 +157,7 @@ so the new installation keeps its own display configuration.
 | `backup --skip-rpm` / `--skip-flatpak` | Omit that package inventory |
 | `restore --apply --install-packages` | Opt in to package reinstallation with native confirmations |
 | `restore --skip-rpm` / `--skip-flatpak` | Skip that package installation path |
+| `restore --apply --rewrite-home` | Replace the old home path with this home in the settings files the preview lists; without `--apply` the preview shows what would change |
 | `restore --apply --rollback-dir /path/new-recovery-dir` | Choose a new private rollback directory |
 
 Known SSH/GPG/PKI/keyring/Online Accounts paths are excluded by default. `--include-secrets` may copy private keys

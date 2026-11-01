@@ -34,6 +34,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Preserved this fork's previous shell fixes instead of replacing its script
   wholesale. Legacy live Fedora XFCE 43/44 migration remains unverified.
 
+### Added (restore preview report)
+
+- `restore` preview and apply print read-only "Destination checks": how many
+  existing files or symlinks are replaced versus created, which bundle settings
+  files still name the old home path (with a count per file), panel plugins
+  missing on the destination, and autostart entries whose program is not found.
+  The findings are informational and do not block the restore.
+- `restore --rewrite-home` (with `--apply`) replaces the old home path with the
+  destination home in a fixed set of small XFCE, GTK, launcher and Thunar settings
+  files, only after each file's checksum is validated. Browser, mail and Flatpak
+  data are never scanned or modified; without the option nothing is rewritten.
+
 ### Added (backup safety)
 
 - `backup --exclude PATTERN` (home-relative paths or one-segment globs, winning
