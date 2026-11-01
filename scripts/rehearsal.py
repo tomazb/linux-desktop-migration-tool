@@ -415,6 +415,7 @@ class Step:
     kind: str = "setup"          # setup, tool, check or cleanup; setup/tool failures abort the run
     vm: str | None = None
     expect: str = "zero"         # zero, nonzero or any
+    also_ok: dict = field(default_factory=dict)  # with expect "zero": other passing codes -> note
     expect_output: tuple = ()
     stdin_file: Path | None = None
     stdout_file: Path | None = None
@@ -538,7 +539,7 @@ class Runner:
         code = completed.returncode
         output = _text(completed.stdout) + _text(completed.stderr)
         problems = []
-        if step.expect == "zero" and code != 0:
+        if step.expect == "zero" and code != 0 and code not in step.also_ok:
             problems.append(f"expected exit 0, got {code}")
         elif step.expect == "nonzero" and code == 0:
             problems.append("expected a nonzero exit, got 0")
@@ -548,6 +549,8 @@ class Runner:
         detail = "; ".join(problems)
         if step.expect == "any" and code != 0:
             detail = f"exit {code} (ignored)"
+        elif not problems and code in step.also_ok:
+            detail = f"exit {code}: {step.also_ok[code]}"
         return self._finish(step, command, "failed" if problems else "passed", code, detail,
                             output, self.clock() - started)
 
@@ -999,7 +1002,9 @@ def build_plan(config, state=None):
     for label in ("src", "dst"):
         remote(f"wait-ssh-{label}", f"Wait for SSH on {label}", label, ["true"], wait=config.ssh_timeout)
         remote(f"cloud-init-{label}", f"Wait for cloud-init to finish on {label}", label,
-               ["sudo", "cloud-init", "status", "--wait"], timeout=900)
+               ["sudo", "cloud-init", "status", "--wait"], timeout=900,
+               # Exit 2 means boot finished with recoverable errors; only 1 is fatal.
+               also_ok={2: "cloud-init finished with recoverable errors; continuing"})
         remote(f"record-os-{label}", f"Record OS release of {label}", label, ["cat", "/etc/os-release"], kind="check", record=True)
 
     for label in ("src", "dst"):

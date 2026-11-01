@@ -623,6 +623,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("RPM triage", result.detail)
 
+    def test_additional_success_codes_pass_with_a_note(self):
+        def runner_for(code):
+            return rehearsal.Runner(dry_run=False, run=lambda argv, **kw: completed(argv, code),
+                                    out=lambda text: None)
+        step = rehearsal.Step(id="c", description="d", argv=["cloud-init"],
+                              also_ok={2: "finished with recoverable errors"})
+        self.assertEqual(runner_for(0).execute(step).status, "passed")
+        degraded = runner_for(2).execute(step)
+        self.assertEqual(degraded.status, "passed")
+        self.assertIn("recoverable errors", degraded.detail)
+        self.assertEqual(runner_for(1).execute(step).status, "failed")
+
+    def test_degraded_cloud_init_boot_does_not_abort_the_rehearsal(self):
+        plan = rehearsal.build_plan(make_config("/tmp/x"))
+        waits = [step for step in plan if step.id.startswith("cloud-init-")]
+        self.assertEqual(len(waits), 2)
+        for step in waits:
+            # cloud-init status --wait: 0 done, 1 critical error, 2 done with
+            # recoverable errors.
+            self.assertIn(2, step.also_ok)
+            self.assertNotIn(1, step.also_ok)
+
     def test_wait_retries_until_success(self):
         outcomes = iter([255, 255, 0])
         clock = {"now": 0.0}
