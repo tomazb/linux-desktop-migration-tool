@@ -188,6 +188,8 @@ The restore preview automates part of this check without changing anything:
   when selected. Missing programs are listed per entry. An `Exec` that cannot be
   split or checked conservatively is reported as unparseable; this includes
   `env -S` / `--split-string`, unsupported options and missing option arguments.
+  Wrappers that change PATH, clear the environment or change directories also
+  require manual inspection, rather than being checked against the tool's PATH.
   Those entries need manual inspection. The entries are only read, never run.
 - **Old home paths.** See `--rewrite-home` under
   [Restore into Fedora XFCE 44](#restore-into-fedora-xfce-44).

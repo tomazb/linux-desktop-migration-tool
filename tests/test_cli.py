@@ -162,6 +162,22 @@ class CLITests(unittest.TestCase):
         self.assertTrue((dest / "payload/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml").exists())
         self.applications_guard.assert_called_once_with(secrets=False)
 
+    def test_excluded_secret_selection_does_not_require_agents_to_stop(self):
+        cli = cli_module()
+
+        def guard(*, secrets):
+            if secrets:
+                raise cli.MigrationError("Stop secret agents")
+        self.applications_guard.side_effect = guard
+        with patch.object(cli, "platform_info", return_value=self.info), \
+             patch.object(cli, "assert_xfce_stopped"), \
+             patch.object(cli.packages, "collect_packages", return_value=package_fixture()):
+            code, _, err = self.invoke([
+                "backup", "--output", str(self.root / "backup"), "--settings-only",
+                "--include", ".ssh/config", "--exclude", ".ssh",
+            ])
+        self.assertEqual(code, 0, err)
+
     def test_running_applications_block_backup_before_writing(self):
         cli = cli_module()
         self.applications_guard.side_effect = cli.MigrationError("Close firefox")
