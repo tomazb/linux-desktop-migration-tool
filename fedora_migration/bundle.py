@@ -82,11 +82,23 @@ def _exclusion(patterns, relative):
     """
     parts = relative.split("/")
     for pattern in patterns:
-        segments = pattern.split("/")
-        if len(segments) <= len(parts) and all(
-                fnmatchcase(part, segment) for part, segment in zip(parts, segments)):
+        if _matches(pattern, parts):
             return pattern
     return None
+
+
+def _matches(pattern, parts):
+    """Whether pattern matches the path given as segments, or one of its ancestors."""
+    segments = pattern.split("/")
+    return len(segments) <= len(parts) and all(
+        fnmatchcase(part, segment) for part, segment in zip(parts, segments))
+
+
+def _reaches_inside(pattern, parts):
+    """Whether pattern names something strictly below the path given as segments."""
+    segments = pattern.split("/")
+    return len(segments) > len(parts) and all(
+        fnmatchcase(part, segment) for part, segment in zip(parts, segments))
 
 # A deliberately bounded, portable nanosecond range for schema 1. Validate this
 # before any destination changes rather than discovering an overflow in utime.
@@ -388,8 +400,13 @@ def create_bundle(home, output, source, packages, *, include=(),
         user_excludes = tuple(_safe_path(os.fspath(value)) for value in exclude)
         defaults = DEFAULT_EXCLUDES if default_excludes else ()
         excludes = tuple(dict.fromkeys(user_excludes + defaults))
-        # Existing paths left out, recorded under the first pattern that matches.
+        # Existing paths left out, counted under the first pattern that matches.
         excluded = {pattern: set() for pattern in excludes}
+        # Every pattern that matched an existing path, even if an earlier one
+        # claimed it, and patterns that only reach inside an excluded tree
+        # (which is never walked), with the pattern that excluded that tree.
+        matched = set()
+        shadowed = {}
 
         def is_excluded(relative):
             pattern = _exclusion(excludes, relative)
@@ -397,6 +414,12 @@ def create_bundle(home, output, source, packages, *, include=(),
                 return False
             if os.path.lexists(home / relative):
                 excluded[pattern].add(relative)
+                parts = relative.split("/")
+                for other in excludes:
+                    if _matches(other, parts):
+                        matched.add(other)
+                    elif _reaches_inside(other, parts):
+                        shadowed.setdefault(other, pattern)
             return True
 
         def secret_excluded(relative):
@@ -484,6 +507,11 @@ def create_bundle(home, output, source, packages, *, include=(),
                         if pattern in defaults and pattern not in user_excludes else "")
                 warnings.append(f"Excluded {count} path{'s' if count != 1 else ''} "
                                 f"matching {pattern!r}{note}")
+            elif pattern in user_excludes and pattern in matched:
+                pass  # matched only paths an earlier pattern already counted
+            elif pattern in user_excludes and pattern in shadowed:
+                warnings.append(f"Exclusion {pattern!r} lies inside paths already excluded "
+                                f"by {shadowed[pattern]!r}; it has no further effect")
             elif pattern in user_excludes:
                 warnings.append(f"Exclusion {pattern!r} matched nothing; check the path")
         # Apply directory times after copying children. Keep owner access during
