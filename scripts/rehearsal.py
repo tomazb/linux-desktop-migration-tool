@@ -342,6 +342,9 @@ def parse_args(argv=None):
     if args.execute and args.dry_run:
         parser.error("--execute and --dry-run are mutually exclusive")
     workdir = Path(args.workdir).expanduser().absolute()
+    repo = args.repo.expanduser().absolute()
+    if workdir.resolve() == repo.resolve() or repo.resolve() in workdir.resolve().parents:
+        parser.error("--workdir must be outside --repo so VM images and SSH keys are not archived")
     if "," in str(workdir) or "\n" in str(workdir):
         parser.error("--workdir must not contain commas or newlines (virt-install key=value syntax)")
     for name in ("vcpus", "memory_mib", "disk_gib", "ssh_timeout"):
@@ -361,7 +364,7 @@ def parse_args(argv=None):
         source_user=args.source_user, dest_user=args.dest_user, with_flatpak=args.with_flatpak,
         vcpus=args.vcpus, memory_mib=args.memory_mib, disk_gib=args.disk_gib, osinfo=args.osinfo,
         ssh_port_base=args.ssh_port_base, ssh_timeout=args.ssh_timeout,
-        repo_root=args.repo.expanduser().absolute(),
+        repo_root=repo,
     )
 
 
@@ -997,7 +1000,7 @@ def build_plan(config, state=None):
         remote(f"wait-ssh-{label}", f"Wait for SSH on {label}", label, ["true"], wait=config.ssh_timeout)
         remote(f"cloud-init-{label}", f"Wait for cloud-init to finish on {label}", label,
                ["sudo", "cloud-init", "status", "--wait"], timeout=900)
-        remote(f"record-os-{label}", f"Record OS release of {label}", label, ["cat", "/etc/os-release"], record=True)
+        remote(f"record-os-{label}", f"Record OS release of {label}", label, ["cat", "/etc/os-release"], kind="check", record=True)
 
     for label in ("src", "dst"):
         remote(f"provision-{label}", f"Install XFCE (never started), Flatpak and Python on {label}", label,
@@ -1006,7 +1009,7 @@ def build_plan(config, state=None):
         remote(f"console-only-{label}", f"Keep {label} on a console target so XFCE is never started", label,
                ["sudo", "systemctl", "set-default", "multi-user.target"])
         remote(f"record-packages-{label}", f"Record package versions on {label}", label,
-               ["rpm", "-q", "xfce4-panel", "dnf5", "python3"], record=True)
+               ["rpm", "-q", "xfce4-panel", "dnf5", "python3"], kind="check", record=True)
 
     action("make-repo-tarball", "Archive the current checkout without .git",
            lambda: make_repo_tarball(config.repo_root, config.run_dir / "repo.tar"))

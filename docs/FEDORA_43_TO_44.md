@@ -211,6 +211,8 @@ The restore preview automates part of this check without changing anything:
   when selected. Missing programs are listed per entry. An `Exec` that cannot be
   split or checked conservatively is reported as unparseable; this includes
   `env -S` / `--split-string`, unsupported options and missing option arguments.
+  Wrappers that change PATH, clear the environment or change directories also
+  require manual inspection, rather than being checked against the tool's PATH.
   Those entries need manual inspection. The entries are only read, never run.
 - **Old home paths.** See `--rewrite-home` under
   [Restore into Fedora XFCE 44](#restore-into-fedora-xfce-44).
@@ -476,6 +478,8 @@ the matching CHECKSUM file, and creates two VMs named `fmr-src-ID` and `fmr-dst-
 from qcow2 overlays: user `alice` on the source and `bob` on the destination, so the
 different homes exercise `--rewrite-home`. A throwaway SSH key is generated for the
 run; the guests are reached through loopback port forwards (`--ssh-port-base`).
+The work directory must be outside the checkout selected by `--repo`; this is
+checked before any VM setup so images and private keys cannot enter its archive.
 Each VM gets `@xfce-desktop-environment` (installed but never started; the default
 target is set to `multi-user.target`), a copy of the working tree without `.git`,
 and, on the source, the checklist fixtures: a customised panel file, `displays.xml`,

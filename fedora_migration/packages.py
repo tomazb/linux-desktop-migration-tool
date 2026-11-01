@@ -539,7 +539,8 @@ _MANUAL_REPOS = frozenset(("@commandline", "<unknown>", ""))
 def triage_rpm(data, installed, available):
     """Classify every RPM request against the destination's installed/available sets.
 
-    Returns sorted lists `installed` and `installable`; `manual` entries (dicts
+    Returns sorted lists `installed`, `installable`, and `installable_from_local`
+    (available requests with no source repository to enable); `manual` entries (dicts
     with spec, from_repo and full_nevra) that need manual handling; and
     `unavailable`, a dict of source repository id -> sorted specs. Groups and
     environments are never requested: DNF5 would reinstall their default members.

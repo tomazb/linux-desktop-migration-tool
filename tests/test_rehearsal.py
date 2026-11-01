@@ -1210,6 +1210,37 @@ class ReportTests(unittest.TestCase):
 
 
 class RepoTarballTests(unittest.TestCase):
+    def test_workdir_inside_checkout_is_rejected_before_provisioning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(repo, target_is_directory=True)
+            for workdir in (repo, repo / "work", alias / "work",
+                            repo / "other/../work"):
+                with self.subTest(workdir=workdir), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        make_config(workdir, "--repo", str(repo))
+                    self.assertEqual(raised.exception.code, 2)
+            self.assertEqual(list(repo.iterdir()), [])
+
+    def test_optional_recording_failures_do_not_skip_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp) / "work")
+            probes = [step for step in rehearsal.build_plan(config)
+                      if step.id.startswith(("record-os-", "record-packages-"))]
+            self.assertEqual(len(probes), 4)
+            continued = []
+            steps = probes + [rehearsal.Step(id="migration", description="Migrate",
+                                            action=lambda: continued.append(True))]
+            runner = rehearsal.Runner(dry_run=False, out=lambda text: None,
+                                      run=lambda argv, **kwargs: completed(argv, 1, "missing package"))
+            results = rehearsal.run_plan(steps, runner)
+            self.assertEqual(continued, [True])
+            self.assertEqual([result.status for result in results],
+                             ["failed", "failed", "failed", "failed", "passed"])
+            self.assertIn("missing package", runner.records["record-packages-src"])
+
     def test_tarball_excludes_git_and_caches(self):
         import tarfile
         with tempfile.TemporaryDirectory() as tmp:
