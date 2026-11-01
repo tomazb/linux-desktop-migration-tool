@@ -394,6 +394,39 @@ class CLITests(unittest.TestCase):
         self.assertIn(".config/autostart/x.desktop: no-such-program-xyz", out)
         self.assertEqual(list(target.iterdir()), [])
 
+    def test_preview_escapes_terminal_control_characters_from_the_bundle(self):
+        from fedora_migration.bundle import create_bundle
+        escape = "\x1b[2J\x1b]0;owned\x07"
+        autostart = self.home / ".config/autostart"
+        autostart.mkdir(parents=True)
+        (autostart / f"evil{escape}.desktop").write_text(
+            f"[Desktop Entry]\nExec=missing-{escape}-program\n")
+        launcher = self.home / ".local/share/applications" / f"l{escape}‮.desktop"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text(f"Exec={self.home}/bin/tool\n")
+        bundle = self.root / "escape-backup"
+        create_bundle(self.home, bundle, self.info, package_fixture(), settings_only=True)
+        target = self.root / "target-home"
+        target.mkdir()
+        code, out, err = self.restore(dict(self.info, version_id="44", home=str(target)),
+                                      "--bundle", str(bundle))
+        self.assertEqual(code, 0, err)
+        for raw in ("\x1b", "\x07", "‮"):
+            self.assertNotIn(raw, out + err)
+        self.assertIn("\\x1b[2J", out)
+        self.assertIn("\\u202e", out)
+
+    def test_printable_escapes_controls_and_format_characters(self):
+        from fedora_migration import report
+        self.assertEqual(report.printable("a\x1bb\tc‮d e"),
+                         "a\\x1bb\\x09c\\u202ed\\u2028e")
+        self.assertEqual(report.printable("plain /home/ålice"), "plain /home/ålice")
+        self.assertEqual(report.clip("\x1b" * 200, 8), "\\x1b\\x1b...")
+        self.assertEqual(report.printable_lines("first\x1b\nsecond"), "first\\x1b\nsecond")
+        # Non-UTF-8 file names arrive as lone surrogates; printing one raw fails.
+        self.assertEqual(report.printable("bad\udcff.txt"), "bad\\udcff.txt")
+        report.printable("\ud800").encode("utf-8")
+
     def test_restore_verifies_once_for_preview_and_again_before_mutation(self):
         cli = cli_module()
         bundle = self.backup_fixture()
