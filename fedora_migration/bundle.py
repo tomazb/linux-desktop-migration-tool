@@ -61,9 +61,12 @@ def _within_secret(relative):
     return any(relative == secret or relative.startswith(secret + "/") for secret in SECRETS)
 
 
-def selects_secrets(include=(), include_secrets=False):
-    """Whether a backup selection opts in to any known secret tree."""
-    return include_secrets or any(_within_secret(os.fspath(value)) for value in include)
+def selects_secrets(include=(), include_secrets=False, exclude=()):
+    """Whether any selected secret tree survives the backup exclusions."""
+    patterns = tuple(_safe_path(os.fspath(value)) for value in exclude)
+    candidates = (*SECRETS, *include) if include_secrets else include
+    return any(_within_secret(relative) and _exclusion(patterns, relative) is None
+               for relative in (_safe_path(os.fspath(value)) for value in candidates))
 
 
 def manifest_has_secrets(manifest):
