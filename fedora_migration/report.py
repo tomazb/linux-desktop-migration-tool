@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import stat
+import unicodedata
 import xml.etree.ElementTree as ElementTree
 
 # Larger files are not scanned or parsed.
@@ -42,9 +43,32 @@ DESKTOP_LAUNCHER_DIR = "Desktop"
 MAX_SHOWN = 120
 
 
+# Characters a terminal may act on or that change how text displays: controls
+# (escape sequences), format characters (such as right-to-left overrides) and
+# line/paragraph separators, and lone surrogates (non-UTF-8 file names), which
+# cannot be written to a UTF-8 terminal at all.
+_UNSAFE_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
+
+
+def printable(value):
+    """Escape characters in bundle data that a terminal could interpret."""
+    text = str(value)
+    if not any(unicodedata.category(char) in _UNSAFE_CATEGORIES for char in text):
+        return text
+    return "".join(
+        char if unicodedata.category(char) not in _UNSAFE_CATEGORIES
+        else (f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}")
+        for char in text)
+
+
+def printable_lines(value):
+    """Like printable(), but keep line breaks, for the tool's own multi-line messages."""
+    return "\n".join(printable(line) for line in str(value).split("\n"))
+
+
 def clip(value, limit=MAX_SHOWN):
-    """Shorten a value from bundle data before it is shown."""
-    value = str(value)
+    """Escape and shorten a value from bundle data before it is shown."""
+    value = printable(value)
     return value if len(value) <= limit else value[:limit] + "..."
 
 

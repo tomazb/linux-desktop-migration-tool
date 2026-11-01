@@ -1651,6 +1651,40 @@ class AliasTests(RollbackFixture):
         self.assertTrue((self.bundle / "payload/.config/xfce4/empty").is_dir())
         bundle_module.verify_bundle(self.bundle)
 
+    def test_bundle_inside_an_existing_restored_directory_can_be_rolled_back(self):
+        # A bundle copied to ~/Downloads and restored with default data: the
+        # restore accepts it, so rollback must too.
+        self.write(self.home / "Downloads/report.pdf", b"restored report")
+        self.write(self.home / ".bashrc", b"restored bashrc")
+        self.write(self.target / ".bashrc", b"original bashrc")
+        (self.target / "Downloads").mkdir()
+        self.bundle = self.target / "Downloads/fedora43-backup"
+        self.backup()
+        self.restore()
+        self.assertTrue(any(item["path"] == "Downloads"
+                            for item in self.journal().get("original_directories", [])
+                            ) or "Downloads" in self.journal()["created_directories"])
+        plan = self.plan()
+        self.assertEqual(plan["put_back"], [".bashrc"])
+        self.assertIn("Downloads/report.pdf", plan["remove"])
+        self.apply()
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"original bashrc")
+        self.assertFalse(os.path.lexists(self.target / "Downloads/report.pdf"))
+        bundle_module.verify_bundle(self.bundle)
+
+    def test_created_directory_holding_the_bundle_is_kept_not_removed(self):
+        self.write(self.home / "Downloads/report.pdf", b"restored report")
+        self.backup()
+        self.restore()
+        moved = self.target / "Downloads/moved-bundle"
+        os.rename(self.bundle, moved)
+        self.bundle = moved
+        plan = self.plan(bundle=moved)
+        self.assertNotIn("Downloads", plan["remove_directories"])
+        self.apply(bundle=moved)
+        self.assertTrue((self.target / "Downloads").is_dir())
+        bundle_module.verify_bundle(moved)
+
     def test_bundle_alias_cannot_hide_a_replaced_path_inside_the_bundle(self):
         self.write(self.home / ".bashrc", b"restored")
         self.bundle = self.target / "stored-bundle"
