@@ -82,6 +82,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   or removing it, records its own `rollback-journal.json` (`complete`, `partial`,
   `failed` or `interrupted`), refuses a second run after `complete`, and works on
   failed or interrupted restores. It requires the same guards as `restore --apply`.
+- Rollback opens the directories above home for traversal only, so it also works
+  where an ancestor such as `/home` grants search but not read permission (`0711`).
 - The restore journal now records the `rewrite_home` pair it used (or `null`).
 
 ### Added (restore preview report)

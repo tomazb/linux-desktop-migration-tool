@@ -1611,6 +1611,60 @@ class PinnedHomeTests(RollbackFixture):
         self.assertEqual(opened[0], ("/", None))
         self.assertTrue(all(fd is not None for _, fd in opened[1:]))
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory read permission")
+    def test_search_only_ancestor_above_home_does_not_block_rollback(self):
+        # Hardened hosts may set /home to 0711: others can traverse it but not list it.
+        outer = self.root / "outer"
+        outer.mkdir()
+        self.target = outer / "home"
+        self.target.mkdir()
+        self.standard_setup()
+        outer.chmod(0o100)
+        self.addCleanup(outer.chmod, 0o700)
+        self.restore()
+        result = self.apply()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual((self.target / ".bashrc").read_bytes(), b"original bashrc")
+
+    def test_ancestors_above_home_are_opened_for_traversal_only(self):
+        if not hasattr(os, "O_PATH"):
+            self.skipTest("O_PATH is Linux-specific")
+        (self.target / ".config/xfce4").mkdir(parents=True)
+        above_home = set(self.target.parts[1:-1])
+        flags_by_name = []
+        real = os.open
+
+        def record(path, flags, *args, **kwargs):
+            flags_by_name.append((os.fspath(path), flags))
+            return real(path, flags, *args, **kwargs)
+
+        with patch("fedora_migration.rollback.os.open", side_effect=record):
+            descriptor = rollback_module()._open_parent(self.target, ".config/xfce4/x")
+        os.close(descriptor)
+        walked = flags_by_name[1:]
+        ancestors = walked[:len(self.target.parts) - 2]
+        from_home = walked[len(self.target.parts) - 2:]
+        self.assertEqual([name for name, _ in ancestors], list(self.target.parts[1:-1]))
+        self.assertTrue(above_home)
+        for name, flags in ancestors:
+            self.assertTrue(flags & os.O_PATH, name)
+            self.assertTrue(flags & os.O_NOFOLLOW and flags & os.O_DIRECTORY, name)
+        # Home and below stay readable descriptors: they are fsynced after mkdir.
+        self.assertEqual([name for name, _ in from_home], [self.target.name, ".config", "xfce4"])
+        for name, flags in from_home:
+            self.assertFalse(flags & os.O_PATH, name)
+
+    def test_symlinked_ancestor_above_home_is_still_refused_by_the_walk(self):
+        real_outer = self.root / "real-outer"
+        (real_outer / "home").mkdir(parents=True)
+        link = self.root / "link-outer"
+        link.symlink_to(real_outer, target_is_directory=True)
+        home = link / "home"
+        # Bypass the lexical realpath check so the descriptor walk itself must refuse.
+        with patch("fedora_migration.rollback.os.path.realpath", side_effect=lambda path: str(path)):
+            with self.assertRaisesRegex(BundleError, "Refusing symlink"):
+                rollback_module()._open_parent(home, ".bashrc")
+
     def test_interrupt_while_walking_leaks_no_descriptors(self):
         if not Path("/proc/self/fd").is_dir():
             self.skipTest("descriptor inventory requires /proc/self/fd")
