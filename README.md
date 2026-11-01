@@ -36,7 +36,10 @@ claim of successful migration on real Fedora desktops or your hardware.
 
 An active application may change files while they are read. Close browsers,
 mail clients and Flatpak apps as well as XFCE; this is not an application-aware
-backup of live databases.
+backup of live databases. Backup and `restore --apply` refuse to start while
+Firefox, Thunderbird or any Flatpak app is running and, when keys or keyrings are
+part of the operation, while `gpg-agent`, `ssh-agent` or `gnome-keyring-daemon`
+runs. The tool never stops these processes itself.
 
 ## Quick start
 
@@ -110,12 +113,17 @@ user-directory configuration, personal themes/icons/fonts/backgrounds, launchers
 and local executables. Default data covers configured XDG personal directories,
 Firefox (`.mozilla`), Thunderbird (`.thunderbird`) and Flatpak app data (`.var/app`).
 Only existing selected paths are copied; this is not an entire-home backup.
-XFCE saved-session caches are excluded.
+XFCE saved-session caches are excluded. By default the XFCE monitor layout
+(`.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml`, which names the source
+machine's outputs) and Flatpak app caches (`.var/app/*/cache`) are also left out,
+so the new installation keeps its own display configuration.
 
 | Option | Effect |
 | --- | --- |
 | `backup --settings-only` | Exclude default personal/app data |
 | `backup --include Projects --include .config/my-app` | Add home-relative paths explicitly |
+| `backup --exclude 'Downloads/*.iso'` | Leave out a home-relative path or glob (repeatable; `*` matches one path segment; wins over includes) |
+| `backup --no-default-excludes` | Also back up the monitor layout and Flatpak app caches |
 | `backup --include-secrets` | Opt in to SSH/GPG/PKI/keyrings and GNOME Online Accounts configuration |
 | `backup --skip-rpm` / `--skip-flatpak` | Omit that package inventory |
 | `restore --apply --install-packages` | Opt in to package reinstallation with native confirmations |
