@@ -8,7 +8,28 @@ from unittest.mock import patch
 from fedora_migration import packages
 
 
+REPO = {"id": "fedora", "name": "Fedora 43 - x86_64", "base_urls": [],
+        "metalink": "https://mirrors.fedoraproject.org/metalink?repo=fedora-43&arch=x86_64",
+        "mirrorlist": "", "gpg_keys": ["file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-43-x86_64"],
+        "repo_file_path": "/etc/yum.repos.d/fedora.repo"}
+REPO_INFO_JSON = (
+    '[{"id": "fedora", "name": "Fedora 43 - x86_64", "base_url": [], '
+    '"metalink": "https://mirrors.fedoraproject.org/metalink?repo=fedora-43&arch=x86_64", '
+    '"mirrorlist": "", "gpg_key": ["file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-43-x86_64"], '
+    '"repo_file_path": "/etc/yum.repos.d/fedora.repo", "enabled": true}]')
+GROUPS_TOML = 'version = "1.0"\n\n[groups.core]\npackages = ["bash"]\npackage_types = ["mandatory"]\nuserinstalled = true\n'
+ENVIRONMENTS_TOML = 'version = "1.0"\n\n[environments.xfce-desktop-environment]\ngroups = ["xfce-desktop"]\n'
+
+
 def manifest():
+    data = manifest_v1()
+    data["rpm"].update(
+        repos=[copy.deepcopy(REPO)], groups=[{"id": "core", "userinstalled": True}],
+        environments=[{"id": "xfce-desktop-environment", "groups": ["xfce-desktop"]}])
+    return data
+
+
+def manifest_v1():
     return {
         "rpm": {"status": "captured", "requests": ["gcc-c++.x86_64", "lib_example.i686"],
                 "inventory": [{"spec": "gcc-c++.x86_64", "reason": "User", "from_repo": "fedora",
@@ -31,9 +52,20 @@ class PackageTests(unittest.TestCase):
         self.path_patch = patch.object(packages, "INSTALLATIONS_DIR", self.installations)
         self.path_patch.start()
         self.addCleanup(self.path_patch.stop)
+        self.groups_file = Path(self.temp.name) / "groups.toml"
+        self.groups_file.write_text(GROUPS_TOML)
+        self.environments_file = Path(self.temp.name) / "environments.toml"
+        self.environments_file.write_text(ENVIRONMENTS_TOML)
+        for name, path in (("GROUPS_STATE", self.groups_file),
+                           ("ENVIRONMENTS_STATE", self.environments_file)):
+            state_patch = patch.object(packages, name, path, create=True)
+            state_patch.start()
+            self.addCleanup(state_patch.stop)
 
     def capture_output(self, argv, **kwargs):
         if argv[0] == "dnf5":
+            if argv[1:3] == ["repo", "info"]:
+                return REPO_INFO_JSON
             if "--userinstalled" in argv:
                 # Fedora 43/44 DNF5 rejects these mutually exclusive selectors.
                 if "--installed" in argv:
@@ -114,9 +146,9 @@ class PackageTests(unittest.TestCase):
 
     def test_every_schema_version_has_a_key_table(self):
         self.assertEqual(set(packages.PACKAGE_KEYS), {1, 2})
-        for version in (1, 2):
+        for version, build in ((1, manifest_v1), (2, manifest)):
             with self.subTest(schema_version=version):
-                packages.validate_package_manifest(manifest(), schema_version=version)
+                packages.validate_package_manifest(build(), schema_version=version)
 
     def test_default_schema_is_the_current_one(self):
         extra = manifest()
@@ -128,10 +160,10 @@ class PackageTests(unittest.TestCase):
                 packages.validate_package_manifest(manifest(), schema_version=2)
 
     def test_unexpected_extra_keys_are_rejected_for_every_schema_version(self):
-        for version in (1, 2):
+        for version, build in ((1, manifest_v1), (2, manifest)):
             for path in ((), ("rpm",), ("flatpak",), ("rpm", "inventory", 0),
                          ("flatpak", "apps", 0), ("flatpak", "remotes", 0)):
-                data = manifest()
+                data = build()
                 node = data
                 for step in path:
                     node = node[step]
@@ -148,7 +180,7 @@ class PackageTests(unittest.TestCase):
             packages.validate_package_manifest(data, schema_version=2)
             with self.assertRaises(packages.PackageError):
                 packages.validate_package_manifest(data, schema_version=1)
-            packages.validate_package_manifest(manifest(), schema_version=1)
+            packages.validate_package_manifest(manifest_v1(), schema_version=1)
 
     def test_unknown_schema_version_is_rejected(self):
         for version in (0, 3, "2", None, True):
@@ -160,10 +192,12 @@ class PackageTests(unittest.TestCase):
         data["extra"] = {}
         with self.assertRaises(packages.PackageError):
             packages.package_commands(data, schema_version=1)
+        with self.assertRaises(packages.PackageError):
+            packages.package_commands(manifest(), schema_version=1)
         with patch.object(packages, "_run") as run, self.assertRaises(packages.PackageError):
             packages.install_packages(data, schema_version=1)
         run.assert_not_called()
-        self.assertEqual(len(packages.package_commands(manifest(), schema_version=1)), 3)
+        self.assertEqual(len(packages.package_commands(manifest_v1(), schema_version=1)), 3)
 
     def test_invalid_rpm_specs_rejected(self):
         for spec in ["-y", "--allowerasing.x86_64", "bash", "bash.*", "pkg.x86_64;id", "pkg.x86_64\n", "./file.rpm", "https://host/pkg.x86_64", "a b.x86_64", "a.x86_64=1"]:
