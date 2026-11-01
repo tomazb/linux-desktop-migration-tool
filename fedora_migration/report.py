@@ -235,18 +235,29 @@ def _program(values):
             if option in ("-u", "--unset", "-C", "--chdir"):
                 if not tokens or not tokens[0]:
                     raise ValueError("env option needs an argument")
-                tokens.pop(0)
+                argument = tokens.pop(0)
+                if option in ("-C", "--chdir") or argument == "PATH":
+                    raise ValueError("env changes command resolution; manual inspection required")
             elif option.startswith(("--unset=", "--chdir=")):
                 if not option.partition("=")[2]:
                     raise ValueError("env option needs an argument")
+                if option.startswith("--chdir=") or option == "--unset=PATH":
+                    raise ValueError("env changes command resolution; manual inspection required")
+            elif (option in ("-", "-i", "--ignore-environment", "-uPATH")
+                  or option.startswith("-C")):
+                raise ValueError("env changes command resolution; manual inspection required")
             elif (option in ("-", "-i", "--ignore-environment", "-v", "--debug")
                   or option.startswith(("-u", "-C"))):
                 continue
             else:
                 raise ValueError("unsupported env option requires manual inspection")
         while tokens and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            if tokens[0].startswith("PATH="):
+                raise ValueError("env changes PATH; manual inspection required")
             tokens.pop(0)
     while tokens and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+        if tokens[0].startswith("PATH="):
+            raise ValueError("command changes PATH; manual inspection required")
         tokens.pop(0)
     return tokens[0] if tokens else None
 

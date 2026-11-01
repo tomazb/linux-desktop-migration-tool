@@ -310,7 +310,7 @@ def backup_command(args):
     require_platform(info)
     assert_xfce_stopped()
     assert_applications_closed(
-        secrets=bundle.selects_secrets(args.include, args.include_secrets))
+        secrets=bundle.selects_secrets(args.include, args.include_secrets, args.exclude))
     output = args.output.expanduser().absolute()
     home = Path(info["home"])
     # Fail early before collecting inventories for an unusable backup destination.

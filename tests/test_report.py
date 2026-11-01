@@ -468,6 +468,24 @@ class AutostartOverlayTests(BundleFixture):
 
 
 class EnvWrapperDiagnosticTests(BundleFixture):
+    def test_resolution_changing_env_wrappers_require_manual_inspection(self):
+        present = self.root / "bin/tool"
+        self.write(present, b"#!/bin/sh\n", 0o755)
+        for command in (f"env PATH={present.parent} tool", "env PATH=/missing tool",
+                        "env PATH= tool", "env -u PATH tool", "env --unset=PATH tool",
+                        "env -uPATH tool", "env -i tool", "env --ignore-environment tool",
+                        "env - tool", "env -C /tmp ./tool", "PATH=/missing tool"):
+            with self.subTest(command=command), patch.dict(os.environ, {"PATH": str(present.parent)}):
+                self.write(self.home / ".config/autostart/tool.desktop",
+                           f"[Desktop Entry]\nExec={command}\n".encode())
+                if self.bundle.exists():
+                    shutil.rmtree(self.bundle)
+                self.backup(settings_only=True)
+                result = report.check_autostart(self.bundle, verify_bundle(self.bundle), self.target)
+                self.assertEqual(result["missing"], [])
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertIn("manual inspection", result["warnings"][0])
+
     def test_split_string_wrappers_report_that_they_cannot_be_checked(self):
         for command in ('env -S "ghost-program --flag"',
                         'env --split-string "ghost-program --flag"',

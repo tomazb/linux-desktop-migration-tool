@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -222,6 +223,40 @@ class PreviewTests(RollbackFixture):
 
 
 class ConflictTests(RollbackFixture):
+    def test_metadata_only_edits_are_conflicts_for_plain_and_rewritten_files(self):
+        for rewrite in (False, True):
+            for change in ("mode", "mtime"):
+                with self.subTest(rewrite=rewrite, change=change):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        source, target = root / "source", root / "target"
+                        source.mkdir()
+                        target.mkdir()
+                        relative = XML_PATH if rewrite else ".bashrc"
+                        self.write(source / relative, b"new /home/alice", 0o644)
+                        self.write(target / relative, b"original", 0o644)
+                        bundle = root / "bundle"
+                        rollback = root / "rollback"
+                        bundle_module.create_bundle(source, bundle, {"version_id": "43"}, {}, settings_only=True)
+                        restore_bundle(bundle, target, dry_run=False, backup_dir=rollback,
+                                       rewrite_home=(OLD_HOME, NEW_HOME) if rewrite else None)
+                        path = target / relative
+                        if change == "mode":
+                            path.chmod(0o600)
+                        else:
+                            os.utime(path, ns=(path.stat().st_atime_ns,
+                                               path.stat().st_mtime_ns + 1000000000))
+                        before = (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+                        result = rollback_module().apply_rollback(rollback, target)
+                        self.assertIn(relative, [c["path"] for c in result["conflicts"]])
+                        self.assertEqual((path.read_bytes(), path.stat().st_mode,
+                                          path.stat().st_mtime_ns), before)
+                        result = rollback_module().apply_rollback(rollback, target, include_changed=True)
+                        self.assertEqual(path.read_bytes(), b"original")
+                        saved = Path(result["undone_dir"]) / relative
+                        self.assertEqual((saved.read_bytes(), saved.stat().st_mode,
+                                          saved.stat().st_mtime_ns), before)
+
     def test_user_edited_restored_file_is_a_conflict_and_untouched(self):
         self.standard_setup()
         self.restore()
@@ -373,7 +408,10 @@ class RewriteHomeRollbackTests(RollbackFixture):
                 # Legacy restores performed this literal substitution and wrote
                 # this pair. Reproduce their persisted bytes without relaxing
                 # the validation used for any new restore.
-                (target / XML_PATH).write_bytes(('<p value="' + str(target) + '/x"/>').encode())
+                restored = target / XML_PATH
+                restored_mtime = restored.stat().st_mtime_ns
+                restored.write_bytes(('<p value="' + str(target) + '/x"/>').encode())
+                os.utime(restored, ns=(restored_mtime, restored_mtime))
                 journal = json.loads((recovery / "journal.json").read_text())
                 journal["rewrite_home"] = [old, str(target)]
                 journal.pop("original_directories", None)
