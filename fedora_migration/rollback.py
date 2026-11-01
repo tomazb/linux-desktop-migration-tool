@@ -15,8 +15,8 @@ Threat model: rollback assumes the home is quiescent, which the CLI checks (no
 XFCE session, no browser, mail or Flatpak applications). It never overwrites or
 deletes an entry it has not captured: a destination's parent is pinned by file
 descriptor, walked from "/" without following symlinks; the current entry is
-    captured by rename before anything is published (and retained beside the
-    destination as well as copied out when undone-<time>/ is across filesystems); the
+captured by rename before anything is published (and retained beside the
+destination as well as copied out when undone-<time>/ is across filesystems); the
 original is published with a hard link, which fails instead of replacing. A
 concurrent writer can therefore at most make one path fail, with both versions
 kept. Writes inside the rollback directory itself use ordinary paths: it is the
@@ -241,6 +241,9 @@ def _is_as_restored(destination, info, entry, bundle, rewrite):
     if entry["type"] == "symlink":
         return stat.S_ISLNK(info.st_mode) and os.readlink(destination) == entry["target"]
     if entry["type"] != "file" or not stat.S_ISREG(info.st_mode):
+        return False
+    if (stat.S_IMODE(info.st_mode) != entry["mode"]
+            or info.st_mtime_ns != entry["mtime_ns"]):
         return False
     if rewrite is not None and entry_is_rewritable(entry):
         payload = (bundle / "payload" / entry["path"]).read_bytes()
