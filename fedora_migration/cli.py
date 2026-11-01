@@ -175,7 +175,7 @@ def validate_manifest_metadata(manifest):
 
 def print_warnings(warnings):
     for warning in warnings:
-        print(f"  Note: {warning}")
+        print(f"  Note: {report.printable(warning)}")
 
 
 def print_manifest_summary(manifest):
@@ -184,7 +184,8 @@ def print_manifest_summary(manifest):
                       if entry["type"] == "file")
     native = manifest["packages"]["rpm"]
     flatpak = manifest["packages"]["flatpak"]
-    print(f"Source: Fedora {manifest['source']['version_id']} / {manifest['source']['architecture']}")
+    print(f"Source: Fedora {report.printable(manifest['source']['version_id'])} / "
+          f"{report.printable(manifest['source']['architecture'])}")
     print(f"Files: {counts['file']}; symlinks: {counts['symlink']}; directories: {counts['directory']}")
     print(f"File content: {total_bytes:,} bytes ({total_bytes / 1024**3:.2f} GiB); allow extra space for recovery copies.")
     print(f"RPM requests: {len(native['requests'])} ({native['status']})")
@@ -213,19 +214,20 @@ def print_destination_checks(source_path, manifest, home, plan, *, rewrite, appl
           "(originals are kept in the rollback directory) and create "
           f"{plan['new_count']} new ones.")
     source_home = manifest["source"]["home"]
+    shown_home = report.printable(source_home)
     if source_home == str(home):
         if rewrite:
             print("  --rewrite-home has no effect: the source and destination homes are the same.")
     else:
         references = report.find_home_references(source_path, manifest, source_home)
         if not references:
-            print(f"  No references to the old home path {source_home} were found in the "
+            print(f"  No references to the old home path {shown_home} were found in the "
                   "settings files that --rewrite-home can change.")
         else:
             total = sum(count for _, count in references)
-            print(f"  The old home path {source_home} appears {total} times in "
+            print(f"  The old home path {shown_home} appears {total} times in "
                   f"{len(references)} bundle files:")
-            print_limited([f"    {path}: {count}" for path, count in references])
+            print_limited([f"    {report.clip(path)}: {count}" for path, count in references])
             if not rewrite:
                 print(f"  Not rewritten. Add --rewrite-home (with --apply) to replace it with "
                       f"{home} in exactly these files; no other file is changed.")
@@ -245,7 +247,8 @@ def print_destination_checks(source_path, manifest, home, plan, *, rewrite, appl
               "find them with: dnf provides '*/xfce4/panel/plugins/NAME.desktop'")
     if autostart["missing"]:
         print("  Autostart programs not found on this system:")
-        print_limited([f"    {path}: {program}" for path, program in autostart["missing"]])
+        print_limited([f"    {report.clip(path)}: {report.clip(program)}"
+                       for path, program in autostart["missing"]])
     print_limited([f"  Note: {report.clip(warning, 300)}"
                    for warning in panel["warnings"] + autostart["warnings"]])
     if not (panel["missing"] or panel["warnings"] or autostart["missing"]
@@ -322,7 +325,7 @@ def restore_command(args):
     print(f"Destination: {home}")
     print("Selected paths:")
     for relative in plan["selected_paths"]:
-        print(f"  {relative}")
+        print(f"  {report.printable(relative)}")
     print_destination_checks(source_path, manifest, home, plan,
                              rewrite=args.rewrite_home, apply=args.apply)
     commands = []
@@ -410,10 +413,10 @@ def main(argv=None):
     try:
         return args.handler(args)
     except bundle.BundleInterrupted as error:
-        print(str(error), file=sys.stderr)
+        print(report.printable_lines(error), file=sys.stderr)
         return 130
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print(f"Error: {report.printable_lines(error)}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("Interrupted. Keep any reported rollback directory and inspect it before retrying.", file=sys.stderr)
