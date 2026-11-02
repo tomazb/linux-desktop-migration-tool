@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -622,6 +623,54 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(result.status, "dry-run")
         self.assertIn("echo 'hello world'", out.getvalue())
+
+    def test_progress_is_flushed_when_stdout_is_a_pipe(self):
+        # Under "| tee" stdout is block-buffered; without a flush a live run shows
+        # nothing for many minutes and looks hung.
+        events = []
+
+        class PipeLike:
+            def write(self, text):
+                events.append(("write", text))
+
+            def flush(self):
+                events.append(("flush",))
+
+        runner = rehearsal.Runner(dry_run=True)
+        step = rehearsal.Step(id="x", description="Do a thing", argv=["true"])
+        with patch.object(rehearsal.sys, "stdout", PipeLike()):
+            runner.execute(step)
+        self.assertTrue(events)
+        self.assertEqual(events[-1], ("flush",))
+        writes = [i for i, event in enumerate(events) if event[0] == "write"]
+        for index in writes:
+            self.assertIn(("flush",), events[index + 1:])
+
+    def test_reader_going_away_does_not_stop_the_run_or_its_cleanup(self):
+        # If tee or less exits mid-run, later steps (above all VM cleanup) must
+        # still run; output is then discarded instead of raising BrokenPipeError.
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, write_end)
+        os.close(read_end)
+
+        class BrokenPipe:
+            def write(self, text):
+                os.write(write_end, text.encode())
+
+            def flush(self):
+                pass
+
+            def fileno(self):
+                return write_end
+
+        calls = []
+        runner = rehearsal.Runner(dry_run=False, run=lambda argv, **kw: calls.append(argv) or completed(argv, 0))
+        with patch.object(rehearsal.sys, "stdout", BrokenPipe()):
+            first = runner.execute(rehearsal.Step(id="a", description="first", argv=["true"]))
+            second = runner.execute(rehearsal.Step(id="b", description="cleanup", argv=["true"]))
+        self.assertEqual([first.status, second.status], ["passed", "passed"])
+        self.assertEqual(calls, [["true"], ["true"]])
+        self.assertEqual(os.fstat(write_end).st_rdev, os.stat(os.devnull).st_rdev)
 
     def test_expectations(self):
         def runner_for(code, stdout=""):

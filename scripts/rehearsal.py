@@ -470,6 +470,15 @@ def _tail(text, lines=40, chars=4000):
     return "\n".join(text.splitlines()[-lines:])[-chars:]
 
 
+def _silence_stdout():
+    """Send the rest of stdout to /dev/null once its reader has gone away."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    finally:
+        os.close(devnull)
+
+
 class Runner:
     """Prints steps (dry run) or executes them, collecting results."""
 
@@ -486,7 +495,16 @@ class Runner:
         self.attempted_domains = []   # virt-install was started; cleanup verifies the UUID first
 
     def out(self, text):
-        (self._out or sys.stdout.write)(text)
+        if self._out:
+            self._out(text)
+            return
+        try:
+            sys.stdout.write(text)
+            # Show progress live even when stdout is a pipe (for example "| tee").
+            sys.stdout.flush()
+        except BrokenPipeError:
+            # The reader went away; keep running (cleanup must still happen).
+            _silence_stdout()
 
     def run(self, argv, **kwargs):
         return (self._run or subprocess.run)(argv, **kwargs)
@@ -1320,6 +1338,9 @@ def execute(config, runner):
 
 
 def main(argv=None):
+    # Line-buffer every print so a long run piped through tee shows its progress.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
     config = parse_args(argv)
     try:
         if not config.execute:
@@ -1331,4 +1352,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # The reader (head, less) went away; stop quietly instead of a traceback.
+        _silence_stdout()
+        raise SystemExit(1) from None
