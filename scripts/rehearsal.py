@@ -35,7 +35,10 @@ IMAGE_NAME = "Fedora-Cloud-Base-Generic-{release}-{build}.x86_64.qcow2"
 CHECKSUM_NAME = "Fedora-Cloud-{release}-{build}-x86_64-CHECKSUM"
 IMAGE_NAME_PATTERN = r"Fedora-Cloud-Base-Generic-{release}-([0-9]+(?:\.[0-9]+)*)\.x86_64\.qcow2"
 
-BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "ssh", "scp", "ssh-keygen", "curl", "sha256sum")
+# passt gives an unprivileged (qemu:///session) VM user-mode networking with a
+# host port forward that libvirt itself manages.
+BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "passt", "ssh", "scp", "ssh-keygen", "curl",
+              "sha256sum")
 SEED_TOOLS = ("cloud-localds", "genisoimage", "xorriso")
 KVM_DEVICE = "/dev/kvm"
 
@@ -993,12 +996,10 @@ def build_plan(config, state=None):
                        "--osinfo", config.osinfo,
                        "--disk", f"path={directory / 'disk.qcow2'},format=qcow2,bus=virtio",
                        "--disk", f"path={directory / 'seed.iso'},device=cdrom",
-                       "--network", "none",
-                       # "=" form: virt-install would parse a separate "-netdev ..." value
-                       # as its short option "-n" and reject the command (exit 2).
-                       "--qemu-commandline="
-                       f"-netdev user,id=fwd0,hostfwd=tcp:{SSH_HOST}:{config.ssh_port(label)}-:22 "
-                       "-device virtio-net-pci,netdev=fwd0",
+                       # libvirt-managed passt networking with a loopback-only SSH forward.
+                       # (Raw QEMU -netdev/-device passthrough collided with the PCI slots
+                       # libvirt assigns on q35.)
+                       "--network", f"passt,model=virtio,portForward={SSH_HOST}:{config.ssh_port(label)}:22",
                        "--graphics", "none", "--noautoconsole"],
                  vm=label, creates_domain=domain))
     for label in ("src", "dst"):

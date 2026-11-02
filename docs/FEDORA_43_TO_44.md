@@ -459,7 +459,7 @@ fake every external command); **a successful live run is still pending**, so tre
 its first runs as a test of the script itself.
 
 It needs `/dev/kvm`, a reachable libvirt (`qemu:///session` by default; see
-`--connect`), `virt-install`, `virsh`, `qemu-img`, `ssh`, `scp`, `ssh-keygen`, `curl`,
+`--connect`), `virt-install`, `virsh`, `qemu-img`, `passt`, `ssh`, `scp`, `ssh-keygen`, `curl`,
 `sha256sum` and one of `cloud-localds`, `genisoimage` or `xorriso`. Nothing runs
 unless asked: the default is a dry run that prints every command and Python step.
 
@@ -477,7 +477,8 @@ for the source (43) and destination (44) releases into `--workdir` (default
 the matching CHECKSUM file, and creates two VMs named `fmr-src-ID` and `fmr-dst-ID`
 from qcow2 overlays: user `alice` on the source and `bob` on the destination, so the
 different homes exercise `--rewrite-home`. A throwaway SSH key is generated for the
-run; the guests are reached through loopback port forwards (`--ssh-port-base`).
+run; the guests use libvirt-managed passt networking and are reached through
+loopback-only SSH port forwards (`--ssh-port-base`).
 The work directory must be outside the checkout selected by `--repo`; this is
 checked before any VM setup so images and private keys cannot enter its archive.
 Each VM gets `@xfce-desktop-environment` (installed but never started; the default
