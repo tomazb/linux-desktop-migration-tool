@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -464,6 +465,22 @@ class PlanTests(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertEqual(step.creates_domain, "fmr-src-abc123")
 
+    def test_virt_install_network_is_a_libvirt_managed_passt_forward(self):
+        # Raw QEMU passthrough failed live twice: virt-install's argparse read a
+        # separate "-netdev ..." value as its short "-n", and the hand-added
+        # virtio-net-pci device took a PCI slot libvirt had assigned to a root port.
+        for label, port in (("src", 22200), ("dst", 22201)):
+            argv = next(s for s in self.plan() if s.id == f"create-vm-{label}").argv
+            networks = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--network"]
+            self.assertEqual(networks, [f"passt,model=virtio,portForward=127.0.0.1:{port}:22"])
+            self.assertFalse([arg for arg in argv if arg.startswith("--qemu-commandline")])
+            # No argument may be a bare dash-leading value that argparse could misread.
+            self.assertEqual([arg for arg in argv[1:]
+                              if arg.startswith("-") and not arg.startswith("--")], [])
+
+    def test_passt_is_a_required_tool(self):
+        self.assertIn("passt", rehearsal.BASE_TOOLS)
+
     def test_ssh_ports_are_distinct(self):
         config = make_config("/tmp/x")
         self.assertNotEqual(config.ssh_port("src"), config.ssh_port("dst"))
@@ -606,6 +623,54 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(result.status, "dry-run")
         self.assertIn("echo 'hello world'", out.getvalue())
+
+    def test_progress_is_flushed_when_stdout_is_a_pipe(self):
+        # Under "| tee" stdout is block-buffered; without a flush a live run shows
+        # nothing for many minutes and looks hung.
+        events = []
+
+        class PipeLike:
+            def write(self, text):
+                events.append(("write", text))
+
+            def flush(self):
+                events.append(("flush",))
+
+        runner = rehearsal.Runner(dry_run=True)
+        step = rehearsal.Step(id="x", description="Do a thing", argv=["true"])
+        with patch.object(rehearsal.sys, "stdout", PipeLike()):
+            runner.execute(step)
+        self.assertTrue(events)
+        self.assertEqual(events[-1], ("flush",))
+        writes = [i for i, event in enumerate(events) if event[0] == "write"]
+        for index in writes:
+            self.assertIn(("flush",), events[index + 1:])
+
+    def test_reader_going_away_does_not_stop_the_run_or_its_cleanup(self):
+        # If tee or less exits mid-run, later steps (above all VM cleanup) must
+        # still run; output is then discarded instead of raising BrokenPipeError.
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, write_end)
+        os.close(read_end)
+
+        class BrokenPipe:
+            def write(self, text):
+                os.write(write_end, text.encode())
+
+            def flush(self):
+                pass
+
+            def fileno(self):
+                return write_end
+
+        calls = []
+        runner = rehearsal.Runner(dry_run=False, run=lambda argv, **kw: calls.append(argv) or completed(argv, 0))
+        with patch.object(rehearsal.sys, "stdout", BrokenPipe()):
+            first = runner.execute(rehearsal.Step(id="a", description="first", argv=["true"]))
+            second = runner.execute(rehearsal.Step(id="b", description="cleanup", argv=["true"]))
+        self.assertEqual([first.status, second.status], ["passed", "passed"])
+        self.assertEqual(calls, [["true"], ["true"]])
+        self.assertEqual(os.fstat(write_end).st_rdev, os.stat(os.devnull).st_rdev)
 
     def test_expectations(self):
         def runner_for(code, stdout=""):

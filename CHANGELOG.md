@@ -21,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cloud-init rendering, quoting, cleanup scoping and report rendering with every
   external command faked. The script has so far been exercised only in dry-run
   mode and by these tests; a successful live run is still pending.
+- The first live runs (virt-install 5.1, libvirt 12 on Fedora 44) failed creating
+  the source VM: virt-install read the raw `-netdev ...` value as its `-n` option,
+  and then the hand-added QEMU network device took a PCI slot libvirt had assigned.
+  VMs now use `--network passt,portForward=127.0.0.1:PORT:22`, managed by libvirt;
+  `passt` is a required host tool.
 
 ### Added
 

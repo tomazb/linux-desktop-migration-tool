@@ -35,7 +35,10 @@ IMAGE_NAME = "Fedora-Cloud-Base-Generic-{release}-{build}.x86_64.qcow2"
 CHECKSUM_NAME = "Fedora-Cloud-{release}-{build}-x86_64-CHECKSUM"
 IMAGE_NAME_PATTERN = r"Fedora-Cloud-Base-Generic-{release}-([0-9]+(?:\.[0-9]+)*)\.x86_64\.qcow2"
 
-BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "ssh", "scp", "ssh-keygen", "curl", "sha256sum")
+# passt gives an unprivileged (qemu:///session) VM user-mode networking with a
+# host port forward that libvirt itself manages.
+BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "passt", "ssh", "scp", "ssh-keygen", "curl",
+              "sha256sum")
 SEED_TOOLS = ("cloud-localds", "genisoimage", "xorriso")
 KVM_DEVICE = "/dev/kvm"
 
@@ -467,6 +470,15 @@ def _tail(text, lines=40, chars=4000):
     return "\n".join(text.splitlines()[-lines:])[-chars:]
 
 
+def _silence_stdout():
+    """Send the rest of stdout to /dev/null once its reader has gone away."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    finally:
+        os.close(devnull)
+
+
 class Runner:
     """Prints steps (dry run) or executes them, collecting results."""
 
@@ -483,7 +495,16 @@ class Runner:
         self.attempted_domains = []   # virt-install was started; cleanup verifies the UUID first
 
     def out(self, text):
-        (self._out or sys.stdout.write)(text)
+        if self._out:
+            self._out(text)
+            return
+        try:
+            sys.stdout.write(text)
+            # Show progress live even when stdout is a pipe (for example "| tee").
+            sys.stdout.flush()
+        except BrokenPipeError:
+            # The reader went away; keep running (cleanup must still happen).
+            _silence_stdout()
 
     def run(self, argv, **kwargs):
         return (self._run or subprocess.run)(argv, **kwargs)
@@ -993,10 +1014,10 @@ def build_plan(config, state=None):
                        "--osinfo", config.osinfo,
                        "--disk", f"path={directory / 'disk.qcow2'},format=qcow2,bus=virtio",
                        "--disk", f"path={directory / 'seed.iso'},device=cdrom",
-                       "--network", "none",
-                       "--qemu-commandline",
-                       f"-netdev user,id=fwd0,hostfwd=tcp:{SSH_HOST}:{config.ssh_port(label)}-:22 "
-                       "-device virtio-net-pci,netdev=fwd0",
+                       # libvirt-managed passt networking with a loopback-only SSH forward.
+                       # (Raw QEMU -netdev/-device passthrough collided with the PCI slots
+                       # libvirt assigns on q35.)
+                       "--network", f"passt,model=virtio,portForward={SSH_HOST}:{config.ssh_port(label)}:22",
                        "--graphics", "none", "--noautoconsole"],
                  vm=label, creates_domain=domain))
     for label in ("src", "dst"):
@@ -1317,6 +1338,9 @@ def execute(config, runner):
 
 
 def main(argv=None):
+    # Line-buffer every print so a long run piped through tee shows its progress.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
     config = parse_args(argv)
     try:
         if not config.execute:
@@ -1328,4 +1352,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # The reader (head, less) went away; stop quietly instead of a traceback.
+        _silence_stdout()
+        raise SystemExit(1) from None
