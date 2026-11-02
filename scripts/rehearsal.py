@@ -994,7 +994,9 @@ def build_plan(config, state=None):
                        "--disk", f"path={directory / 'disk.qcow2'},format=qcow2,bus=virtio",
                        "--disk", f"path={directory / 'seed.iso'},device=cdrom",
                        "--network", "none",
-                       "--qemu-commandline",
+                       # "=" form: virt-install would parse a separate "-netdev ..." value
+                       # as its short option "-n" and reject the command (exit 2).
+                       "--qemu-commandline="
                        f"-netdev user,id=fwd0,hostfwd=tcp:{SSH_HOST}:{config.ssh_port(label)}-:22 "
                        "-device virtio-net-pci,netdev=fwd0",
                        "--graphics", "none", "--noautoconsole"],

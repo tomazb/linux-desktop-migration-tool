@@ -1,5 +1,6 @@
 """Tests for scripts/rehearsal.py; no VM, libvirt or network is ever used."""
 
+import argparse
 import contextlib
 import hashlib
 import importlib.util
@@ -463,6 +464,25 @@ class PlanTests(unittest.TestCase):
                          "--name fmr-src-abc123", "--noautoconsole", "--connect qemu:///session"):
             self.assertIn(expected, text)
         self.assertEqual(step.creates_domain, "fmr-src-abc123")
+
+    def test_virt_install_accepts_the_qemu_commandline_value(self):
+        # virt-install's argparse has a short "-n" (--name), so a separate value
+        # "-netdev ..." is read as "-n etdev ..." and --qemu-commandline gets no
+        # argument (exit 2, seen on virt-install 5.1). The "--opt=value" form is safe.
+        parser = argparse.ArgumentParser(prog="virt-install", add_help=False)
+        parser.add_argument("-n", "--name")
+        parser.add_argument("--qemu-commandline", action="append")
+        for label, port in (("src", 22200), ("dst", 22201)):
+            step = next(s for s in self.plan() if s.id == f"create-vm-{label}")
+            with contextlib.redirect_stderr(io.StringIO()):
+                parsed, _ = parser.parse_known_args(step.argv[1:])
+            self.assertEqual(parsed.name, f"fmr-{label}-abc123")
+            self.assertEqual(parsed.qemu_commandline, [
+                f"-netdev user,id=fwd0,hostfwd=tcp:127.0.0.1:{port}-:22 "
+                "-device virtio-net-pci,netdev=fwd0"])
+            # No other argument may be a bare dash-leading value either.
+            self.assertEqual([arg for arg in step.argv[1:]
+                              if arg.startswith("-") and not arg.startswith("--")], [])
 
     def test_ssh_ports_are_distinct(self):
         config = make_config("/tmp/x")
