@@ -66,6 +66,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Flatpak apps are installed with one command per scope and origin instead of one
   per app, keeping native confirmations.
 - DNF5 and Flatpak commands run with `LC_ALL=C.UTF-8`.
+- Backup no longer fails on a system whose Flatpak system installation has never
+  been used: its `repo` directory is absent (`/var/lib/flatpak/repo`, or
+  `$FLATPAK_SYSTEM_DIR/repo` when that is set) and `flatpak list --system` fails
+  for a normal user. If `app` and `runtime` are absent too, system apps and
+  remotes are recorded as empty with a warning; leftover deployments without a
+  `repo`, or an installation that cannot be inspected (including a dangling
+  symlink, such as one to an unmounted disk), stop the backup instead.
+  Restore checks only the user remotes there, so captured system remotes are still
+  reported as missing. Found when a first, not yet completed live run of
+  `scripts/rehearsal.py` reached the backup step (Fedora 43 cloud image with only
+  a user Flathub remote).
 
 ### Changed (schema 2 and releases)
 
