@@ -72,6 +72,8 @@ class FakeLibvirt:
     def handle(self, argv, install_fails=False):
         """A CompletedProcess for libvirt commands, or None for anything else."""
         if argv[0] == "virt-install":
+            if "--version" in argv:
+                return completed(argv, 0, "5.1.0\n")
             name, uuid = argv[argv.index("--name") + 1], argv[argv.index("--uuid") + 1]
             self.installs.append(name)
             if self.foreign_on_create:
@@ -129,7 +131,7 @@ class DryRunDefaultTests(unittest.TestCase):
         for expected in ("virt-install", "fmr-src-abc123", "fmr-dst-abc123", "qemu-img",
                          "fedora-migration.py backup --output /var/tmp/bundle",
                          "--rewrite-home", "--rollback-dir /var/tmp/rollback-1",
-                         "virsh"):
+                         "virsh", "virt-install --version", "older than 5.0.0"):
             self.assertIn(expected, text)
 
     def test_dry_run_does_not_fail_on_missing_kvm_or_tools(self):
@@ -231,6 +233,59 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(calls, [["virsh", "-c", "qemu:///system", "uri"]])
         self.assertIn("libvirt", err.getvalue())
+
+    def test_virt_install_version_accepts_5_and_refuses_older(self):
+        self.assertIsNone(rehearsal.virt_install_version_problem("5.0.0\n"))
+        self.assertIsNone(rehearsal.virt_install_version_problem("5.1.0\n"))
+        self.assertIsNone(rehearsal.virt_install_version_problem("5.10.0\n"))
+        for text in ("4.1.0\n", "4.9.9\n", "1.5.0\n"):
+            problem = rehearsal.virt_install_version_problem(text)
+            self.assertIn("5.0.0", problem)
+            self.assertIn(text.strip(), problem)
+        for text in ("", "virt-install\n", "5.0\n"):
+            self.assertIn("parse", rehearsal.virt_install_version_problem(text))
+
+    def test_preflight_reads_virt_install_version(self):
+        def fake_run(argv, **kwargs):
+            self.assertEqual(argv, ["virt-install", "--version"])
+            return completed(argv, 0, "5.0.0\n")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            self.assertEqual(rehearsal.preflight_virt_install(), [])
+
+        def failed(argv, **kwargs):
+            return completed(argv, 1, "", "cannot execute")
+
+        with patch.object(subprocess, "run", side_effect=failed):
+            problems = rehearsal.preflight_virt_install()
+        self.assertEqual(problems, ["Could not read the virt-install version: cannot execute"])
+        with patch.object(subprocess, "run", side_effect=OSError("boom")):
+            self.assertIn("boom", rehearsal.preflight_virt_install()[0])
+
+    def test_execute_refuses_old_virt_install_before_any_vm_work(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:2] == ["virt-install", "--version"]:
+                return completed(argv, 0, "4.1.0\n")
+            if argv[0] == "virsh":
+                return completed(argv, 0, "qemu:///session\n")
+            return completed(argv, 0, "should not run\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with patch.object(rehearsal, "which", return_value="/usr/bin/x"), \
+                    patch.object(rehearsal, "kvm_present", return_value=True), \
+                    patch.object(subprocess, "run", side_effect=fake_run), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = rehearsal.main(["--execute", "--workdir", str(Path(tmp) / "w")])
+            self.assertEqual(code, 2)
+            self.assertFalse((Path(tmp) / "w").exists())
+        self.assertEqual([call[0] for call in calls], ["virsh", "virt-install"])
+        self.assertIn("4.1.0", err.getvalue())
+        self.assertIn("5.0.0", err.getvalue())
+        self.assertNotIn("qemu-img", " ".join(" ".join(call) for call in calls))
 
     def test_default_connection_is_session(self):
         self.assertEqual(rehearsal.parse_args([]).connect, "qemu:///session")
@@ -947,7 +1002,7 @@ class ExecuteFlowTests(unittest.TestCase):
     def test_uuid_passed_to_virt_install_matches_cleanup_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, calls, _ = self.run_main(tmp)
-        installs = [c for c in calls if c[0] == "virt-install"]
+        installs = [c for c in calls if c[0] == "virt-install" and "--name" in c]
         uuids = {c[c.index("--name") + 1]: c[c.index("--uuid") + 1] for c in installs}
         self.assertEqual(set(uuids), {"fmr-src-abc123", "fmr-dst-abc123"})
         self.assertEqual(self.libvirt.domains, {})  # both were ours and are gone
@@ -967,7 +1022,7 @@ class ExecuteFlowTests(unittest.TestCase):
             self.assertEqual((existing / "report.json").read_text(), "old report")
             self.assertFalse((existing / "report.md").exists())
             self.assertEqual(self.destructive(calls), [])
-            self.assertEqual([c for c in calls if c[0] == "virt-install"], [])
+            self.assertEqual([c for c in calls if c[0] == "virt-install" and "--version" not in c], [])
         self.assertIn("--run-id", out)
 
     def test_failed_domain_removal_fails_report_and_keeps_artifacts(self):

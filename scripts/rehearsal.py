@@ -36,9 +36,12 @@ CHECKSUM_NAME = "Fedora-Cloud-{release}-{build}-x86_64-CHECKSUM"
 IMAGE_NAME_PATTERN = r"Fedora-Cloud-Base-Generic-{release}-([0-9]+(?:\.[0-9]+)*)\.x86_64\.qcow2"
 
 # passt gives an unprivileged (qemu:///session) VM user-mode networking with a
-# host port forward that libvirt itself manages.
+# host port forward that libvirt itself manages. portForward first shipped in
+# virt-install 5.0.0; 4.1.0 has neither that option nor the passt backend.
 BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "passt", "ssh", "scp", "ssh-keygen", "curl",
               "sha256sum")
+MIN_VIRT_INSTALL = (5, 0, 0)
+_VIRT_INSTALL_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 SEED_TOOLS = ("cloud-localds", "genisoimage", "xorriso")
 KVM_DEVICE = "/dev/kvm"
 
@@ -645,6 +648,35 @@ def preflight_libvirt(config):
     return []
 
 
+def virt_install_version_problem(text):
+    """Refusal when `virt-install --version` cannot do passt portForward, else None."""
+    match = _VIRT_INSTALL_VERSION.search(text or "")
+    if match is None:
+        shown = (text or "").strip() or "(empty)"
+        return f"Could not parse the virt-install version from {shown!r}."
+    version = tuple(int(part) for part in match.groups())
+    if version < MIN_VIRT_INSTALL:
+        found = ".".join(str(part) for part in version)
+        needed = ".".join(str(part) for part in MIN_VIRT_INSTALL)
+        return (f"virt-install {found} is too old for --network passt,portForward; "
+                f"need {needed} or newer.")
+    return None
+
+
+def preflight_virt_install():
+    """Refuse a virt-install that cannot express the passt SSH port forward."""
+    try:
+        completed = subprocess.run(["virt-install", "--version"], capture_output=True,
+                                   text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return [f"Could not read the virt-install version: {error}"]
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return [f"Could not read the virt-install version: {detail or completed.returncode}"]
+    problem = virt_install_version_problem(completed.stdout)
+    return [problem] if problem else []
+
+
 # --------------------------------------------------------------------------- python actions
 
 def _curl_text(url):
@@ -1015,8 +1047,9 @@ def build_plan(config, state=None):
                        "--disk", f"path={directory / 'disk.qcow2'},format=qcow2,bus=virtio",
                        "--disk", f"path={directory / 'seed.iso'},device=cdrom",
                        # libvirt-managed passt networking with a loopback-only SSH forward.
-                       # (Raw QEMU -netdev/-device passthrough collided with the PCI slots
-                       # libvirt assigns on q35.)
+                       # portForward needs virt-install 5.0.0 or newer; preflight checks
+                       # that before either VM is created. (Raw QEMU -netdev/-device
+                       # passthrough collided with the PCI slots libvirt assigns on q35.)
                        "--network", f"passt,model=virtio,portForward={SSH_HOST}:{config.ssh_port(label)}:22",
                        "--graphics", "none", "--noautoconsole"],
                  vm=label, creates_domain=domain))
@@ -1219,7 +1252,10 @@ def dry_run(config, runner):
     print("Preflight (an --execute run would " + ("refuse:" if problems else "pass the static checks):"))
     for problem in problems:
         print("  - " + problem)
+    needed = ".".join(str(part) for part in MIN_VIRT_INSTALL)
     print("Preflight would also run: " + shlex.join(["virsh", "-c", config.connect, "uri"]))
+    print("Preflight would also run: " + shlex.join(["virt-install", "--version"])
+          + f" and refuse virt-install older than {needed}")
     print()
     for step in build_plan(config):
         runner.execute(step)
@@ -1278,6 +1314,8 @@ def execute(config, runner):
     problems = preflight_static(config)
     if not problems:
         problems = preflight_libvirt(config)
+    if not problems:
+        problems = preflight_virt_install()
     if problems:
         print("Refusing to run the rehearsal:", file=sys.stderr)
         for problem in problems:

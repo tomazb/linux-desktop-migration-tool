@@ -26,6 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and then the hand-added QEMU network device took a PCI slot libvirt had assigned.
   VMs now use `--network passt,portForward=127.0.0.1:PORT:22`, managed by libvirt;
   `passt` is a required host tool.
+- `--execute` reads `virt-install --version` before creating either VM and
+  refuses versions older than 5.0.0, the first release that accepts
+  `--network passt,portForward`. Checking only that the binary exists lets
+  4.1.0 through; VM creation then fails after the images are prepared.
 
 ### Added
 
