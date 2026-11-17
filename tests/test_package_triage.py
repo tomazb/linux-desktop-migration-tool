@@ -720,9 +720,19 @@ class FlatpakBatchingTests(unittest.TestCase):
 
         def output(argv, **kwargs):
             return remotes["user" if "--user" in argv else "system"]
-        with patch.object(packages, "INSTALLATIONS_DIR", Path("/nonexistent/installations.d")), \
-             patch.object(packages, "_run", side_effect=output) as run:
-            packages.install_packages(data, skip_rpm=True)
+        # Preflight queries --system only when the installation on disk has a
+        # repo. The mocked remotes never create one, and a host without
+        # /var/lib/flatpak/repo (the Fedora CI images) would skip that scope
+        # and report the captured system remotes missing.
+        with tempfile.TemporaryDirectory() as temp:
+            system_dir = Path(temp) / "flatpak"
+            (system_dir / "repo").mkdir(parents=True)
+            with patch.dict(os.environ, {"FLATPAK_SYSTEM_DIR": str(system_dir)}), \
+                    patch.object(packages, "INSTALLATIONS_DIR", Path("/nonexistent/installations.d")), \
+                    patch.object(packages, "_run", side_effect=output) as run:
+                packages.install_packages(data, skip_rpm=True)
+        queried = [call.args[0] for call in run.call_args_list if call.args[0][1] == "remotes"]
+        self.assertTrue(any("--system" in command for command in queried))
         installs = [call for call in run.call_args_list if call.args[0][1] == "install"]
         self.assertEqual([call.args[0] for call in installs],
                          packages.package_commands(data, skip_rpm=True))

@@ -1,4 +1,5 @@
 import copy
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -52,6 +53,16 @@ class PackageTests(unittest.TestCase):
         self.path_patch = patch.object(packages, "INSTALLATIONS_DIR", self.installations)
         self.path_patch.start()
         self.addCleanup(self.path_patch.stop)
+        # An initialised default system installation, independent of the test host.
+        self.system_dir = Path(self.temp.name) / "flatpak"
+        (self.system_dir / "repo").mkdir(parents=True)
+        system_patch = patch.object(packages, "SYSTEM_INSTALLATION", self.system_dir, create=True)
+        system_patch.start()
+        self.addCleanup(system_patch.stop)
+        env_patch = patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        os.environ.pop("FLATPAK_SYSTEM_DIR", None)
         self.groups_file = Path(self.temp.name) / "groups.toml"
         self.groups_file.write_text(GROUPS_TOML)
         self.environments_file = Path(self.temp.name) / "environments.toml"
@@ -116,6 +127,107 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(packages.PackageError, "custom.*skip-flatpak|skip-flatpak.*custom"):
                 packages.collect_packages()
         run.assert_not_called()
+
+    def uninitialised_system_output(self, argv, **kwargs):
+        if argv[0] == "flatpak" and "--system" in argv:
+            # What flatpak prints for a normal user before the system repo exists.
+            raise packages.PackageError(
+                "Package command failed (exit 1): opendir(/var/lib/flatpak/repo): No such file or directory")
+        return self.capture_output(argv, **kwargs)
+
+    def test_uninitialised_system_installation_is_captured_as_empty(self):
+        # Fresh install with only user remotes: /var/lib/flatpak/repo does not exist
+        # yet and flatpak (run by a normal user) cannot create it. Seen live.
+        (self.system_dir / "repo").rmdir()
+        with patch.object(packages, "_run", side_effect=self.uninitialised_system_output) as run:
+            data = packages.collect_packages(skip_rpm=True)
+        self.assertEqual(data["flatpak"]["status"], "captured")
+        self.assertEqual(data["flatpak"]["apps"], [manifest()["flatpak"]["apps"][0]])
+        self.assertEqual(data["flatpak"]["remotes"], [manifest()["flatpak"]["remotes"][0]])
+        self.assertFalse([call.args[0] for call in run.call_args_list if "--system" in call.args[0]])
+        self.assertTrue(any("system Flatpak installation" in w and str(self.system_dir) in w
+                            for w in data["warnings"]))
+
+    def test_flatpak_system_dir_override_is_honoured(self):
+        (self.system_dir / "repo").rmdir()
+        other = Path(self.temp.name) / "other-system"
+        (other / "repo").mkdir(parents=True)
+        os.environ["FLATPAK_SYSTEM_DIR"] = str(other)
+        with patch.object(packages, "_run", side_effect=self.capture_output) as run:
+            data = packages.collect_packages(skip_rpm=True)
+        self.assertEqual(data["flatpak"], manifest()["flatpak"])
+        self.assertTrue([call for call in run.call_args_list if "--system" in call.args[0]])
+
+    def test_broken_system_repo_symlink_is_still_queried_and_fails(self):
+        (self.system_dir / "repo").rmdir()
+        (self.system_dir / "repo").symlink_to(self.system_dir / "missing")
+        with patch.object(packages, "_run", side_effect=self.uninitialised_system_output):
+            with self.assertRaisesRegex(packages.PackageError, "opendir"):
+                packages.collect_packages(skip_rpm=True)
+
+    def test_inaccessible_system_installation_is_an_error_not_unused(self):
+        # os.path.lexists() is false on EACCES too; that must not drop system apps.
+        repo = self.system_dir / "repo"
+        real_lstat = os.lstat
+
+        def denied(path, *args, **kwargs):
+            if Path(path) == repo:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with patch.object(packages.os, "lstat", side_effect=denied), \
+                patch.object(packages, "_run", side_effect=self.capture_output) as run:
+            with self.assertRaisesRegex(packages.PackageError, "Permission denied"):
+                packages.collect_packages(skip_rpm=True)
+        self.assertFalse([c for c in run.call_args_list if c.args[0][0] == "flatpak"])
+
+    def test_deployments_without_a_repo_are_an_error_not_unused(self):
+        (self.system_dir / "repo").rmdir()
+        for leftover in ("app", "runtime"):
+            with self.subTest(leftover=leftover):
+                (self.system_dir / leftover / "org.example.Second").mkdir(parents=True)
+                with patch.object(packages, "_run", side_effect=self.capture_output) as run:
+                    with self.assertRaisesRegex(packages.PackageError, f"{leftover}.*repo|repo.*{leftover}"):
+                        packages.collect_packages(skip_rpm=True)
+                self.assertFalse([c for c in run.call_args_list if c.args[0][0] == "flatpak"])
+                (self.system_dir / leftover / "org.example.Second").rmdir()
+                (self.system_dir / leftover).rmdir()
+
+    def test_missing_root_is_unused_but_a_dangling_or_file_root_is_an_error(self):
+        absent = Path(self.temp.name) / "never-created"
+        os.environ["FLATPAK_SYSTEM_DIR"] = str(absent)
+        with patch.object(packages, "_run", side_effect=self.uninitialised_system_output):
+            data = packages.collect_packages(skip_rpm=True)
+        self.assertEqual([app["scope"] for app in data["flatpak"]["apps"]], ["user"])
+        # e.g. /var/lib/flatpak symlinked to a disk that is not mounted
+        dangling = Path(self.temp.name) / "dangling"
+        dangling.symlink_to(Path(self.temp.name) / "unmounted-disk/flatpak")
+        regular = Path(self.temp.name) / "regular-file"
+        regular.write_text("")
+        broken_parent = Path(self.temp.name) / "broken-mount"
+        broken_parent.symlink_to(Path(self.temp.name) / "unmounted-disk")
+        for root in (dangling, regular, broken_parent / "flatpak"):
+            os.environ["FLATPAK_SYSTEM_DIR"] = str(root)
+            with self.subTest(root=root.name), \
+                    patch.object(packages, "_run", side_effect=self.capture_output) as run:
+                with self.assertRaisesRegex(packages.PackageError, "system Flatpak installation"):
+                    packages.collect_packages(skip_rpm=True)
+                self.assertFalse([c for c in run.call_args_list if c.args[0][0] == "flatpak"])
+
+    def test_preflight_with_uninitialised_system_installation(self):
+        (self.system_dir / "repo").rmdir()
+        user_only = manifest()
+        user_only["flatpak"]["apps"] = user_only["flatpak"]["apps"][:1]
+        user_only["flatpak"]["remotes"] = user_only["flatpak"]["remotes"][:1]
+        with patch.object(packages, "_run", side_effect=self.uninitialised_system_output) as run:
+            packages.install_packages(user_only, skip_rpm=True)
+        self.assertFalse([c.args[0] for c in run.call_args_list
+                          if "--system" in c.args[0] and c.args[0][1] == "remotes"])
+        # A bundle that needs a system remote is still refused, before any change.
+        with patch.object(packages, "_run", side_effect=self.uninitialised_system_output) as run:
+            with self.assertRaisesRegex(packages.PackageError, "Missing system Flatpak remote 'work'"):
+                packages.install_packages(manifest())
+        self.assertTrue(all(c.args[0][1] == "remotes" for c in run.call_args_list))
 
     def test_absent_custom_installation_directory_is_supported(self):
         self.installations.rmdir()

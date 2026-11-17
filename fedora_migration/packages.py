@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 
 
@@ -18,6 +19,8 @@ class PackageError(RuntimeError):
 
 
 INSTALLATIONS_DIR = Path("/etc/flatpak/installations.d")
+# Default system installation; flatpak honours FLATPAK_SYSTEM_DIR instead.
+SYSTEM_INSTALLATION = Path("/var/lib/flatpak")
 # DNF5 keeps installed group/environment state here (version "1.0"), readable by
 # every user. Group names are descriptive only: restore never requests groups.
 GROUPS_STATE = Path("/usr/lib/sysimage/libdnf5/groups.toml")
@@ -80,6 +83,68 @@ def _custom_installations():
         return []
     except OSError as exc:
         raise PackageError(f"Cannot inspect Flatpak installations in {INSTALLATIONS_DIR}: {exc}") from exc
+
+
+def _uninitialised_system_installation():
+    """Return the system installation path if it has no repository yet, else None.
+
+    Flatpak creates <path>/repo on first system use. Until then a normal user's
+    "flatpak list/remotes --system" fails, although there is nothing installed.
+    It counts as unused when the directory does not exist, or when repo, app and
+    runtime are all absent from it; a dangling or non-directory root is an error.
+    A repo
+    that exists in any form (even a broken symlink) is queried, so real damage is
+    still reported; deployments without a repo, or paths that cannot be
+    inspected, are errors rather than an empty inventory.
+    """
+    root = Path(os.environ.get("FLATPAK_SYSTEM_DIR") or SYSTEM_INSTALLATION)
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        # Never created, but only if the path leading to it resolves (no dangling
+        # symlink to an unmounted disk in a parent component).
+        try:
+            parent_is_dir = stat.S_ISDIR(os.stat(root.parent).st_mode)
+        except OSError as exc:
+            raise PackageError(f"Cannot open the parent of the system Flatpak installation {root}: "
+                               f"{exc}. Fix it or use --skip-flatpak.") from exc
+        if not parent_is_dir:
+            raise PackageError(f"The parent of the system Flatpak installation {root} is not a "
+                               "directory; fix it or use --skip-flatpak.")
+        return root
+    except OSError as exc:
+        raise PackageError(f"Cannot inspect the system Flatpak installation {root}: {exc}. "
+                           "Fix its permissions or use --skip-flatpak.") from exc
+    try:
+        # Follows a symlinked root (for example to another disk); a dangling one fails.
+        if not stat.S_ISDIR(os.stat(root).st_mode):
+            raise PackageError(f"The system Flatpak installation {root} is not a directory; "
+                               "fix it or use --skip-flatpak.")
+    except OSError as exc:
+        raise PackageError(f"Cannot open the system Flatpak installation {root}: {exc}. "
+                           "Is the disk it points to mounted? Fix it or use --skip-flatpak.") from exc
+    present = []
+    for name in ("repo", "app", "runtime"):
+        try:
+            os.lstat(root / name)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PackageError(f"Cannot inspect the system Flatpak installation {root}: {exc}. "
+                               "Fix its permissions or use --skip-flatpak.") from exc
+        present.append(name)
+    if not present:
+        return root
+    if "repo" not in present:
+        # Deployments are stored apart from the repository: never record them as empty.
+        raise PackageError(f"The system Flatpak installation {root} has {' and '.join(present)} "
+                           "but no repo; repair it (for example \"flatpak repair --system\") "
+                           "or use --skip-flatpak.")
+    return None
+
+
+def _flatpak_scopes():
+    return ("user",) if _uninitialised_system_installation() else ("user", "system")
 
 
 def _check_standard_installations():
@@ -496,8 +561,9 @@ def collect_packages(*, skip_rpm=False, skip_flatpak=False):
         )
     if not skip_flatpak:
         flatpak_started = False
+        uninitialised = _uninitialised_system_installation()
         try:
-            for scope in ("user", "system"):
+            for scope in ("user",) if uninitialised else ("user", "system"):
                 output = _run(["flatpak", "list", f"--{scope}", "--app", "--columns=ref,origin"])
                 flatpak_started = True
                 data["flatpak"]["apps"].extend(
@@ -510,6 +576,11 @@ def collect_packages(*, skip_rpm=False, skip_flatpak=False):
                 raise PackageError("flatpak became unavailable while capturing packages; retry the backup") from exc
             data["flatpak"]["status"] = "not-installed"
             data["warnings"].append("Flatpak is not installed; no Flatpak apps or remotes were captured.")
+        else:
+            if uninitialised:
+                data["warnings"].append(
+                    f"The system Flatpak installation ({uninitialised}) has not been used yet; "
+                    "no system Flatpak apps or remotes were captured.")
     validate_package_manifest(data)
     return data
 
@@ -622,7 +693,9 @@ def _preflight_remotes(data):
     """Refuse missing, changed or disabled remotes before any transaction."""
     existing = {}
     enabled = {}
-    for scope in ("user", "system"):
+    # An unused system installation has no remotes; captured system remotes are
+    # then reported missing below.
+    for scope in _flatpak_scopes():
         existing.update({(scope, remote["name"]): remote["url"] for remote in _remote_inventory(scope)})
         enabled.update({(scope, remote["name"]): remote["url"]
                         for remote in _remote_inventory(scope, include_disabled=False)})
