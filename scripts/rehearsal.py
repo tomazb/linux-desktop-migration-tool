@@ -35,7 +35,13 @@ IMAGE_NAME = "Fedora-Cloud-Base-Generic-{release}-{build}.x86_64.qcow2"
 CHECKSUM_NAME = "Fedora-Cloud-{release}-{build}-x86_64-CHECKSUM"
 IMAGE_NAME_PATTERN = r"Fedora-Cloud-Base-Generic-{release}-([0-9]+(?:\.[0-9]+)*)\.x86_64\.qcow2"
 
-BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "ssh", "scp", "ssh-keygen", "curl", "sha256sum")
+# passt gives an unprivileged (qemu:///session) VM user-mode networking with a
+# host port forward that libvirt itself manages. portForward first shipped in
+# virt-install 5.0.0; 4.1.0 has neither that option nor the passt backend.
+BASE_TOOLS = ("virt-install", "virsh", "qemu-img", "passt", "ssh", "scp", "ssh-keygen", "curl",
+              "sha256sum")
+MIN_VIRT_INSTALL = (5, 0, 0)
+_VIRT_INSTALL_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 SEED_TOOLS = ("cloud-localds", "genisoimage", "xorriso")
 KVM_DEVICE = "/dev/kvm"
 
@@ -467,6 +473,15 @@ def _tail(text, lines=40, chars=4000):
     return "\n".join(text.splitlines()[-lines:])[-chars:]
 
 
+def _silence_stdout():
+    """Send the rest of stdout to /dev/null once its reader has gone away."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    finally:
+        os.close(devnull)
+
+
 class Runner:
     """Prints steps (dry run) or executes them, collecting results."""
 
@@ -483,7 +498,16 @@ class Runner:
         self.attempted_domains = []   # virt-install was started; cleanup verifies the UUID first
 
     def out(self, text):
-        (self._out or sys.stdout.write)(text)
+        if self._out:
+            self._out(text)
+            return
+        try:
+            sys.stdout.write(text)
+            # Show progress live even when stdout is a pipe (for example "| tee").
+            sys.stdout.flush()
+        except BrokenPipeError:
+            # The reader went away; keep running (cleanup must still happen).
+            _silence_stdout()
 
     def run(self, argv, **kwargs):
         return (self._run or subprocess.run)(argv, **kwargs)
@@ -622,6 +646,35 @@ def preflight_libvirt(config):
     if completed.returncode != 0:
         return [f"libvirt is not reachable at {config.connect}: {(completed.stderr or '').strip()}"]
     return []
+
+
+def virt_install_version_problem(text):
+    """Refusal when `virt-install --version` cannot do passt portForward, else None."""
+    match = _VIRT_INSTALL_VERSION.search(text or "")
+    if match is None:
+        shown = (text or "").strip() or "(empty)"
+        return f"Could not parse the virt-install version from {shown!r}."
+    version = tuple(int(part) for part in match.groups())
+    if version < MIN_VIRT_INSTALL:
+        found = ".".join(str(part) for part in version)
+        needed = ".".join(str(part) for part in MIN_VIRT_INSTALL)
+        return (f"virt-install {found} is too old for --network passt,portForward; "
+                f"need {needed} or newer.")
+    return None
+
+
+def preflight_virt_install():
+    """Refuse a virt-install that cannot express the passt SSH port forward."""
+    try:
+        completed = subprocess.run(["virt-install", "--version"], capture_output=True,
+                                   text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return [f"Could not read the virt-install version: {error}"]
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return [f"Could not read the virt-install version: {detail or completed.returncode}"]
+    problem = virt_install_version_problem(completed.stdout)
+    return [problem] if problem else []
 
 
 # --------------------------------------------------------------------------- python actions
@@ -993,10 +1046,11 @@ def build_plan(config, state=None):
                        "--osinfo", config.osinfo,
                        "--disk", f"path={directory / 'disk.qcow2'},format=qcow2,bus=virtio",
                        "--disk", f"path={directory / 'seed.iso'},device=cdrom",
-                       "--network", "none",
-                       "--qemu-commandline",
-                       f"-netdev user,id=fwd0,hostfwd=tcp:{SSH_HOST}:{config.ssh_port(label)}-:22 "
-                       "-device virtio-net-pci,netdev=fwd0",
+                       # libvirt-managed passt networking with a loopback-only SSH forward.
+                       # portForward needs virt-install 5.0.0 or newer; preflight checks
+                       # that before either VM is created. (Raw QEMU -netdev/-device
+                       # passthrough collided with the PCI slots libvirt assigns on q35.)
+                       "--network", f"passt,model=virtio,portForward={SSH_HOST}:{config.ssh_port(label)}:22",
                        "--graphics", "none", "--noautoconsole"],
                  vm=label, creates_domain=domain))
     for label in ("src", "dst"):
@@ -1198,7 +1252,10 @@ def dry_run(config, runner):
     print("Preflight (an --execute run would " + ("refuse:" if problems else "pass the static checks):"))
     for problem in problems:
         print("  - " + problem)
+    needed = ".".join(str(part) for part in MIN_VIRT_INSTALL)
     print("Preflight would also run: " + shlex.join(["virsh", "-c", config.connect, "uri"]))
+    print("Preflight would also run: " + shlex.join(["virt-install", "--version"])
+          + f" and refuse virt-install older than {needed}")
     print()
     for step in build_plan(config):
         runner.execute(step)
@@ -1257,6 +1314,8 @@ def execute(config, runner):
     problems = preflight_static(config)
     if not problems:
         problems = preflight_libvirt(config)
+    if not problems:
+        problems = preflight_virt_install()
     if problems:
         print("Refusing to run the rehearsal:", file=sys.stderr)
         for problem in problems:
@@ -1317,6 +1376,9 @@ def execute(config, runner):
 
 
 def main(argv=None):
+    # Line-buffer every print so a long run piped through tee shows its progress.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
     config = parse_args(argv)
     try:
         if not config.execute:
@@ -1328,4 +1390,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # The reader (head, less) went away; stop quietly instead of a traceback.
+        _silence_stdout()
+        raise SystemExit(1) from None
